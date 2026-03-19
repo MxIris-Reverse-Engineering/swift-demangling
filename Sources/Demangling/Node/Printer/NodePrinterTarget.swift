@@ -1,4 +1,4 @@
-package protocol NodePrinterTarget: Sendable {
+public protocol NodePrinterTarget: Sendable {
     init()
     var count: Int { get }
     mutating func write(_ content: String)
@@ -6,15 +6,15 @@ package protocol NodePrinterTarget: Sendable {
 }
 
 extension NodePrinterTarget {
-    package mutating func write(_ content: String, context: NodePrintContext?) {
+    public mutating func write(_ content: String, context: NodePrintContext?) {
         write(content)
     }
 
-    package mutating func writeSpace(_ count: Int = 1) {
+    public mutating func writeSpace(_ count: Int = 1) {
         write(" ")
     }
 
-    package mutating func writeBreakLine() {
+    public mutating func writeBreakLine() {
         write("\n")
     }
 }

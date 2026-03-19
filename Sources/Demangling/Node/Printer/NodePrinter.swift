@@ -1,17 +1,17 @@
-package struct NodePrinter<Target: NodePrinterTarget>: Sendable {
+public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     private var target: Target
     private var specializationPrefixPrinted: Bool
     private var options: DemangleOptions
     private var hidingCurrentModule: String = ""
     private var dependentMemberTypeDepth: Int = 0
 
-    package init(options: DemangleOptions = .default) {
+    public init(options: DemangleOptions = .default) {
         self.target = .init()
         self.specializationPrefixPrinted = false
         self.options = options
     }
 
-    package mutating func printRoot(_ root: Node) -> Target {
+    public mutating func printRoot(_ root: Node) -> Target {
         _ = printName(root)
         return target
     }

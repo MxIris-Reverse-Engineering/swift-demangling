@@ -1,9 +1,9 @@
-package struct NodePrintContext {
-    package let node: Node?
-    package let parentKind: Node.Kind?
-    package let state: NodePrintState
+public struct NodePrintContext {
+    public let node: Node?
+    public let parentKind: Node.Kind?
+    public let state: NodePrintState
 
-    package static func context(for node: Node? = nil, parentKind: Node.Kind? = nil, state: NodePrintState) -> NodePrintContext {
+    public static func context(for node: Node? = nil, parentKind: Node.Kind? = nil, state: NodePrintState) -> NodePrintContext {
         NodePrintContext(node: node, parentKind: parentKind, state: state)
     }
 }

@@ -1,4 +1,4 @@
-package enum SugarType: CaseIterable, Sendable {
+public enum SugarType: CaseIterable, Sendable {
     case none
     case optional
     case implicitlyUnwrappedOptional

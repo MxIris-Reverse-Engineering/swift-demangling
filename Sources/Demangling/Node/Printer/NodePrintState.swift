@@ -1,4 +1,4 @@
-package enum NodePrintState {
+public enum NodePrintState {
     case printIdentifier
     case printFunctionParameters
     case printModule

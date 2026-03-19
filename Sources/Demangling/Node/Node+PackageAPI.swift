@@ -1,5 +1,5 @@
 extension Node {
-    package func findGenericParamsDepth() -> [UInt64: UInt64]? {
+    public func findGenericParamsDepth() -> [UInt64: UInt64]? {
         guard kind == .dependentGenericType, first(of: .dependentGenericParamCount) != nil else { return nil }
 
         var depths: [UInt64: UInt64] = [:]
@@ -19,7 +19,7 @@ extension Node {
         return depths
     }
 
-    package var identifier: String? {
+    public var identifier: String? {
         if let node = children.at(1), node.kind == .identifier {
             return node.text
         } else if let node = children.at(1), node.kind == .privateDeclName {

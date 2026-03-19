@@ -1,20 +1,20 @@
 extension String {
-    package var isSwiftSymbol: Bool {
+    public var isSwiftSymbol: Bool {
         Demangler.getManglingPrefixLength(unicodeScalars) > 0
     }
 
-    package var stripManglePrefix: String {
+    public var stripManglePrefix: String {
         guard isSwiftSymbol else { return self }
         return String(dropFirst(Demangler.getManglingPrefixLength(unicodeScalars)))
     }
 }
 
 extension Array {
-    package func at(_ index: Int) -> Element? {
+    func at(_ index: Int) -> Element? {
         return indices.contains(index) ? self[index] : nil
     }
 
-    package func slice(_ from: Int, _ to: Int) -> ArraySlice<Element> {
+    func slice(_ from: Int, _ to: Int) -> ArraySlice<Element> {
         if from > to || from > endIndex || to < startIndex {
             return ArraySlice()
         } else {
@@ -101,7 +101,7 @@ extension String {
     }
 }
 
-package func genericParameterName(depth: UInt64, index: UInt64) -> String {
+public func genericParameterName(depth: UInt64, index: UInt64) -> String {
     var name = ""
     var index = index
     repeat {

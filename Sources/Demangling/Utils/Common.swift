@@ -1,4 +1,4 @@
-@usableFromInline package let stdlibName = "Swift"
-@usableFromInline package let objcModule = "__C"
-@usableFromInline package let cModule = "__C_Synthesized"
-@usableFromInline package let lldbExpressionsModuleNamePrefix = "__lldb_expr_"
+public let stdlibName = "Swift"
+public let objcModule = "__C"
+public let cModule = "__C_Synthesized"
+public let lldbExpressionsModuleNamePrefix = "__lldb_expr_"
