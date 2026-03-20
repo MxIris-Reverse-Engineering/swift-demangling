@@ -18,7 +18,12 @@ swift package update && swift build 2>&1 | xcsift
 swift package update && swift test 2>&1 | xcsift
 ```
 
-Tests use the Swift Testing framework (`@Test`, `#expect`, `Issue.record`), **not** XCTest.
+Run a single test by name:
+```bash
+swift test --filter DemanglingTests.NodeBuilderTests/initWithExistingNode
+```
+
+Tests use the Swift Testing framework (`@Suite`, `@Test`, `#expect`, `Issue.record`), **not** XCTest.
 
 ## Architecture
 
@@ -35,7 +40,8 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 - **`Node`** (`Node.swift`) — Immutable tree node (reference type, `Sendable`). Uses a unified `Payload` enum that merges contents (`.text`/`.index`/`.none`) and children (`.oneChild`/`.twoChildren`/`.manyChildren`) into a single discriminated union — contents and children are mutually exclusive. Mutation methods are `fileprivate`; external code must use `NodeBuilder`.
 - **`NodeChildren`** (`NodeChildren.swift`) — Inline storage for 0–2 children without heap allocation; falls back to `ContiguousArray` for 3+.
 - **`NodeBuilder`** (`Node.swift`) — Thread-safe builder for constructing `Node` trees incrementally (uses `os_unfair_lock`).
-- **`NodeCache` / `NodeFactory`** (`NodeFactory.swift`) — Global leaf-node interning cache. `Node.create()` automatically interns leaf nodes. `NodeFactory` provides pre-created singletons for common parameterless nodes.
+- **`Node.create()`** (`Node+Init.swift`) — Public static factories that go through `NodeCache.shared` for leaf-node interning. Always use these instead of `Node.init()` when creating nodes that should be cached.
+- **`NodeCache` / `NodeFactory`** (`NodeFactory.swift`) — `NodeCache` is the global leaf-node interning cache. `NodeFactory` provides pre-created singletons for common parameterless nodes (e.g., `NodeFactory.emptyList`, `.asyncAnnotation`). The `Node.init(...)` convenience initializers in `NodeFactory.swift` are **internal** and bypass the cache — they exist for `Demangler`/`Remangler` internals.
 - **`Node.Kind`** (`Node+Kind.swift`) — Exhaustive enum of ~300 node kinds matching the Swift compiler's `Demangle::Node::Kind`.
 - **`Demangler`** (`Demangler.swift`) — Generic over `Collection<UnicodeScalar>`. Parses mangled prefixes `_T0`, `_$S`, `_$s`, `$S`, `$s`, `$e`, `_$e`, `@__swiftmacro_`.
 - **`Remangler`** (`Remangler.swift`) — Converts a `Node` tree back to a mangled string. Uses hash-based substitution merging.
@@ -43,6 +49,11 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 - **`DemangleOptions`** (`DemangleOptions.swift`) — `OptionSet` with presets: `.default`, `.simplified`, `.interface`, `.interfaceType`, etc.
 - **`TypeDecoder<Builder>`** (`TypeDecoder.swift`) — Walks a `Node` tree and builds abstract types via the `TypeBuilder` protocol.
 - **`Node.Rewriter`** (`Node+Rewriter.swift`) — Open class for bottom-up tree rewriting. Override `visit(_:)` to transform nodes.
+- **`Node` as `Sequence`** (`Node+Sequence.swift`) — `Node` conforms to `Sequence` with preorder traversal as default. Also provides `.inorder()`, `.postorder()`, `.levelorder()`. Sequence extensions add `first(of:)`, `all(of:)`, `contains(_:)` by `Node.Kind`.
+
+### Node Identity vs Equality
+
+`Node` is a reference type with structural `Hashable` conformance: `==` compares kind + contents + children recursively, while `===` checks identity. Interned leaf nodes from `NodeCache` guarantee identity equality for structurally equal leaves.
 
 ### Public API Entry Points
 
@@ -51,7 +62,7 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 func demangleAsNode(_ mangled: String, isType: Bool = false, ...) throws(DemanglingError) -> Node
 
 // Print
-node.print(using: .default)      // → String
+node.print(using: .default)      // → String (human-readable)
 node.description                  // → debug tree dump (kind=..., text=...)
 
 // Remangle
@@ -70,7 +81,7 @@ Sources/Demangling/
   Main/Demangle/     — Demangler, DemangleInterface, DemangleOptions
   Main/Remangle/     — Remangler, RemangleInterface
   Main/TypeDecoder/  — TypeDecoder, TypeBuilder protocol
-  Node/              — Node, NodeChildren, NodeBuilder, NodeCache, Kind, Conversions, Rewriter
+  Node/              — Node, NodeChildren, NodeBuilder, NodeCache, Kind, Conversions, Sequence, Rewriter
   Node/Printer/      — NodePrinter, NodePrinterTarget protocol, NodePrintContext/State
   Enums/             — SugarType, ManglingFlavor, DemanglingError, ManglingError, etc.
   Utils/             — Extensions, Common constants, Punycode
@@ -79,7 +90,8 @@ Tests/DemanglingTests/
 
 ## Conventions
 
-- The codebase uses Swift 6 strict concurrency. `Node` is `Sendable` via `nonisolated(unsafe)` on its payload (safe because mutation only occurs during single-threaded demangling). `NodeBuilder` is `@unchecked Sendable` with an `os_unfair_lock`.
-- Typed throws are used throughout: `throws(DemanglingError)`, `throws(ManglingError)`, `throws(TypeLookupError)`.
+- Swift 6 strict concurrency. `Node` is `Sendable` via `nonisolated(unsafe)` on its payload (safe because mutation only occurs during single-threaded demangling). `NodeBuilder` is `@unchecked Sendable` with `os_unfair_lock`.
+- Typed throws throughout: `throws(DemanglingError)`, `throws(ManglingError)`, `throws(TypeLookupError)`.
 - Performance-sensitive code is marked `@inlinable` / `@usableFromInline`.
-- `Node` creation during demangling uses `Node.create()` (not `Node.init()` directly) to go through `NodeCache` interning.
+- Use `Node.create()` (not `Node.init()`) when creating nodes that should participate in leaf interning. Direct `Node.init()` is for internal demangler/remangler use only.
+- Test pattern: demangle with `demangleAsNode()`, print with `.print(using: .default.union(.synthesizeSugarOnTypes))`, assert with `#expect`.
