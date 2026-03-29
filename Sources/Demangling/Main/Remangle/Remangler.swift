@@ -737,6 +737,8 @@ final class Remangler {
             try manglePropertyWrapperBackingInitializer(node, depth: depth)
         case .propertyWrapperInitFromProjectedValue:
             try manglePropertyWrapperInitFromProjectedValue(node, depth: depth)
+        case .propertyWrappedFieldInitAccessor:
+            try manglePropertyWrappedFieldInitAccessor(node, depth: depth)
         case .curryThunk:
             try mangleCurryThunk(node, depth: depth)
         case .dispatchThunk:
@@ -931,6 +933,10 @@ final class Remangler {
             try mangleModify2Accessor(node, depth: depth)
         case .read2Accessor:
             try mangleRead2Accessor(node, depth: depth)
+        case .borrowAccessor:
+            try mangleBorrowAccessor(node, depth: depth)
+        case .mutateAccessor:
+            try mangleMutateAccessor(node, depth: depth)
         case .materializeForSet:
             try mangleMaterializeForSet(node, depth: depth)
         case .nativeOwningAddressor:
@@ -1083,7 +1089,7 @@ final class Remangler {
             try mangleNonUniqueExtendedExistentialTypeShapeSymbolicReference(node, depth: depth)
         case .outlinedInitializeWithTakeNoValueWitness:
             try mangleOutlinedInitializeWithTakeNoValueWitness(node, depth: depth)
-        case .predefinedObjCAsyncCompletionHandlerImpl:
+        case .checkedObjCAsyncCompletionHandlerImpl:
             try manglePredefinedObjCAsyncCompletionHandlerImpl(node, depth: depth)
         case .protocolConformanceRefInTypeModule:
             try mangleProtocolConformanceRefInTypeModule(node, depth: depth)
@@ -1099,8 +1105,8 @@ final class Remangler {
             try mangleReflectionMetadataFieldDescriptor(node, depth: depth)
         case .reflectionMetadataSuperclassDescriptor:
             try mangleReflectionMetadataSuperclassDescriptor(node, depth: depth)
-        case .silThunkHopToMainActorIfNeeded:
-            try mangleSILThunkHopToMainActorIfNeeded(node, depth: depth)
+        case .representationChanged:
+            try mangleRepresentationChanged(node, depth: depth)
         case .sugaredInlineArray:
             try mangleSugaredInlineArray(node, depth: depth)
         case .typeMetadataInstantiationFunction:
@@ -2915,38 +2921,22 @@ extension Remangler {
 
     private func mangleFunctionSignatureSpecialization(_ node: Node, depth: Int) throws(ManglingError) {
         for param in node.children {
-            if param.kind == .functionSignatureSpecializationParam, param.numberOfChildren > 0, let rawValue = try param[_child: 0].index, let kind = FunctionSigSpecializationParamKind(rawValue: rawValue) {
-                switch kind {
-                case .constantPropFunction,
-                     .constantPropGlobal:
-                    try mangleIdentifier(param[_child: 1], depth: depth + 1)
-                case .constantPropString:
-                    var textNd = try param[_child: 2]
-                    let text = textNd.text
-                    if let text, !text.isEmpty, Remangler.isDigit(text.first!) || text.first == "_" {
-                        var buffer = "_"
-                        buffer.append(text)
-                        buffer.append(text.count.description)
-                        textNd = Node(kind: .identifier, contents: .text(buffer))
-                    }
-                    try mangleIdentifier(textNd, depth: depth + 1)
-                case .closureProp,
-                     .constantPropKeyPath:
-                    try mangleIdentifier(param[_child: 1], depth: depth + 1)
-                    var i = 2
-                    let e = param.numberOfChildren
-                    while i != e {
-                        try mangleType(param[_child: i], depth: depth + 1)
-                        i += 1
-                    }
-                default:
-                    break
+            guard param.kind == .functionSignatureSpecializationParam else { continue }
+            for paramChild in param.children {
+                if paramChild.kind == .functionSignatureSpecializationParamKind ||
+                   paramChild.kind == .functionSignatureSpecializationParamPayload {
+                    continue
                 }
+                try mangle(paramChild, depth: depth + 1)
             }
         }
+
         append("Tf")
         var returnValMangled = false
         for child in node.children {
+            if child.kind == .representationChanged {
+                returnValMangled = true
+            }
             if child.kind == .functionSignatureSpecializationReturn {
                 append("_")
                 returnValMangled = true
@@ -3929,6 +3919,20 @@ extension Remangler {
         try mangleAbstractStorage(node._firstChild, accessorCode: "y", depth: depth + 1)
     }
 
+    private func mangleBorrowAccessor(_ node: Node, depth: Int) throws(ManglingError) {
+        guard node.children.count >= 1 else {
+            throw .invalidNodeStructure(node, message: "BorrowAccessor needs at least 1 child")
+        }
+        try mangleAbstractStorage(node._firstChild, accessorCode: "b", depth: depth + 1)
+    }
+
+    private func mangleMutateAccessor(_ node: Node, depth: Int) throws(ManglingError) {
+        guard node.children.count >= 1 else {
+            throw .invalidNodeStructure(node, message: "MutateAccessor needs at least 1 child")
+        }
+        try mangleAbstractStorage(node._firstChild, accessorCode: "z", depth: depth + 1)
+    }
+
     private func mangleUnsafeAddressor(_ node: Node, depth: Int) throws(ManglingError) {
         guard node.children.count >= 1 else {
             throw .invalidNodeStructure(node, message: "UnsafeAddressor needs at least 1 child")
@@ -4553,6 +4557,11 @@ extension Remangler {
         append("fW")
     }
 
+    private func manglePropertyWrappedFieldInitAccessor(_ node: Node, depth: Int) throws(ManglingError) {
+        try mangleChildNodes(node, depth: depth + 1)
+        append("fF")
+    }
+
     // MARK: - Additional 36 Missing Methods (Final Batch)
 
     /// Simple methods - just mangling child nodes + code
@@ -4574,8 +4583,13 @@ extension Remangler {
     }
 
     private func manglePredefinedObjCAsyncCompletionHandlerImpl(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
+        try mangleChildNode(node, at: 0, depth: depth + 1)
+        try mangleChildNode(node, at: 1, depth: depth + 1)
+        if node.numberOfChildren == 4 {
+            try mangleChildNode(node, at: 3, depth: depth + 1)
+        }
         append("TZ")
+        try mangleChildNode(node, at: 2, depth: depth + 1)
     }
 
     private func mangleLazyProtocolWitnessTableAccessor(_ node: Node, depth: Int) throws(ManglingError) {
@@ -4874,84 +4888,118 @@ extension Remangler {
             return
         }
 
-        // First child is kind
-        guard let kindNode = node.children.first, let kindValue = kindNode.index else {
-            throw .invalidNodeStructure(node, message: "FunctionSignatureSpecializationParam missing kind")
-        }
+        var constPropPrefix = "p"
+        var idx = 0
+        let end = node.children.count
 
-        // Use enum values for cleaner code
-        let kind = UInt64(kindValue)
+        while idx < end {
+            let kindNode = node.children[idx]
+            guard kindNode.kind == .functionSignatureSpecializationParamKind else {
+                idx += 1
+                continue
+            }
+            guard let kindValue = kindNode.index else {
+                throw .invalidNodeStructure(node, message: "FunctionSignatureSpecializationParam missing kind index")
+            }
+            idx += 1
 
-        switch FunctionSigSpecializationParamKind(rawValue: kind) {
-        case .constantPropFunction:
-            append("pf")
-        case .constantPropGlobal:
-            append("pg")
-        case .constantPropInteger:
-            guard let text = try node[_child: 1].text else {
-                throw .invalidNodeStructure(node, message: "ConstantPropInteger missing text")
-            }
-            append("pi")
-            append(text)
-        case .constantPropFloat:
-            guard let text = try node[_child: 1].text else {
-                throw .invalidNodeStructure(node, message: "ConstantPropFloat missing text")
-            }
-            append("pd")
-            append(text)
-        case .constantPropString:
-            append("ps")
-            guard let encodingStr = try node[_child: 1].text else {
-                throw .invalidNodeStructure(node, message: "ConstantPropString missing encoding")
-            }
-            if encodingStr == "u8" {
-                append("b")
-            } else if encodingStr == "u16" {
-                append("w")
-            } else if encodingStr == "objc" {
-                append("c")
-            } else {
-                throw .invalidNodeStructure(node, message: "Unknown string encoding: \(encodingStr)")
-            }
-        case .constantPropKeyPath:
-            append("pk")
-        case .closureProp:
-            append("c")
-        case .boxToValue:
-            append("i")
-        case .boxToStack:
-            append("s")
-        case .inOutToOut:
-            append("r")
-        case .sroa:
-            append("x")
-        default:
-            if kindValue & FunctionSigSpecializationParamKind.existentialToGeneric.rawValue != 0 {
-                append("e")
-                if kindValue & FunctionSigSpecializationParamKind.dead.rawValue != 0 {
-                    append("D")
-                }
-                if kindValue & FunctionSigSpecializationParamKind.ownedToGuaranteed.rawValue != 0 {
-                    append("G")
-                }
-                if kindValue & FunctionSigSpecializationParamKind.guaranteedToOwned.rawValue != 0 {
-                    append("O")
-                }
-            } else if kindValue & FunctionSigSpecializationParamKind.dead.rawValue != 0 {
-                append("d")
-                if kindValue & FunctionSigSpecializationParamKind.ownedToGuaranteed.rawValue != 0 {
-                    append("G")
-                }
-                if kindValue & FunctionSigSpecializationParamKind.guaranteedToOwned.rawValue != 0 {
-                    append("O")
-                }
-            } else if kindValue & FunctionSigSpecializationParamKind.ownedToGuaranteed.rawValue != 0 {
+            switch FunctionSigSpecializationParamKind(rawValue: kindValue) {
+            case .constantPropFunction:
+                append(constPropPrefix)
+                append("f")
+                constPropPrefix = ""
+            case .constantPropGlobal:
+                append(constPropPrefix)
                 append("g")
-            } else if kindValue & FunctionSigSpecializationParamKind.guaranteedToOwned.rawValue != 0 {
-                append("o")
-            }
-            if kindValue & FunctionSigSpecializationParamKind.sroa.rawValue != 0 {
-                append("X")
+                constPropPrefix = ""
+            case .constantPropInteger:
+                guard idx < end, let text = node.children[idx].text else {
+                    throw .invalidNodeStructure(node, message: "ConstantPropInteger missing text")
+                }
+                append(constPropPrefix)
+                append("i")
+                append(text)
+                constPropPrefix = ""
+                idx += 1
+            case .constantPropFloat:
+                guard idx < end, let text = node.children[idx].text else {
+                    throw .invalidNodeStructure(node, message: "ConstantPropFloat missing text")
+                }
+                append(constPropPrefix)
+                append("d")
+                append(text)
+                constPropPrefix = ""
+                idx += 1
+            case .constantPropString:
+                append(constPropPrefix)
+                append("s")
+                constPropPrefix = ""
+                guard idx < end, let encodingStr = node.children[idx].text else {
+                    throw .invalidNodeStructure(node, message: "ConstantPropString missing encoding")
+                }
+                idx += 1
+                if encodingStr == "u8" {
+                    append("b")
+                } else if encodingStr == "u16" {
+                    append("w")
+                } else if encodingStr == "objc" {
+                    append("c")
+                } else {
+                    throw .invalidNodeStructure(node, message: "Unknown string encoding: \(encodingStr)")
+                }
+            case .constantPropKeyPath:
+                append(constPropPrefix)
+                append("k")
+                constPropPrefix = ""
+            case .constantPropStruct:
+                append(constPropPrefix)
+                append("S")
+                constPropPrefix = ""
+            case .closureProp:
+                append("c")
+            case .closurePropPreviousArg:
+                guard idx < end, let prevIdx = node.children[idx].index else {
+                    throw .invalidNodeStructure(node, message: "ClosurePropPreviousArg missing index")
+                }
+                append("C")
+                append(prevIdx)
+                idx += 1
+            case .boxToValue:
+                append("i")
+            case .boxToStack:
+                append("s")
+            case .inOutToOut:
+                append("r")
+            case .sroa:
+                append("x")
+            default:
+                if kindValue & FunctionSigSpecializationParamKind.existentialToGeneric.rawValue != 0 {
+                    append("e")
+                    if kindValue & FunctionSigSpecializationParamKind.dead.rawValue != 0 {
+                        append("D")
+                    }
+                    if kindValue & FunctionSigSpecializationParamKind.ownedToGuaranteed.rawValue != 0 {
+                        append("G")
+                    }
+                    if kindValue & FunctionSigSpecializationParamKind.guaranteedToOwned.rawValue != 0 {
+                        append("O")
+                    }
+                } else if kindValue & FunctionSigSpecializationParamKind.dead.rawValue != 0 {
+                    append("d")
+                    if kindValue & FunctionSigSpecializationParamKind.ownedToGuaranteed.rawValue != 0 {
+                        append("G")
+                    }
+                    if kindValue & FunctionSigSpecializationParamKind.guaranteedToOwned.rawValue != 0 {
+                        append("O")
+                    }
+                } else if kindValue & FunctionSigSpecializationParamKind.ownedToGuaranteed.rawValue != 0 {
+                    append("g")
+                } else if kindValue & FunctionSigSpecializationParamKind.guaranteedToOwned.rawValue != 0 {
+                    append("o")
+                }
+                if kindValue & FunctionSigSpecializationParamKind.sroa.rawValue != 0 {
+                    append("X")
+                }
             }
         }
     }
@@ -4986,9 +5034,8 @@ extension Remangler {
         throw .unsupportedNodeKind(node)
     }
 
-    private func mangleSILThunkHopToMainActorIfNeeded(_ node: Node, depth: Int) throws(ManglingError) {
-        // This method doesn't exist in C++ - likely a newer addition or different name
-        throw .unsupportedNodeKind(node)
+    private func mangleRepresentationChanged(_ node: Node, depth: Int) throws(ManglingError) {
+        append("r")
     }
 
     // MARK: - Helper Methods for Dependent Types

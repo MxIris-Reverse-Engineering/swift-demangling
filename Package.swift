@@ -22,7 +22,7 @@ let package = Package(
             name: "Demangling",
             dependencies: [
                 .product(name: "FoundationToolbox", package: "FrameworkToolbox"),
-            ],
+            ]
         ),
         .testTarget(
             name: "DemanglingTests",

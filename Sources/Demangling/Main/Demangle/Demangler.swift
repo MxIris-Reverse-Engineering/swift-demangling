@@ -1134,6 +1134,7 @@ extension Demangler {
              .initializer,
              .propertyWrapperBackingInitializer,
              .propertyWrapperInitFromProjectedValue,
+             .propertyWrappedFieldInitAccessor,
              .static:
             consumesGenericArgs = false
         default:
@@ -1582,7 +1583,7 @@ extension Demangler {
         case "T":
             switch try scanner.readScalar() {
             case "I": return try Node.create(kind: .silThunkIdentity, child: require(pop(where: { $0.isEntity })))
-            case "H": return try Node.create(kind: .silThunkHopToMainActorIfNeeded, child: require(pop(where: { $0.isEntity })))
+            case "H": throw failure
             default: throw failure
             }
         case "c": return try Node.create(kind: .curryThunk, child: require(pop(where: { $0.isEntity })))
@@ -1613,7 +1614,7 @@ extension Demangler {
             if let sig {
                 children.append(sig)
             }
-            return Node.create(kind: c == "z" ? .objCAsyncCompletionHandlerImpl : .predefinedObjCAsyncCompletionHandlerImpl, children: children)
+            return Node.create(kind: c == "z" ? .objCAsyncCompletionHandlerImpl : .checkedObjCAsyncCompletionHandlerImpl, children: children)
         case "V":
             let base = try require(pop(where: { $0.isEntity }))
             let derived = try require(pop(where: { $0.isEntity }))
@@ -1917,42 +1918,51 @@ extension Demangler {
     private mutating func demangleFunctionSpecialization() throws(DemanglingError) -> Node {
         let specBase = try demangleSpecAttributes(kind: .functionSignatureSpecialization, demangleUniqueId: true)
         var specChildren = Array(specBase.children)
-        var paramIdx: UInt64 = 0
+
+        // RepresentationChanged specialization has no params
+        if specBase.children.first?.kind == .representationChanged {
+            return Node.create(kind: .functionSignatureSpecialization, contents: specBase.contents, children: specChildren)
+        }
+
         while !scanner.conditional(scalar: "_") {
             try specChildren.append(demangleFuncSpecParam(kind: .functionSignatureSpecializationParam))
-            paramIdx += 1
         }
         if !scanner.conditional(scalar: "n") {
             try specChildren.append(demangleFuncSpecParam(kind: .functionSignatureSpecializationReturn))
         }
 
-        for paramIndexPair in specChildren.enumerated().reversed() {
-            let param = paramIndexPair.element
+        // Add the required parameters in reverse order.
+        for paramIndex in (0 ..< specChildren.count).reversed() {
+            var param = specChildren[paramIndex]
             guard param.kind == .functionSignatureSpecializationParam else { continue }
-            guard let kindName = param.children.first else { continue }
-            guard kindName.kind == .functionSignatureSpecializationParamKind, case .index(let i) = kindName.contents else { throw failure }
-            let paramKind = FunctionSigSpecializationParamKind(rawValue: UInt64(i))
-            switch paramKind {
-            case .constantPropFunction,
-                 .constantPropGlobal,
-                 .constantPropString,
-                 .constantPropKeyPath,
-                 .closureProp:
-                var newParam = param
-                let fixedChildrenEndIndex = param.children.endIndex
-                while let t = pop(kind: .type) {
-                    try require(paramKind == .closureProp || paramKind == .constantPropKeyPath)
-                    newParam = newParam.insertingChild(t, at: fixedChildrenEndIndex)
+
+            let fixedChildrenCount = param.children.count
+            for childIndex in 0 ..< fixedChildrenCount {
+                let kindNode = param.children[fixedChildrenCount - childIndex - 1]
+                guard kindNode.kind == .functionSignatureSpecializationParamKind,
+                      case .index(let kindValue) = kindNode.contents else { continue }
+                let paramKind = FunctionSigSpecializationParamKind(rawValue: kindValue)
+                switch paramKind {
+                case .closureProp:
+                    while let typeNode = pop(kind: .type) {
+                        param = param.addingChild(typeNode)
+                    }
+                case .constantPropKeyPath:
+                    if let type1 = pop(kind: .type) { param = param.addingChild(type1) }
+                    if let type2 = pop(kind: .type) { param = param.addingChild(type2) }
+                case .constantPropStruct:
+                    if let typeNode = pop(kind: .type) { param = param.addingChild(typeNode) }
+                    continue
+                case .constantPropFunction, .constantPropGlobal, .constantPropString:
+                    break
+                default:
+                    continue
                 }
-                let name = try require(pop(kind: .identifier))
-                var text = try require(name.text)
-                if paramKind == .constantPropString, !text.isEmpty, text.first == "_" {
-                    text = String(text.dropFirst())
-                }
-                newParam = newParam.insertingChild(Node.create(kind: .functionSignatureSpecializationParamPayload, contents: .text(text)), at: fixedChildrenEndIndex)
-                specChildren[paramIndexPair.offset] = newParam
-            default: break
+                let identifierNode = try require(pop(kind: .identifier))
+                param = param.addingChild(identifierNode)
             }
+            param = param.reversingChildren(from: fixedChildrenCount)
+            specChildren[paramIndex] = param
         }
         return Node.create(kind: .functionSignatureSpecialization, contents: specBase.contents, children: specChildren)
     }
@@ -1961,26 +1971,50 @@ extension Demangler {
         var children: [Node] = []
         switch try scanner.readScalar() {
         case "n": break
-        case "c": children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.closureProp.rawValue)))
+        case "c":
+            // Consumes an identifier and multiple type parameters. Added later.
+            children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.closureProp.rawValue)))
+        case "C":
+            // ClosurePropPreviousArg: consumes an index
+            children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.closurePropPreviousArg.rawValue)))
+            let prevArgIndex = try require(demangleNatural())
+            children.append(Node.create(kind: .functionSignatureSpecializationParamPayload, contents: .index(prevArgIndex)))
         case "p":
-            switch try scanner.readScalar() {
-            case "f": children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropFunction.rawValue)))
-            case "g": children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropGlobal.rawValue)))
-            case "i": children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropInteger.rawValue)))
-            case "d": children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropFloat.rawValue)))
-            case "s":
-                let encoding: String
+            // Multiple constant prop kinds can appear in sequence
+            constantPropLoop: while true {
                 switch try scanner.readScalar() {
-                case "b": encoding = "u8"
-                case "w": encoding = "u16"
-                case "c": encoding = "objc"
-                default: throw failure
+                case "S":
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropStruct.rawValue)))
+                case "f":
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropFunction.rawValue)))
+                case "g":
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropGlobal.rawValue)))
+                case "i":
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropInteger.rawValue)))
+                    let intStr = scanner.readWhile { $0.isDigit }
+                    try require(!intStr.isEmpty)
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamPayload, contents: .text(intStr)))
+                case "d":
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropFloat.rawValue)))
+                    let floatStr = scanner.readWhile { $0.isDigit }
+                    try require(!floatStr.isEmpty)
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamPayload, contents: .text(floatStr)))
+                case "s":
+                    let encoding: String
+                    switch try scanner.readScalar() {
+                    case "b": encoding = "u8"
+                    case "w": encoding = "u16"
+                    case "c": encoding = "objc"
+                    default: throw failure
+                    }
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropString.rawValue)))
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamPayload, contents: .text(encoding)))
+                case "k":
+                    children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropKeyPath.rawValue)))
+                default:
+                    try scanner.backtrack()
+                    break constantPropLoop
                 }
-                children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropString.rawValue)))
-                children.append(Node.create(kind: .functionSignatureSpecializationParamPayload, contents: .text(encoding)))
-            case "k":
-                children.append(Node.create(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.constantPropKeyPath.rawValue)))
-            default: throw failure
             }
         case "e":
             var value = FunctionSigSpecializationParamKind.existentialToGeneric.rawValue
@@ -2045,6 +2079,7 @@ extension Demangler {
     private mutating func demangleSpecAttributes(kind: Node.Kind, demangleUniqueId: Bool = false) throws(DemanglingError) -> Node {
         let isSerialized = scanner.conditional(scalar: "q")
         let asyncRemoved = scanner.conditional(scalar: "a")
+        let representationChanged = scanner.conditional(scalar: "r")
         let passId = try scanner.readScalar().value - UnicodeScalar("0").value
         try require((0 ... 9).contains(passId))
         let contents = try demangleUniqueId ? (demangleNatural().map { Node.Contents.index($0) } ?? Node.Contents.none) : Node.Contents.none
@@ -2054,6 +2089,9 @@ extension Demangler {
         }
         if asyncRemoved {
             children.append(NodeFactory.asyncRemoved)
+        }
+        if representationChanged {
+            children.append(Node.create(kind: .representationChanged))
         }
         children.append(Node.create(kind: .specializationPassID, contents: .index(UInt64(passId))))
         return Node.create(kind: kind, contents: contents, children: children)
@@ -2329,6 +2367,8 @@ extension Demangler {
         case "M": kind = .modifyAccessor
         case "x": kind = .modify2Accessor
         case "i": kind = .initAccessor
+        case "b": kind = .borrowAccessor
+        case "z": kind = .mutateAccessor
         case "a":
             switch try scanner.readScalar() {
             case "O": kind = .owningMutableAddressor
@@ -2370,6 +2410,7 @@ extension Demangler {
         case "p": return try demangleEntity(kind: .genericTypeParamDecl)
         case "P": argsAndKind = (.none, .propertyWrapperBackingInitializer)
         case "W": argsAndKind = (.none, .propertyWrapperInitFromProjectedValue)
+        case "F": argsAndKind = (.none, .propertyWrappedFieldInitAccessor)
         default: throw failure
         }
 

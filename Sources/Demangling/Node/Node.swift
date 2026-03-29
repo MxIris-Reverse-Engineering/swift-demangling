@@ -254,6 +254,15 @@ extension Node {
         return Node(kind: kind, contents: contents, inlineChildren: nc)
     }
 
+    /// Returns a new node with children from the given index to end reversed.
+    func reversingChildren(from startIndex: Int) -> Node {
+        var nc = children
+        if startIndex < nc.count {
+            nc[startIndex...].reverse()
+        }
+        return Node(kind: kind, contents: contents, inlineChildren: nc)
+    }
+
     /// Returns a new tree with the descendant node replaced.
     /// If `old` is not found in the tree, returns a copy of self.
     func replacingDescendant(_ old: Node, with new: Node) -> Node {

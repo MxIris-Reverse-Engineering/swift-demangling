@@ -9,6 +9,8 @@ enum FunctionSigSpecializationParamKind: UInt64, CaseIterable, Sendable {
     case boxToStack = 7
     case inOutToOut = 8
     case constantPropKeyPath = 9
+    case constantPropStruct = 10
+    case closurePropPreviousArg = 11
 
     case dead = 64
     case ownedToGuaranteed = 128
@@ -27,6 +29,8 @@ extension FunctionSigSpecializationParamKind {
         case .constantPropInteger: return "Constant Propagated Integer"
         case .constantPropFloat: return "Constant Propagated Float"
         case .constantPropKeyPath: return "Constant Propagated KeyPath"
+        case .constantPropStruct: return "Constant Propagated Struct"
+        case .closurePropPreviousArg: return "Same As Argument"
         case .constantPropString: return "Constant Propagated String"
         case .closureProp: return "Closure Propagated"
         case .existentialToGeneric: return "Existential To Protocol Constrained Generic"

@@ -39,6 +39,7 @@ extension Node {
         case boundGenericProtocol
         case boundGenericStructure
         case boundGenericTypeAlias
+        case borrowAccessor
         case builtinBorrow
         case builtinTypeName
         case builtinTupleType
@@ -47,6 +48,7 @@ extension Node {
         case canonicalSpecializedGenericMetaclass
         case canonicalSpecializedGenericTypeMetadataAccessFunction
         case cFunctionPointer
+        case checkedObjCAsyncCompletionHandlerImpl
         case clangType
         case `class`
         case classMetadataBaseOffset
@@ -205,6 +207,7 @@ extension Node {
         case modifyAccessor
         case modify2Accessor
         case module
+        case mutateAccessor
         case moduleDescriptor
         case nativeOwningAddressor
         case nativeOwningMutableAddressor
@@ -272,11 +275,11 @@ extension Node {
         case peerAttachedMacroExpansion
         case postfixOperator
         case prefixOperator
-        case predefinedObjCAsyncCompletionHandlerImpl
         case privateDeclName
         case propertyDescriptor
         case propertyWrapperBackingInitializer
         case propertyWrapperInitFromProjectedValue
+        case propertyWrappedFieldInitAccessor
         case `protocol`
         case protocolConformance
         case protocolConformanceDescriptorRecord
@@ -304,6 +307,7 @@ extension Node {
         case reabstractionThunkHelperWithSelf
         case readAccessor
         case read2Accessor
+        case representationChanged
         case reflectionMetadataAssocTypeDescriptor
         case reflectionMetadataBuiltinDescriptor
         case reflectionMetadataFieldDescriptor
@@ -324,7 +328,6 @@ extension Node {
         case silPackDirect
         case silPackIndirect
         case silThunkIdentity
-        case silThunkHopToMainActorIfNeeded
         case specializationPassID
         case `static`
         case structure
@@ -400,6 +403,7 @@ extension Node.Kind {
         case .allocator,
              .anonymousContext,
              .autoDiffFunction,
+             .borrowAccessor,
              .class,
              .constructor,
              .curryThunk,
@@ -422,7 +426,8 @@ extension Node.Kind {
              .isolatedDeallocator,
              .materializeForSet,
              .modifyAccessor,
-             .modify2Accessor: fallthrough
+             .modify2Accessor,
+             .mutateAccessor: fallthrough
         case .module,
              .nativeOwningAddressor: fallthrough
         case .nativeOwningMutableAddressor,
@@ -434,6 +439,7 @@ extension Node.Kind {
              .owningMutableAddressor,
              .propertyWrapperBackingInitializer: fallthrough
         case .propertyWrapperInitFromProjectedValue,
+             .propertyWrappedFieldInitAccessor,
              .protocol,
              .protocolSymbolicReference,
              .readAccessor: fallthrough

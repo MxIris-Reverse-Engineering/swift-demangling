@@ -2896,14 +2896,10 @@ struct DemangleSwiftProjectDerivedTests {
     }
 
     @Test func _$s4mainAAyyycAA1CCFTTH() {
+        // TTH (SILThunkHopToMainActorIfNeeded) was removed from upstream Swift demangler
         let input = "$s4mainAAyyycAA1CCFTTH"
-        let output = "hop to main actor thunk of main.main(main.C) -> () -> ()"
-        do {
-            let parsed = try demangleAsNode(input)
-            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
-            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
-        } catch {
-            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        #expect(throws: DemanglingError.self) {
+            try demangleAsNode(input)
         }
     }
 

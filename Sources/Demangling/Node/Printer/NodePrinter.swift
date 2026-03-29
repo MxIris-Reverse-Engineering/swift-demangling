@@ -83,6 +83,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
             printBaseConformanceDescriptor(name)
         case .baseWitnessTableAccessor:
             printBaseWitnessTableAccessor(name)
+        case .borrowAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "borrow")
         case .bodyAttachedMacroExpansion:
             return printMacro(name: name, asPrefixContext: asPrefixContext, label: "body")
         case .boundGenericClass,
@@ -206,7 +207,17 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .functionSignatureSpecialization: printSpecializationPrefix(name, description: "function signature specialization")
         case .functionSignatureSpecializationParam: printFunctionSignatureSpecializationParam(name)
         case .functionSignatureSpecializationParamKind: printFunctionSignatureSpecializationParamKind(name)
-        case .functionSignatureSpecializationParamPayload: target.write((try? demangleAsNode(name.text ?? "").print(using: options)) ?? (name.text ?? ""))
+        case .functionSignatureSpecializationParamPayload:
+            if let text = name.text {
+                let demangledName = (try? demangleAsNode(text))?.print(using: options) ?? ""
+                if demangledName.isEmpty {
+                    target.write(text)
+                } else {
+                    target.write(demangledName)
+                }
+            } else if name.hasIndex {
+                target.write("\(name.index ?? 0)")
+            }
         case .functionSignatureSpecializationReturn: printFunctionSignatureSpecializationParam(name)
         case .genericPartialSpecialization: printSpecializationPrefix(name, description: "generic partial specialization", paramPrefix: "Signature = ")
         case .genericPartialSpecializationNotReAbstracted: printSpecializationPrefix(name, description: "generic not-reabstracted partial specialization", paramPrefix: "Signature = ")
@@ -286,8 +297,9 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .metatypeRepresentation: target.write(name.text ?? "")
         case .methodDescriptor: printFirstChild(name, prefix: "method descriptor for ")
         case .methodLookupFunction: printFirstChild(name, prefix: "method lookup function for ")
-        case .modify2Accessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "modify2")
         case .modifyAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "modify")
+        case .modify2Accessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "modify2")
+        case .mutateAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "mutate")
         case .module: printModule(name)
         case .moduleDescriptor: printFirstChild(name, prefix: "module descriptor ")
         case .nativeOwningAddressor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "nativeOwningAddressor")
@@ -306,7 +318,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
             target.write((name.index ?? 0).hexadecimalString)
         case .number: target.write("\(name.index ?? 0)")
         case .objCAsyncCompletionHandlerImpl,
-             .predefinedObjCAsyncCompletionHandlerImpl: printObjCAsyncCompletionHandlerImpl(name)
+             .checkedObjCAsyncCompletionHandlerImpl: printObjCAsyncCompletionHandlerImpl(name)
         case .objCAttribute: target.write("@objc ")
         case .objCMetadataUpdateFunction: printFirstChild(name, prefix: "ObjC metadata update function for ")
         case .objCResilientClassStub: printFirstChild(name, prefix: "ObjC resilient class stub for ")
@@ -369,6 +381,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .propertyDescriptor: printFirstChild(name, prefix: "property descriptor for ")
         case .propertyWrapperBackingInitializer: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: false, extraName: "property wrapper backing initializer")
         case .propertyWrapperInitFromProjectedValue: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: false, extraName: "property wrapper init from projected value")
+        case .propertyWrappedFieldInitAccessor: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: false, extraName: "property wrapped field init accessor")
         case .protocolConformance: printProtocolConformance(name)
         case .protocolConformanceDescriptor: printFirstChild(name, prefix: "protocol conformance descriptor for ")
         case .protocolConformanceDescriptorRecord: printFirstChild(name, prefix: "protocol conformance descriptor runtime record for ")
@@ -393,12 +406,13 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
              .reabstractionThunkHelper: printReabstractionThunk(name)
         case .reabstractionThunkHelperWithGlobalActor: printReabstracctionThunkHelperWithGlobalActor(name)
         case .reabstractionThunkHelperWithSelf: printReabstractionThunkHelperWithSelf(name)
-        case .read2Accessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "read2")
         case .readAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "read")
+        case .read2Accessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "read2")
         case .reflectionMetadataAssocTypeDescriptor: printFirstChild(name, prefix: "reflection metadata associated type descriptor ")
         case .reflectionMetadataBuiltinDescriptor: printFirstChild(name, prefix: "reflection metadata builtin descriptor ")
         case .reflectionMetadataFieldDescriptor: printFirstChild(name, prefix: "reflection metadata field descriptor ")
         case .reflectionMetadataSuperclassDescriptor: printFirstChild(name, prefix: "reflection metadata superclass descriptor ")
+        case .representationChanged: target.write("representation changed")
         case .relatedEntityDeclName:
             printFirstChild(name, prefix: "related decl '", suffix: "' for ")
             _ = printOptional(name.children.at(1))
@@ -416,7 +430,6 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .silBoxTypeWithLayout: printSilBoxTypeWithLayout(name)
         case .silPackDirect: printChildren(name, prefix: "@direct Pack{", suffix: "}", separator: ", ")
         case .silPackIndirect: printChildren(name, prefix: "@indirect Pack{", suffix: "}", separator: ", ")
-        case .silThunkHopToMainActorIfNeeded: printFirstChild(name, prefix: "hop to main actor thunk of ")
         case .silThunkIdentity: printFirstChild(name, prefix: "identity thunk of ")
         case .specializationPassID: target.write("\(name.index ?? 0)")
         case .static: printFirstChild(name, prefix: "static ")
@@ -591,8 +604,11 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
 
     private mutating func printFunctionSignatureSpecializationParam(_ name: Node) {
         var idx = 0
-        while idx < name.children.count {
-            guard let firstChild = name.children.at(idx), let v = firstChild.index else { return }
+        var argIdx = 0
+        let end = name.children.count
+        while idx < end {
+            guard let child = name.children.at(idx), child.hasIndex else { return }
+            let v = child.index ?? 0
             let k = FunctionSigSpecializationParamKind(rawValue: v)
             switch k {
             case .boxToValue,
@@ -602,48 +618,117 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
                 idx += 1
             case .constantPropFunction,
                  .constantPropGlobal:
-                _ = printOptional(name.children.at(idx), prefix: "[", suffix: " : ")
-                guard let t = name.children.at(idx + 1)?.text else { return }
-                let demangedName = (try? demangleAsNode(t))?.print(using: options) ?? ""
-                if demangedName.isEmpty {
-                    target.write(t)
-                } else {
-                    target.write(demangedName)
-                }
+                target.write("[")
+                _ = printOptional(name.children.at(idx))
+                idx += 1
+                target.write(" : ")
+                printNextParamChildNode(name, argIdx: &argIdx, kind: k)
                 target.write("]")
-                idx += 2
-            case .constantPropInteger: fallthrough
-            case .constantPropFloat:
+            case .constantPropInteger,
+                 .constantPropFloat:
                 _ = printOptional(name.children.at(idx), prefix: "[")
-                _ = printOptional(name.children.at(idx + 1), prefix: " : ", suffix: "]")
-                idx += 2
+                idx += 1
+                _ = printOptional(name.children.at(idx), prefix: " : ", suffix: "]")
+                idx += 1
             case .constantPropString:
-                _ = printOptional(name.children.at(idx), prefix: "[")
-                _ = printOptional(name.children.at(idx + 1), prefix: " : ")
-                _ = printOptional(name.children.at(idx + 2), prefix: "'", suffix: "']")
-                idx += 3
+                if idx + 2 > end { return }
+                target.write("[")
+                _ = printOptional(name.children.at(idx))
+                idx += 1
+                _ = printOptional(name.children.at(idx), prefix: " : ")
+                idx += 1
+                target.write("'")
+                printNextParamChildNode(name, argIdx: &argIdx, kind: k)
+                target.write("'")
+                target.write("]")
             case .constantPropKeyPath:
-                _ = printOptional(name.children.at(idx), prefix: "[")
-                _ = printOptional(name.children.at(idx + 1), prefix: " : ")
-                _ = printOptional(name.children.at(idx + 2), prefix: "<")
-                _ = printOptional(name.children.at(idx + 3), prefix: ",", suffix: ">]")
-                idx += 4
+                target.write("[")
+                _ = printOptional(name.children.at(idx))
+                idx += 1
+                target.write(" : ")
+                printNextParamChildNode(name, argIdx: &argIdx, kind: k)
+                target.write("<")
+                printNextParamChildNode(name, argIdx: &argIdx, kind: k)
+                target.write(",")
+                printNextParamChildNode(name, argIdx: &argIdx, kind: k)
+                target.write(">]")
+            case .constantPropStruct:
+                target.write("[")
+                _ = printOptional(name.children.at(idx))
+                idx += 1
+                target.write(" : ")
+                printNextParamChildNode(name, argIdx: &argIdx, kind: k)
+                target.write("]")
             case .closureProp:
-                _ = printOptional(name.children.at(idx), prefix: "[")
-                _ = printOptional(name.children.at(idx + 1), prefix: " : ", suffix: ", Argument Types : [")
-                idx += 2
-                while idx < name.children.count, let c = name.children.at(idx), c.kind == .type {
-                    _ = printName(c)
-                    idx += 1
-                    if idx < name.children.count, name.children.at(idx)?.text != nil {
+                if idx + 2 > end { return }
+                target.write("[")
+                _ = printOptional(name.children.at(idx))
+                idx += 1
+                target.write(" : ")
+                printNextParamChildNode(name, argIdx: &argIdx, kind: k)
+                target.write(", Argument Types : [")
+                while argIdx < name.children.count {
+                    guard let typeChild = name.children.at(argIdx), typeChild.kind == .type else { break }
+                    argIdx += 1
+                    _ = printName(typeChild)
+                    if argIdx < name.children.count, name.children.at(argIdx)?.kind == .type {
                         target.write(", ")
                     }
                 }
+                target.write("]")
+            case .closurePropPreviousArg:
+                if idx + 2 > end { return }
+                target.write("[")
+                _ = printOptional(name.children.at(idx))
+                idx += 1
+                target.write(" ")
+                _ = printOptional(name.children.at(idx))
+                idx += 1
                 target.write("]")
             default:
                 _ = printOptional(name.children.at(idx))
                 idx += 1
             }
+        }
+    }
+
+    /// Prints the next non-kind/non-payload child node from a specialization param,
+    /// applying demangling for function/global props and string leading underscore stripping.
+    private mutating func printNextParamChildNode(_ node: Node, argIdx: inout Int, kind: FunctionSigSpecializationParamKind?) {
+        while argIdx < node.children.count {
+            let child = node.children[argIdx]
+            argIdx += 1
+            if child.kind == .functionSignatureSpecializationParamKind ||
+               child.kind == .functionSignatureSpecializationParamPayload {
+                continue
+            }
+            switch kind {
+            case .constantPropInteger, .constantPropFloat:
+                guard let text = child.text else { return }
+                let demangledName = (try? demangleAsNode(text))?.print(using: options) ?? ""
+                if demangledName.isEmpty {
+                    target.write(text)
+                } else {
+                    target.write(demangledName)
+                }
+            case .constantPropString:
+                if let text = child.text, !text.isEmpty, text.first == "_" {
+                    target.write(String(text.dropFirst()))
+                    return
+                }
+                _ = printName(child)
+            case .constantPropFunction, .constantPropGlobal:
+                let text = child.text ?? ""
+                let demangledName = (try? demangleAsNode(text))?.print(using: options) ?? ""
+                if demangledName.isEmpty {
+                    target.write(text)
+                } else {
+                    target.write(demangledName)
+                }
+            default:
+                _ = printName(child)
+            }
+            return
         }
     }
 
@@ -1310,7 +1395,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     }
 
     private mutating func printObjCAsyncCompletionHandlerImpl(_ name: Node) {
-        if name.kind == .predefinedObjCAsyncCompletionHandlerImpl {
+        if name.kind == .checkedObjCAsyncCompletionHandlerImpl {
             target.write("predefined ")
         }
         target.write("@objc completion handler block implementation for ")
@@ -1666,7 +1751,8 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
             case .defaultArgumentInitializer,
                  .initializer,
                  .propertyWrapperBackingInitializer,
-                 .propertyWrapperInitFromProjectedValue:
+                 .propertyWrapperInitFromProjectedValue,
+                 .propertyWrappedFieldInitAccessor:
                 target.write(" of ")
             default:
                 target.write(" in ")
@@ -1680,7 +1766,11 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     private mutating func printSpecializationPrefix(_ name: Node, description: String, paramPrefix: String = "") {
         if !options.contains(.displayGenericSpecializations) {
             if !specializationPrefixPrinted {
-                target.write("specialized ")
+                if name.children.first?.kind == .representationChanged {
+                    target.write("representation changed of ")
+                } else {
+                    target.write("specialized ")
+                }
                 specializationPrefixPrinted = true
             }
             return
@@ -1691,7 +1781,8 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         for c in name.children {
             switch c.kind {
             case .specializationPassID,
-                 .droppedArgument: break
+                 .droppedArgument,
+                 .representationChanged: break
             case .isSerialized:
                 target.write(separator)
                 separator = ", "
