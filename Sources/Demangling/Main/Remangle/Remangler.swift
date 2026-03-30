@@ -137,13 +137,13 @@ struct Remangler {
     }
 
     /// Combine two hash values
-    private mutating func combineHash(_ currentHash: Int, _ newValue: Int) -> Int {
+    private func combineHash(_ currentHash: Int, _ newValue: Int) -> Int {
         return 33 &* currentHash &+ newValue
     }
 
     /// Translate operator character for mangling
     /// Based on Swift's ManglingUtils.cpp translateOperatorChar
-    private mutating func translateOperatorChar(_ char: Character) -> Character {
+    private func translateOperatorChar(_ char: Character) -> Character {
         switch char {
         case "&": return "a" // 'and'
         case "@": return "c" // 'commercial at sign'
@@ -197,7 +197,7 @@ struct Remangler {
     }
 
     /// Compute a hash from a node pointer (for cache indexing)
-    private mutating func nodePointerHash(_ node: Node) -> Int {
+    private func nodePointerHash(_ node: Node) -> Int {
         // Use ObjectIdentifier for pointer-like hashing
         let objectId = ObjectIdentifier(node)
         let prime = objectId.hashValue &* 2043
@@ -207,7 +207,7 @@ struct Remangler {
     }
 
     /// Rotate hash bits
-    private mutating func rotateHash(_ value: Int, by shift: Int) -> Int {
+    private func rotateHash(_ value: Int, by shift: Int) -> Int {
         let bits = MemoryLayout<Int>.size * 8
         return (value >> shift) | (value << (bits - shift))
     }
@@ -215,7 +215,7 @@ struct Remangler {
     // MARK: - Substitution Management
 
     /// Find a substitution and return its index, or nil if not found
-    private mutating func findSubstitution(_ entry: SubstitutionEntry) -> UInt64? {
+    private func findSubstitution(_ entry: SubstitutionEntry) -> UInt64? {
         // First search in inline substitutions (fast path)
         if let index = inlineSubstitutions.firstIndex(of: entry) {
             return UInt64(index)
@@ -309,12 +309,12 @@ struct Remangler {
     // MARK: - Word Substitution Helpers
 
     /// Check if a character can start a word
-    private mutating func isWordStart(_ ch: Character) -> Bool {
+    private func isWordStart(_ ch: Character) -> Bool {
         return !ch.isNumber && ch != "_" && ch != "\0"
     }
 
     /// Check if a character (following prevCh) defines the end of a word
-    private mutating func isWordEnd(_ ch: Character, _ prevCh: Character) -> Bool {
+    private func isWordEnd(_ ch: Character, _ prevCh: Character) -> Bool {
         if ch == "_" || ch == "\0" {
             return true
         }
@@ -1151,7 +1151,7 @@ struct Remangler {
     }
 
     /// Get a single child, skipping Type wrapper if present
-    private mutating func skipType(_ node: Node) -> Node {
+    private func skipType(_ node: Node) -> Node {
         if node.kind == .type && node.children.count == 1 {
             return node.children[0]
         }
@@ -1241,7 +1241,7 @@ struct Remangler {
     /// Get standard type substitution string
     ///
     /// Based on StandardTypesMangling.def from Swift compiler
-    private mutating func getStandardTypeSubstitution(_ name: String, allowConcurrencyManglings: Bool = true) -> String? {
+    private func getStandardTypeSubstitution(_ name: String, allowConcurrencyManglings: Bool = true) -> String? {
         // Standard types (Structure, Enum, Protocol)
         switch name {
         // Structures
@@ -1500,7 +1500,7 @@ extension Remangler {
     }
 
     /// Check if a node consumes generic arguments
-    private mutating func nodeConsumesGenericArgs(_ node: Node) -> Bool {
+    private func nodeConsumesGenericArgs(_ node: Node) -> Bool {
         switch node.kind {
         case .variable,
              .subscript,
@@ -1737,7 +1737,7 @@ extension Remangler {
         addSubstitution(substResult.entry)
     }
 
-    private mutating func encodePunycode(_ text: String) -> String? {
+    private func encodePunycode(_ text: String) -> String? {
         // Use the Punycode encoding implementation
         // mapNonSymbolChars: true to handle non-symbol characters
         return Punycode.encodePunycode(text, mapNonSymbolChars: true)
@@ -2580,7 +2580,7 @@ extension Remangler {
         try mangleChildNodes(proto, depth: depth + 1)
     }
 
-    private mutating func getChildOfType(_ node: Node) -> Node {
+    private func getChildOfType(_ node: Node) -> Node {
         assert(node.kind == .type)
         assert(node.children.count == 1)
         return node.children[0]
@@ -4269,7 +4269,7 @@ extension Remangler {
         append("P")
     }
 
-    private mutating func require<T>(_ param: T?) throws(ManglingError) -> T {
+    private func require<T>(_ param: T?) throws(ManglingError) -> T {
         if let param {
             return param
         } else {
