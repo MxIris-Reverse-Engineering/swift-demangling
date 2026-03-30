@@ -1730,8 +1730,8 @@ extension Remangler {
             processedText = text
         }
 
-        // Use the shared Mangle.mangleIdentifier implementation
-        Self.mangleIdentifier(self, processedText)
+        // Use the shared mangleIdentifier implementation
+        mangleIdentifier(processedText)
 
         // Add this node to the substitution table
         addSubstitution(substResult.entry)
@@ -5543,21 +5543,20 @@ extension Remangler {
     /// 3. Handles Punycode encoding for non-ASCII identifiers
     ///
     /// - Parameters:
-    ///   - mangler: The mangler instance implementing IdentifierMangler protocol
     ///   - ident: The identifier to mangle
-    private static func mangleIdentifier(_ mangler: Remangler, _ ident: String) {
-        let wordsInBuffer = mangler.words.count
-        assert(mangler.substWordsInIdent.isEmpty)
+    private func mangleIdentifier(_ ident: String) {
+        let wordsInBuffer = words.count
+        assert(substWordsInIdent.isEmpty)
 
         // Handle Punycode encoding for non-ASCII identifiers
-        if mangler.usePunycode, needsPunycodeEncoding(ident) {
+        if usePunycode, Self.needsPunycodeEncoding(ident) {
             if let encoded = Punycode.encodePunycode(ident, mapNonSymbolChars: true) {
                 let pcIdent = encoded
-                mangler.append("00\(pcIdent.count)")
-                if let first = pcIdent.first, isDigit(first) || first == "_" {
-                    mangler.append("_")
+                append("00\(pcIdent.count)")
+                if let first = pcIdent.first, Self.isDigit(first) || first == "_" {
+                    append("_")
                 }
-                mangler.append(pcIdent)
+                append(pcIdent)
                 return
             }
         }
@@ -5569,7 +5568,7 @@ extension Remangler {
         for pos in 0 ... ident.count {
             let ch: Character = pos < ident.count ? ident[ident.index(ident.startIndex, offsetBy: pos)] : "\0"
 
-            if wordStartPos != notInsideWord, isWordEnd(ch, pos > 0 ? ident[ident.index(ident.startIndex, offsetBy: pos - 1)] : "\0") {
+            if wordStartPos != notInsideWord, Self.isWordEnd(ch, pos > 0 ? ident[ident.index(ident.startIndex, offsetBy: pos - 1)] : "\0") {
                 // End of a word
                 assert(pos > wordStartPos)
                 let wordLen = pos - wordStartPos
@@ -5580,7 +5579,7 @@ extension Remangler {
                 // Look up word in buffer and existing words
                 func lookupWord(in str: String, from: Int, to: Int) -> Int? {
                     for idx in from ..< to {
-                        let w = mangler.words[idx]
+                        let w = words[idx]
                         let existingWordStart = str.index(str.startIndex, offsetBy: w.start)
                         let existingWordEnd = str.index(existingWordStart, offsetBy: w.length)
                         let existingWord = String(str[existingWordStart ..< existingWordEnd])
@@ -5592,67 +5591,67 @@ extension Remangler {
                 }
 
                 // Check if word exists in buffer
-                var wordIdx = lookupWord(in: mangler.buffer, from: 0, to: wordsInBuffer)
+                var wordIdx = lookupWord(in: buffer, from: 0, to: wordsInBuffer)
 
                 // Check if word exists in this identifier
                 if wordIdx == nil {
-                    wordIdx = lookupWord(in: ident, from: wordsInBuffer, to: mangler.words.count)
+                    wordIdx = lookupWord(in: ident, from: wordsInBuffer, to: words.count)
                 }
 
                 if let idx = wordIdx {
                     // Found word substitution
                     assert(idx < 26)
-                    mangler.addSubstWordInIdent(WordReplacement(stringPos: wordStartPos, wordIdx: idx))
-                } else if wordLen >= 2, mangler.words.count < Remangler.maxNumWords {
+                    addSubstWordInIdent(WordReplacement(stringPos: wordStartPos, wordIdx: idx))
+                } else if wordLen >= 2, words.count < Self.maxNumWords {
                     // New word
-                    mangler.addWord(SubstitutionWord(start: wordStartPos, length: wordLen))
+                    addWord(SubstitutionWord(start: wordStartPos, length: wordLen))
                 }
 
                 wordStartPos = notInsideWord
             }
 
-            if wordStartPos == notInsideWord, isWordStart(ch) {
+            if wordStartPos == notInsideWord, Self.isWordStart(ch) {
                 // Begin of a word
                 wordStartPos = pos
             }
         }
 
         // Mangle with word substitutions
-        if !mangler.substWordsInIdent.isEmpty {
-            mangler.append("0")
+        if !substWordsInIdent.isEmpty {
+            append("0")
         }
 
         var pos = 0
         var wordsInBufferMutable = wordsInBuffer
 
         // Add dummy word at end
-        mangler.addSubstWordInIdent(WordReplacement(stringPos: ident.count, wordIdx: -1))
+        addSubstWordInIdent(WordReplacement(stringPos: ident.count, wordIdx: -1))
 
-        for idx in 0 ..< mangler.substWordsInIdent.count {
-            let repl = mangler.substWordsInIdent[idx]
+        for idx in 0 ..< substWordsInIdent.count {
+            let repl = substWordsInIdent[idx]
 
             if pos < repl.stringPos {
                 // Mangle substring up to next word substitution
                 var first = true
-                mangler.append("\(repl.stringPos - pos)")
+                append("\(repl.stringPos - pos)")
 
                 repeat {
                     // Update start position of new words
-                    if wordsInBufferMutable < mangler.words.count,
-                       mangler.words[wordsInBufferMutable].start == pos {
-                        var word = mangler.words[wordsInBufferMutable]
-                        word.start = mangler.buffer.count
-                        mangler.words[wordsInBufferMutable] = word
+                    if wordsInBufferMutable < words.count,
+                       words[wordsInBufferMutable].start == pos {
+                        var word = words[wordsInBufferMutable]
+                        word.start = buffer.count
+                        words[wordsInBufferMutable] = word
                         wordsInBufferMutable += 1
                     }
 
                     let ch = ident[ident.index(ident.startIndex, offsetBy: pos)]
 
                     // Error recovery for invalid identifiers
-                    if first, isDigit(ch) {
-                        mangler.append("X")
+                    if first, Self.isDigit(ch) {
+                        append("X")
                     } else {
-                        mangler.append(String(ch))
+                        append(String(ch))
                     }
 
                     pos += 1
@@ -5662,25 +5661,25 @@ extension Remangler {
 
             // Handle word substitution
             if repl.wordIdx >= 0 {
-                assert(repl.wordIdx < mangler.words.count, "Word index \(repl.wordIdx) out of range (words.count = \(mangler.words.count))")
-                pos += mangler.words[repl.wordIdx].length
+                assert(repl.wordIdx < words.count, "Word index \(repl.wordIdx) out of range (words.count = \(words.count))")
+                pos += words[repl.wordIdx].length
 
-                if idx < mangler.substWordsInIdent.count - 2 {
+                if idx < substWordsInIdent.count - 2 {
                     // Lowercase letter
                     let ch = Character(UnicodeScalar(UInt8(ascii: "a") + UInt8(repl.wordIdx)))
-                    mangler.append(String(ch))
+                    append(String(ch))
                 } else {
                     // Last word substitution is uppercase
                     let ch = Character(UnicodeScalar(UInt8(ascii: "A") + UInt8(repl.wordIdx)))
-                    mangler.append(String(ch))
+                    append(String(ch))
                     if pos == ident.count {
-                        mangler.append("0")
+                        append("0")
                     }
                 }
             }
         }
 
-        mangler.substWordsInIdent.removeAll()
+        substWordsInIdent.removeAll()
     }
 
     /// An entry in the remangler's substitution map.
