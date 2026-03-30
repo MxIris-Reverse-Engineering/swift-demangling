@@ -1003,7 +1003,7 @@ extension Demangler {
         var cachedParentId: String?
         func getParentId() -> String {
             if let cached = cachedParentId { return cached }
-            let remangler = Remangler(usePunycode: true)
+            var remangler = Remangler(usePunycode: true)
             let id = (try? remangler.mangle(parent)) ?? ""
             cachedParentId = id
             return id
