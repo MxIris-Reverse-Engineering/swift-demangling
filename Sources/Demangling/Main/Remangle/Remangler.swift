@@ -26,7 +26,7 @@ final class Remangler {
 
     let flavor = ManglingFlavor.default
 
-    private let substMerging: SubstitutionMerging = .init()
+    private var substMerging: SubstitutionMerging = .init()
 
     /// List of all words seen so far in the mangled string
     private var words: [SubstitutionWord] = []
@@ -1192,7 +1192,7 @@ final class Remangler {
             let substChar = Character(UnicodeScalar(UInt8(ascii: "A") + UInt8(index)))
             let subst = String(substChar)
             // Try to merge with previous substitution
-            if !substMerging.tryMergeSubst(self, subst: subst, isStandardSubst: false) {
+            if !substMerging.tryMergeSubst(buffer: &buffer, subst: subst, isStandardSubst: false) {
                 // If merge failed, output normally
                 append("A")
                 append(subst)
@@ -1227,7 +1227,7 @@ final class Remangler {
         // Check for standard type substitutions
         if let subst = getStandardTypeSubstitution(typeName, allowConcurrencyManglings: true) {
             // Try to merge with previous substitution
-            if !substMerging.tryMergeSubst(self, subst: subst, isStandardSubst: true) {
+            if !substMerging.tryMergeSubst(buffer: &buffer, subst: subst, isStandardSubst: true) {
                 // If merge failed, output normally
                 append("S")
                 append(subst)
@@ -5427,7 +5427,7 @@ extension Remangler {
     ///
     /// Used in the Mangler and Remangler to optimize repeated substitutions.
     /// For example: 'AB' can be merged to 'A2B', 'AB' to 'AbC', etc.
-    private class SubstitutionMerging {
+    private struct SubstitutionMerging {
         /// The position of the last substitution mangling
         /// e.g. 3 for 'AabC' and 'Aab4C'
         private var lastSubstPosition: Int = 0
@@ -5451,7 +5451,7 @@ extension Remangler {
         init() {}
 
         /// Clear the state
-        func clear() {
+        mutating func clear() {
             lastNumSubsts = 0
         }
 
@@ -5468,24 +5468,24 @@ extension Remangler {
         ///   - appendToBuffer: Callback to append string to buffer
         ///   - getBuffer: Callback to get current buffer content
         /// - Returns: True if merge was successful
-        func tryMergeSubst(
-            _ mangler: Remangler,
+        mutating func tryMergeSubst(
+            buffer: inout String,
             subst: String,
             isStandardSubst: Bool
         ) -> Bool {
             assert(Remangler.isUpperLetter(subst.last!) || (isStandardSubst && Remangler.isLowerLetter(subst.last!)))
 
-            let bufferStr = mangler.buffer
+            let bufferCount = buffer.count
 
             if lastNumSubsts > 0 && lastNumSubsts < Self.maxRepeatCount
-                && bufferStr.count == lastSubstPosition + lastSubstSize
+                && bufferCount == lastSubstPosition + lastSubstSize
                 && lastSubstIsStandardSubst == isStandardSubst {
                 // The last mangled thing is a substitution
-                assert(lastSubstPosition > 0 && lastSubstPosition < bufferStr.count)
+                assert(lastSubstPosition > 0 && lastSubstPosition < bufferCount)
                 assert(lastSubstSize > 0)
 
-                let lastSubstStart = bufferStr.index(bufferStr.endIndex, offsetBy: -lastSubstSize)
-                var lastSubst = String(bufferStr[lastSubstStart...])
+                let lastSubstStart = buffer.index(buffer.endIndex, offsetBy: -lastSubstSize)
+                var lastSubst = String(buffer[lastSubstStart...])
 
                 // Drop leading digits
                 while let first = lastSubst.first, Remangler.isDigit(first) {
@@ -5497,15 +5497,16 @@ extension Remangler {
                 if lastSubst != subst && !isStandardSubst {
                     // We can merge with a different 'A' substitution
                     // e.g. 'AB' -> 'AbC'
-                    lastSubstPosition = bufferStr.count
+                    lastSubstPosition = bufferCount
                     lastNumSubsts = 1
-                    let resetPos = bufferStr.count - 1
-                    mangler.resetBuffer(to: resetPos)
+                    let resetPos = bufferCount - 1
+                    let resetIndex = buffer.index(buffer.startIndex, offsetBy: resetPos)
+                    buffer = String(buffer[..<resetIndex])
                     assert(Remangler.isUpperLetter(lastSubst.last!))
 
                     let lastChar = lastSubst.last!
                     let lowercaseChar = Character(UnicodeScalar(lastChar.asciiValue! - Character("A").asciiValue! + Character("a").asciiValue!))
-                    mangler.append(String(lowercaseChar) + subst)
+                    buffer.append(String(lowercaseChar) + subst)
                     lastSubstSize = 1
                     return true
                 }
@@ -5514,19 +5515,19 @@ extension Remangler {
                     // We can merge with the same 'A' or 'S' substitution
                     // e.g. 'AB' -> 'A2B', or 'S3i' -> 'S4i'
                     lastNumSubsts += 1
-                    mangler.resetBuffer(to: lastSubstPosition)
-                    mangler.append("\(lastNumSubsts)\(subst)")
+                    let resetIndex = buffer.index(buffer.startIndex, offsetBy: lastSubstPosition)
+                    buffer = String(buffer[..<resetIndex])
+                    buffer.append("\(lastNumSubsts)\(subst)")
 
                     // Get updated buffer to calculate the new size
-                    let currentBuffer = mangler.buffer
-                    lastSubstSize = currentBuffer.count - lastSubstPosition
+                    lastSubstSize = buffer.count - lastSubstPosition
                     return true
                 }
             }
 
             // We can't merge with the previous substitution, but let's remember this
             // substitution which will be mangled by the caller
-            lastSubstPosition = bufferStr.count + 1
+            lastSubstPosition = bufferCount + 1
             lastSubstSize = subst.count
             lastNumSubsts = 1
             lastSubstIsStandardSubst = isStandardSubst
