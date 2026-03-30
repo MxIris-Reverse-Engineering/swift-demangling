@@ -10,7 +10,7 @@
 ///   - usePunycode: Whether to use Punycode encoding for non-ASCII identifiers
 /// - Returns: The mangled string, or nil if remangling failed
 public func mangleAsString(_ node: Node, usePunycode: Bool = true) throws(ManglingError) -> String {
-    let remangler = Remangler(usePunycode: usePunycode)
+    var remangler = Remangler(usePunycode: usePunycode)
     return try remangler.mangle(node)
 }
 
