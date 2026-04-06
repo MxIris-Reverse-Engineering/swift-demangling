@@ -12,8 +12,15 @@ extension Node: CustomStringConvertible {
     /// - Parameter options: an option set containing the different `DemangleOptions` from the Swift project.
     /// - Returns: `self` printed to a string according to the specified options.
     public func print(using options: DemangleOptions = .default) -> String {
-        var printer = NodePrinter<String>(options: options)
-        return printer.printRoot(self)
+        let printBlock: @Sendable () -> String = {
+            var printer = NodePrinter<String>(options: options)
+            return printer.printRoot(self)
+        }
+        #if canImport(Darwin)
+        return StackSafeExecutor.execute(printBlock)
+        #else
+        return printBlock()
+        #endif
     }
 
     private func printNode(output: inout String, node: Node, depth: Int = 0) {
