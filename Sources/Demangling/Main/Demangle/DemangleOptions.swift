@@ -26,6 +26,7 @@ public struct DemangleOptions: OptionSet, Codable, Sendable {
     public static let showModuleInDependentMemberType = DemangleOptions(rawValue: 1 << 21)
     public static let removeWeakPrefix = DemangleOptions(rawValue: 1 << 22)
     public static let removeBoundGeneric = DemangleOptions(rawValue: 1 << 23)
+    public static let removeReferenceStoragePrefix = DemangleOptions(rawValue: 1 << 24)
 
     public init(rawValue: Int) {
         self.rawValue = rawValue
