@@ -26,7 +26,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DemanglingTests",
-            dependencies: ["Demangling"]
+            dependencies: ["Demangling"],
+            resources: [
+                .copy("UpstreamInputs"),
+            ]
         ),
     ]
 )
