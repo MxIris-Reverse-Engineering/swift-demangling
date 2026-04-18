@@ -4006,7 +4006,7 @@ extension Remangler {
             throw .invalidNodeStructure(node, message: "NegativeInteger has no index")
         }
         append("$n")
-        mangleIndex(0 &- index)
+        mangleIndex(index)
     }
 
     private mutating func mangleSpecializationPassID(_ node: Node, depth: Int) throws(ManglingError) {

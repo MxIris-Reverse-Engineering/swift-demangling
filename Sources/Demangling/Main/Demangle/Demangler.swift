@@ -122,6 +122,7 @@ extension Demangler {
 
     private mutating func parseAndPushNames() throws(DemanglingError) {
         while !scanner.isAtEnd {
+            if scanner.peek() == "\u{0}" { return }
             try nameStack.append(demangleOperator())
         }
     }
@@ -1407,8 +1408,6 @@ extension Demangler {
             try require(t.children.first?.kind.isAnyGeneric == true)
             return try Node.create(kind: .reflectionMetadataSuperclassDescriptor, child: require(t.children.first))
         case "D": return try Node.create(kind: .typeMetadataDemanglingCache, child: require(pop(kind: .type)))
-        case "d": return try Node.create(kind: .typeMetadataDemanglingCache, child: require(pop(kind: .type)))
-        case "R": return try Node.create(kind: .typeMetadataMangledNameRef, child: require(pop(kind: .type)))
         case "f": return try Node.create(kind: .fullTypeMetadata, child: require(pop(kind: .type)))
         case "F": return try Node.create(kind: .reflectionMetadataFieldDescriptor, child: require(pop(kind: .type)))
         case "g": return try Node.create(kind: .opaqueTypeDescriptorAccessor, child: require(pop()))
@@ -1712,7 +1711,7 @@ extension Demangler {
         case "H",
              "h":
             let nodeKind: Node.Kind = c == "H" ? .keyPathEqualsThunkHelper : .keyPathHashThunkHelper
-            let isSerialized = scanner.peek() == "q"
+            let isSerialized = scanner.conditional(scalar: "q")
             var types = [Node]()
             let node = try require(pop())
             var genericSig: Node? = nil
@@ -2180,6 +2179,7 @@ extension Demangler {
                 guard let identifier = pop(where: { $0.isDeclName }) else { throw failure }
                 declChildren.append(identifier)
             }
+            declChildren.reverse()
             let declList = Node.create(kind: .globalVariableOnceDeclList, children: declChildren)
             return try Node.create(kind: c == "Z" ? .globalVariableOnceFunction : .globalVariableOnceToken, children: [popContext(), declList])
         case "J":
@@ -2373,7 +2373,7 @@ extension Demangler {
             switch try scanner.readScalar() {
             case "O": kind = .owningMutableAddressor
             case "o": kind = .nativeOwningMutableAddressor
-            case "p": kind = .nativePinningMutableAddressor
+            case "P": kind = .nativePinningMutableAddressor
             case "u": kind = .unsafeMutableAddressor
             default: throw failure
             }
