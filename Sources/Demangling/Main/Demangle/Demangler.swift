@@ -161,7 +161,10 @@ extension Demangler {
     }
 
     private mutating func demangleOperator() throws(DemanglingError) -> Node {
-        let scalar = try scanner.readScalar()
+        var scalar = try scanner.readScalar()
+        while scalar.value == 0xFF {
+            scalar = try scanner.readScalar()
+        }
         switch scalar {
         case "\u{1}",
              "\u{2}",
