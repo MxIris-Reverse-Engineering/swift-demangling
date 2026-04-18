@@ -235,8 +235,8 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .globalActorFunctionType: printGlobalActorFunctionType(name)
         case .globalGetter: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "getter")
         case .globalVariableOnceDeclList: printGlobalVariableOnceDeclList(name)
-        case .globalVariableOnceFunction,
-             .globalVariableOnceToken: printGlobalVariableOnceFunction(name)
+        case .globalVariableOnceFunction: printGlobalVariableOnceFunction(name)
+        case .globalVariableOnceToken: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .withColon, hasName: true)
         case .hasSymbolQuery: target.write("#_hasSymbol query for ")
         case .identifier: printIdentifier(name, asPrefixContext: asPrefixContext)
         case .implConvention: target.write(name.text ?? "")
@@ -1267,7 +1267,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     }
 
     private mutating func printGlobalVariableOnceFunction(_ name: Node) {
-        target.write(name.kind == .globalVariableOnceToken ? "one-time initialization token for " : "one-time initialization function for ")
+        target.write("one-time initialization function for ")
         if let firstChild = name.children.first {
             _ = shouldPrintContext(firstChild)
         }
