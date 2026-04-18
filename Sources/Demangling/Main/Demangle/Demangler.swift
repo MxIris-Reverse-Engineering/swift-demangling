@@ -2142,12 +2142,7 @@ extension Demangler {
             var children: [Node] = sig.map { [type, $0] } ?? [type]
             switch try scanner.readScalar() {
             case "B":
-                let type = try require(pop(kind: .type))
-                if let sig = pop(kind: .dependentGenericSignature) {
-                    return Node.create(kind: .outlinedInitializeWithTakeNoValueWitness, children: [type, sig])
-                } else {
-                    return Node.create(kind: .outlinedInitializeWithTakeNoValueWitness, children: [type])
-                }
+                return Node.create(kind: .outlinedInitializeWithTakeNoValueWitness, children: children)
             case "C": return Node.create(kind: .outlinedInitializeWithCopyNoValueWitness, children: children)
             case "D": return Node.create(kind: .outlinedAssignWithTakeNoValueWitness, children: children)
             case "F": return Node.create(kind: .outlinedAssignWithCopyNoValueWitness, children: children)
