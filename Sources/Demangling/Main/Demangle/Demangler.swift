@@ -4,7 +4,7 @@ struct Demangler<C>: Sendable where C: Collection, C.Iterator.Element == Unicode
     private var substitutions: [Node] = []
     private var words: [String] = []
     private var isOldFunctionTypeMangling: Bool = false
-    private var flavor: ManglingFlavor = .default
+    var flavor: ManglingFlavor = .default
     private var symbolicReferenceIndex: Int = 0
 
     var symbolicReferenceResolver: DemangleSymbolicReferenceResolver?
@@ -47,11 +47,21 @@ extension Demangler {
     }
 
     private mutating func readManglingPrefix() throws(DemanglingError) {
-        let prefixes = [
-            "_T0", "$S", "_$S", "$s", "_$s", "$e", "_$e", "@__swiftmacro_",
+        let prefixTable: [(prefix: String, flavor: ManglingFlavor?)] = [
+            ("_T0", nil),
+            ("$S", nil),
+            ("_$S", nil),
+            ("$s", nil),
+            ("_$s", nil),
+            ("$e", .embedded),
+            ("_$e", .embedded),
+            ("@__swiftmacro_", nil),
         ]
-        for prefix in prefixes {
+        for (prefix, prefixFlavor) in prefixTable {
             if scanner.conditional(string: prefix) {
+                if let prefixFlavor {
+                    flavor = prefixFlavor
+                }
                 return
             }
         }
