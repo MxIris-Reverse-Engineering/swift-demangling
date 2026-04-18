@@ -886,7 +886,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     private mutating func printConcreteProtocolConformance(_ name: Node) {
         target.write("concrete protocol conformance ")
         if let index = name.index {
-            target.write(" #\(index)")
+            target.write("#\(index) ")
         }
         printFirstChild(name)
         target.write(" to ")
