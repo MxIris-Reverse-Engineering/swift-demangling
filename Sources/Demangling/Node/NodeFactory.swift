@@ -296,9 +296,6 @@ public final class NodeCache: @unchecked Sendable {
             NodeFactory.tuple,
             NodeFactory.pack,
             NodeFactory.errorType,
-            NodeFactory.sugaredOptional,
-            NodeFactory.sugaredArray,
-            NodeFactory.sugaredParen,
             NodeFactory.opaqueReturnType,
             NodeFactory.vTableAttribute,
         ]
@@ -404,9 +401,6 @@ public enum NodeFactory {
     public static let tuple = Node(kind: .tuple)
     public static let pack = Node(kind: .pack)
     public static let errorType = Node(kind: .errorType)
-    public static let sugaredOptional = Node(kind: .sugaredOptional)
-    public static let sugaredArray = Node(kind: .sugaredArray)
-    public static let sugaredParen = Node(kind: .sugaredParen)
     public static let opaqueReturnType = Node(kind: .opaqueReturnType)
     public static let vTableAttribute = Node(kind: .vTableAttribute)
 }
