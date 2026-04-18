@@ -183,7 +183,7 @@ extension Demangler {
         case "A": return try demangleMultiSubstitutions()
         case "B": return try demangleBuiltinType()
         case "C": return try demangleAnyGenericType(kind: .class)
-        case "D": return try Node.create(kind: .typeMangling, child: require(pop(kind: .type)))
+        case "D": return try demangleTypeMangling()
         case "E": return try demangleExtensionContext()
         case "F": return try demanglePlainFunction()
         case "G": return try demangleBoundGenericType()
@@ -253,6 +253,12 @@ extension Demangler {
             try scanner.backtrack()
             return try demangleIdentifier()
         }
+    }
+
+    private mutating func demangleTypeMangling() throws(DemanglingError) -> Node {
+        let type = try require(pop(kind: .type))
+        let labeled = try popFunctionParamLabels(type: type) ?? type
+        return Node.create(kind: .typeMangling, child: labeled)
     }
 
     private mutating func demangleNatural() throws(DemanglingError) -> UInt64? {
