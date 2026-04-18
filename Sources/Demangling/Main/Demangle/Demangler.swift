@@ -257,8 +257,10 @@ extension Demangler {
 
     private mutating func demangleTypeMangling() throws(DemanglingError) -> Node {
         let type = try require(pop(kind: .type))
-        let labeled = try popFunctionParamLabels(type: type) ?? type
-        return Node.create(kind: .typeMangling, child: labeled)
+        if let labelList = try popFunctionParamLabels(type: type) {
+            return Node.create(kind: .typeMangling, children: [labelList, type])
+        }
+        return Node.create(kind: .typeMangling, child: type)
     }
 
     private mutating func demangleNatural() throws(DemanglingError) -> UInt64? {
