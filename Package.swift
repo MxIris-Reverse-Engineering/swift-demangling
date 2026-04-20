@@ -16,6 +16,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/Mx-Iris/FrameworkToolbox", from: "0.4.0"),
+        .package(url: "https://github.com/MxIris-Reverse-Engineering/MachOKit.git", from: "0.46.100"),
     ],
     targets: [
         .target(
@@ -24,9 +25,24 @@ let package = Package(
                 .product(name: "FoundationToolbox", package: "FrameworkToolbox"),
             ]
         ),
+        .target(
+            name: "DemanglingTestingSupportC",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "DemanglingTestingSupport",
+            dependencies: [
+                "Demangling",
+                "DemanglingTestingSupportC",
+                .product(name: "MachOKit", package: "MachOKit"),
+            ]
+        ),
         .testTarget(
             name: "DemanglingTests",
-            dependencies: ["Demangling"]
+            dependencies: [
+                "Demangling",
+                "DemanglingTestingSupport",
+            ]
         ),
     ]
 )

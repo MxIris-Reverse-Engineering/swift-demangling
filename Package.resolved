@@ -1,13 +1,76 @@
 {
-  "originHash" : "1a8e574901dd7b1c25783b1e14493615f8ea5a8379380e8fea4ca6005561da7c",
+  "originHash" : "68d764ddb5c0f451ec994ca1ae3fcbfc08f7113d3dd72959400a37487697722b",
   "pins" : [
     {
       "identity" : "frameworktoolbox",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/Mx-Iris/FrameworkToolbox",
       "state" : {
-        "revision" : "11ffdd076d4dbf14d619692acb9b44d547893480",
-        "version" : "0.4.2"
+        "revision" : "342b9846c6333700be6f0603b1b827cc90df87c5",
+        "version" : "0.5.1"
+      }
+    },
+    {
+      "identity" : "machokit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/MxIris-Reverse-Engineering/MachOKit.git",
+      "state" : {
+        "revision" : "02686f5dc545a4f93efbe036031373058ae5c015",
+        "version" : "0.49.100"
+      }
+    },
+    {
+      "identity" : "objectarchivekit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/p-x9/ObjectArchiveKit.git",
+      "state" : {
+        "revision" : "96d782a576273b73b277b577943a2a25b00b919e",
+        "version" : "0.5.0"
+      }
+    },
+    {
+      "identity" : "swift-asn1",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-asn1.git",
+      "state" : {
+        "revision" : "eb50cbd14606a9161cbc5d452f18797c90ef0bab",
+        "version" : "1.7.0"
+      }
+    },
+    {
+      "identity" : "swift-binary-parse-support",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/p-x9/swift-binary-parse-support.git",
+      "state" : {
+        "revision" : "5fb96b503672ea4752eded6b4e301fd87214b03b",
+        "version" : "0.2.1"
+      }
+    },
+    {
+      "identity" : "swift-crypto",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-crypto.git",
+      "state" : {
+        "revision" : "95ba0316a9b733e92bb6b071255ff46263bbe7dc",
+        "version" : "3.15.1"
+      }
+    },
+    {
+      "identity" : "swift-fileio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/p-x9/swift-fileio.git",
+      "state" : {
+        "revision" : "d589ff3966f9f064574780f527449a946736b989",
+        "version" : "0.13.0"
+      }
+    },
+    {
+      "identity" : "swift-fileio-extra",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/p-x9/swift-fileio-extra.git",
+      "state" : {
+        "revision" : "8d83506dd4dff737807d90dbf2264096ed98c7a7",
+        "version" : "0.2.2"
       }
     },
     {
