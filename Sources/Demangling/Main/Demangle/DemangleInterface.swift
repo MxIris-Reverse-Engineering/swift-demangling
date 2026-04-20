@@ -9,7 +9,23 @@
 /// - Returns: the successfully parsed result
 /// - Throws: a SwiftSymbolParseError error that contains parse position when the error occurred.
 public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil) throws(DemanglingError) -> Node {
-    try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver)
+    let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
+        try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver)
+    }
+    return try StackSafeExecutor.execute(demangleBlock)
+}
+
+/// Asynchronous variant of ``demangleAsNode(_:isType:symbolicReferenceResolver:)``.
+///
+/// Always runs on a dedicated 8MB-stack `Thread` and suspends the calling task
+/// via a continuation, so Swift Concurrency cooperative workers are not blocked
+/// while demangling deeply nested types. Prefer this overload in high-throughput
+/// async pipelines.
+public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil) async throws(DemanglingError) -> Node {
+    let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
+        try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver)
+    }
+    return try await StackSafeExecutor.executeAsync(demangleBlock)
 }
 
 /// Pass a collection of `UnicodeScalars` containing a Swift mangled symbol or type, get a parsed SwiftSymbol structure which can then be directly examined or printed.

@@ -1,10 +1,12 @@
 extension Node: CustomStringConvertible {
     /// Overridden method to allow simple printing with default options
     public var description: String {
-        var string = ""
-        printNode(output: &string, node: self)
-        string.removeLast() // Remove the last newline
-        return string
+        StackSafeExecutor.execute {
+            var string = ""
+            self.printNode(output: &string, node: self)
+            string.removeLast() // Remove the last newline
+            return string
+        }
     }
 
     /// Prints `SwiftSymbol`s to a String with the full set of printing options.
@@ -12,15 +14,22 @@ extension Node: CustomStringConvertible {
     /// - Parameter options: an option set containing the different `DemangleOptions` from the Swift project.
     /// - Returns: `self` printed to a string according to the specified options.
     public func print(using options: DemangleOptions = .default) -> String {
-        let printBlock: @Sendable () -> String = {
+        StackSafeExecutor.execute {
             var printer = NodePrinter<String>(options: options)
             return printer.printRoot(self)
         }
-        #if canImport(Darwin)
-        return StackSafeExecutor.execute(printBlock)
-        #else
-        return printBlock()
-        #endif
+    }
+
+    /// Asynchronous variant of ``print(using:)``.
+    ///
+    /// Always runs on a dedicated 8MB-stack `Thread` and suspends the calling
+    /// task via a continuation, so Swift Concurrency cooperative workers are
+    /// not blocked while printing deeply nested types.
+    public func print(using options: DemangleOptions = .default) async -> String {
+        await StackSafeExecutor.executeAsync {
+            var printer = NodePrinter<String>(options: options)
+            return printer.printRoot(self)
+        }
     }
 
     private func printNode(output: inout String, node: Node, depth: Int = 0) {

@@ -10,8 +10,25 @@
 ///   - usePunycode: Whether to use Punycode encoding for non-ASCII identifiers
 /// - Returns: The mangled string, or nil if remangling failed
 public func mangleAsString(_ node: Node, usePunycode: Bool = true) throws(ManglingError) -> String {
-    var remangler = Remangler(usePunycode: usePunycode)
-    return try remangler.mangle(node)
+    let mangleBlock: @Sendable () throws(ManglingError) -> String = {
+        var remangler = Remangler(usePunycode: usePunycode)
+        return try remangler.mangle(node)
+    }
+    return try StackSafeExecutor.execute(mangleBlock)
+}
+
+/// Asynchronous variant of ``mangleAsString(_:usePunycode:)``.
+///
+/// Always runs on a dedicated 8MB-stack `Thread` and suspends the calling task
+/// via a continuation, so Swift Concurrency cooperative workers are not blocked
+/// while remangling deeply nested types. Prefer this overload in high-throughput
+/// async pipelines.
+public func mangleAsString(_ node: Node, usePunycode: Bool = true) async throws(ManglingError) -> String {
+    let mangleBlock: @Sendable () throws(ManglingError) -> String = {
+        var remangler = Remangler(usePunycode: usePunycode)
+        return try remangler.mangle(node)
+    }
+    return try await StackSafeExecutor.executeAsync(mangleBlock)
 }
 
 // MARK: - Validation Helpers
