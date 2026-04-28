@@ -46,7 +46,8 @@ public struct FunctionParam<BuiltType> {
     }
 }
 
-/// Parameter flags
+/// Parameter flags. Bit layout matches Swift ABI `TargetParameterTypeFlags`
+/// (see `swift/ABI/MetadataValues.h`).
 public struct ParameterFlags: OptionSet {
     public let rawValue: UInt32
 
@@ -54,84 +55,65 @@ public struct ParameterFlags: OptionSet {
         self.rawValue = rawValue
     }
 
-    // Flag bits
-    private static let variadicBit: UInt32 = 1 << 0
-    private static let autoClosureBit: UInt32 = 1 << 1
-    private static let noDerivativeBit: UInt32 = 1 << 2
-    private static let isolatedBit: UInt32 = 1 << 3
-    private static let sendingBit: UInt32 = 1 << 4
-    private static let ownershipMask: UInt32 = 0x7 << 5
+    private static let ownershipMask: UInt32 = 0x7F
+    private static let variadicMask: UInt32 = 0x80
+    private static let autoClosureMask: UInt32 = 0x100
+    private static let noDerivativeMask: UInt32 = 0x200
+    private static let isolatedMask: UInt32 = 0x400
+    private static let sendingMask: UInt32 = 0x800
 
-    // Ownership values in bits 5-7
-    private static let ownershipDefault: UInt32 = 0 << 5
-    private static let ownershipInOut: UInt32 = 1 << 5
-    private static let ownershipShared: UInt32 = 2 << 5
-    private static let ownershipOwned: UInt32 = 3 << 5
-
-    public var isVariadic: Bool { (rawValue & Self.variadicBit) != 0 }
-    public var isAutoClosure: Bool { (rawValue & Self.autoClosureBit) != 0 }
-    public var isNoDerivative: Bool { (rawValue & Self.noDerivativeBit) != 0 }
-    public var isIsolated: Bool { (rawValue & Self.isolatedBit) != 0 }
-    public var isSending: Bool { (rawValue & Self.sendingBit) != 0 }
+    public var isVariadic: Bool { (rawValue & Self.variadicMask) != 0 }
+    public var isAutoClosure: Bool { (rawValue & Self.autoClosureMask) != 0 }
+    public var isNoDerivative: Bool { (rawValue & Self.noDerivativeMask) != 0 }
+    public var isIsolated: Bool { (rawValue & Self.isolatedMask) != 0 }
+    public var isSending: Bool { (rawValue & Self.sendingMask) != 0 }
 
     public var ownership: ParameterOwnership {
-        switch rawValue & Self.ownershipMask {
-        case Self.ownershipInOut: return .inout
-        case Self.ownershipShared: return .shared
-        case Self.ownershipOwned: return .owned
-        default: return .default
-        }
+        return ParameterOwnership(rawValue: UInt8(rawValue & Self.ownershipMask)) ?? .default
     }
 
     public func withVariadic(_ value: Bool) -> ParameterFlags {
         if value {
-            return ParameterFlags(rawValue: rawValue | Self.variadicBit)
+            return ParameterFlags(rawValue: rawValue | Self.variadicMask)
         } else {
-            return ParameterFlags(rawValue: rawValue & ~Self.variadicBit)
+            return ParameterFlags(rawValue: rawValue & ~Self.variadicMask)
         }
     }
 
     public func withAutoClosure(_ value: Bool) -> ParameterFlags {
         if value {
-            return ParameterFlags(rawValue: rawValue | Self.autoClosureBit)
+            return ParameterFlags(rawValue: rawValue | Self.autoClosureMask)
         } else {
-            return ParameterFlags(rawValue: rawValue & ~Self.autoClosureBit)
+            return ParameterFlags(rawValue: rawValue & ~Self.autoClosureMask)
         }
     }
 
     public func withOwnership(_ ownership: ParameterOwnership) -> ParameterFlags {
         let cleared = rawValue & ~Self.ownershipMask
-        let ownershipBits: UInt32
-        switch ownership {
-        case .default: ownershipBits = Self.ownershipDefault
-        case .inout: ownershipBits = Self.ownershipInOut
-        case .shared: ownershipBits = Self.ownershipShared
-        case .owned: ownershipBits = Self.ownershipOwned
-        }
-        return ParameterFlags(rawValue: cleared | ownershipBits)
+        return ParameterFlags(rawValue: cleared | UInt32(ownership.rawValue))
     }
 
     public func withNoDerivative(_ value: Bool) -> ParameterFlags {
         if value {
-            return ParameterFlags(rawValue: rawValue | Self.noDerivativeBit)
+            return ParameterFlags(rawValue: rawValue | Self.noDerivativeMask)
         } else {
-            return ParameterFlags(rawValue: rawValue & ~Self.noDerivativeBit)
+            return ParameterFlags(rawValue: rawValue & ~Self.noDerivativeMask)
         }
     }
 
     public func withIsolated(_ value: Bool) -> ParameterFlags {
         if value {
-            return ParameterFlags(rawValue: rawValue | Self.isolatedBit)
+            return ParameterFlags(rawValue: rawValue | Self.isolatedMask)
         } else {
-            return ParameterFlags(rawValue: rawValue & ~Self.isolatedBit)
+            return ParameterFlags(rawValue: rawValue & ~Self.isolatedMask)
         }
     }
 
     public func withSending(_ value: Bool) -> ParameterFlags {
         if value {
-            return ParameterFlags(rawValue: rawValue | Self.sendingBit)
+            return ParameterFlags(rawValue: rawValue | Self.sendingMask)
         } else {
-            return ParameterFlags(rawValue: rawValue & ~Self.sendingBit)
+            return ParameterFlags(rawValue: rawValue & ~Self.sendingMask)
         }
     }
 }
@@ -222,7 +204,8 @@ public struct ImplFunctionResult<BuiltType> {
     }
 }
 
-/// Function type flags
+/// Function type flags. Bit layout matches Swift ABI `TargetFunctionTypeFlags`
+/// (see `swift/ABI/MetadataValues.h`).
 public struct FunctionTypeFlags: OptionSet {
     public let rawValue: UInt32
 
@@ -230,118 +213,120 @@ public struct FunctionTypeFlags: OptionSet {
         self.rawValue = rawValue
     }
 
-    // Convention bits (0-2)
-    private static let conventionMask: UInt32 = 0x7
-    private static let conventionSwift: UInt32 = 0
-    private static let conventionBlock: UInt32 = 1
-    private static let conventionThin: UInt32 = 2
-    private static let conventionCFunctionPointer: UInt32 = 3
-
-    // Flag bits
-    private static let sendableBit: UInt32 = 1 << 3
-    private static let asyncBit: UInt32 = 1 << 4
-    private static let throwsBit: UInt32 = 1 << 5
-    private static let differentiableBit: UInt32 = 1 << 6
-    private static let escapingBit: UInt32 = 1 << 7
-    private static let parameterFlagsBit: UInt32 = 1 << 8
-    private static let extendedFlagsBit: UInt32 = 1 << 9
-
-    // Number of parameters encoded in bits 16-31
-    private static let numParametersShift: UInt32 = 16
-    private static let numParametersMask: UInt32 = 0xFFFF_0000
+    private static let numParametersMask: UInt32 = 0x0000_FFFF
+    private static let conventionMask: UInt32 = 0x00FF_0000
+    private static let conventionShift: UInt32 = 16
+    private static let throwsMask: UInt32 = 0x0100_0000
+    private static let parameterFlagsMask: UInt32 = 0x0200_0000
+    private static let escapingMask: UInt32 = 0x0400_0000
+    private static let differentiableMask: UInt32 = 0x0800_0000
+    private static let globalActorMask: UInt32 = 0x1000_0000
+    private static let asyncMask: UInt32 = 0x2000_0000
+    private static let sendableMask: UInt32 = 0x4000_0000
+    private static let extendedFlagsMask: UInt32 = 0x8000_0000
 
     public var convention: FunctionMetadataConvention {
-        switch rawValue & Self.conventionMask {
-        case Self.conventionBlock: return .block
-        case Self.conventionThin: return .thin
-        case Self.conventionCFunctionPointer: return .cFunctionPointer
+        let raw = (rawValue & Self.conventionMask) >> Self.conventionShift
+        switch raw {
+        case 1: return .block
+        case 2: return .thin
+        case 3: return .cFunctionPointer
         default: return .swift
         }
     }
 
-    public var isSendable: Bool { (rawValue & Self.sendableBit) != 0 }
-    public var isAsync: Bool { (rawValue & Self.asyncBit) != 0 }
-    public var `throws`: Bool { (rawValue & Self.throwsBit) != 0 }
-    public var isDifferentiable: Bool { (rawValue & Self.differentiableBit) != 0 }
-    public var isEscaping: Bool { (rawValue & Self.escapingBit) != 0 }
-    public var hasParameterFlags: Bool { (rawValue & Self.parameterFlagsBit) != 0 }
-    public var hasExtendedFlags: Bool { (rawValue & Self.extendedFlagsBit) != 0 }
+    public var isSendable: Bool { (rawValue & Self.sendableMask) != 0 }
+    public var isAsync: Bool { (rawValue & Self.asyncMask) != 0 }
+    public var `throws`: Bool { (rawValue & Self.throwsMask) != 0 }
+    public var isDifferentiable: Bool { (rawValue & Self.differentiableMask) != 0 }
+    public var isEscaping: Bool { (rawValue & Self.escapingMask) != 0 }
+    public var hasParameterFlags: Bool { (rawValue & Self.parameterFlagsMask) != 0 }
+    public var hasGlobalActor: Bool { (rawValue & Self.globalActorMask) != 0 }
+    public var hasExtendedFlags: Bool { (rawValue & Self.extendedFlagsMask) != 0 }
 
     public var numParameters: Int {
-        return Int((rawValue & Self.numParametersMask) >> Self.numParametersShift)
+        return Int(rawValue & Self.numParametersMask)
     }
 
     public func withConvention(_ convention: FunctionMetadataConvention) -> FunctionTypeFlags {
         let cleared = rawValue & ~Self.conventionMask
-        let conventionBits: UInt32
+        let conventionRaw: UInt32
         switch convention {
-        case .swift: conventionBits = Self.conventionSwift
-        case .block: conventionBits = Self.conventionBlock
-        case .thin: conventionBits = Self.conventionThin
-        case .cFunctionPointer: conventionBits = Self.conventionCFunctionPointer
+        case .swift: conventionRaw = 0
+        case .block: conventionRaw = 1
+        case .thin: conventionRaw = 2
+        case .cFunctionPointer: conventionRaw = 3
         }
-        return FunctionTypeFlags(rawValue: cleared | conventionBits)
+        return FunctionTypeFlags(rawValue: cleared | (conventionRaw << Self.conventionShift))
     }
 
     public func withSendable(_ value: Bool) -> FunctionTypeFlags {
         if value {
-            return FunctionTypeFlags(rawValue: rawValue | Self.sendableBit)
+            return FunctionTypeFlags(rawValue: rawValue | Self.sendableMask)
         } else {
-            return FunctionTypeFlags(rawValue: rawValue & ~Self.sendableBit)
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.sendableMask)
         }
     }
 
     public func withAsync(_ value: Bool) -> FunctionTypeFlags {
         if value {
-            return FunctionTypeFlags(rawValue: rawValue | Self.asyncBit)
+            return FunctionTypeFlags(rawValue: rawValue | Self.asyncMask)
         } else {
-            return FunctionTypeFlags(rawValue: rawValue & ~Self.asyncBit)
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.asyncMask)
         }
     }
 
     public func withThrows(_ value: Bool) -> FunctionTypeFlags {
         if value {
-            return FunctionTypeFlags(rawValue: rawValue | Self.throwsBit)
+            return FunctionTypeFlags(rawValue: rawValue | Self.throwsMask)
         } else {
-            return FunctionTypeFlags(rawValue: rawValue & ~Self.throwsBit)
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.throwsMask)
         }
     }
 
     public func withDifferentiable(_ value: Bool) -> FunctionTypeFlags {
         if value {
-            return FunctionTypeFlags(rawValue: rawValue | Self.differentiableBit)
+            return FunctionTypeFlags(rawValue: rawValue | Self.differentiableMask)
         } else {
-            return FunctionTypeFlags(rawValue: rawValue & ~Self.differentiableBit)
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.differentiableMask)
         }
     }
 
     public func withEscaping(_ value: Bool) -> FunctionTypeFlags {
         if value {
-            return FunctionTypeFlags(rawValue: rawValue | Self.escapingBit)
+            return FunctionTypeFlags(rawValue: rawValue | Self.escapingMask)
         } else {
-            return FunctionTypeFlags(rawValue: rawValue & ~Self.escapingBit)
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.escapingMask)
         }
     }
 
     public func withParameterFlags(_ value: Bool) -> FunctionTypeFlags {
         if value {
-            return FunctionTypeFlags(rawValue: rawValue | Self.parameterFlagsBit)
+            return FunctionTypeFlags(rawValue: rawValue | Self.parameterFlagsMask)
         } else {
-            return FunctionTypeFlags(rawValue: rawValue & ~Self.parameterFlagsBit)
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.parameterFlagsMask)
+        }
+    }
+
+    public func withGlobalActor(_ value: Bool) -> FunctionTypeFlags {
+        if value {
+            return FunctionTypeFlags(rawValue: rawValue | Self.globalActorMask)
+        } else {
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.globalActorMask)
         }
     }
 
     public func withExtendedFlags(_ value: Bool) -> FunctionTypeFlags {
         if value {
-            return FunctionTypeFlags(rawValue: rawValue | Self.extendedFlagsBit)
+            return FunctionTypeFlags(rawValue: rawValue | Self.extendedFlagsMask)
         } else {
-            return FunctionTypeFlags(rawValue: rawValue & ~Self.extendedFlagsBit)
+            return FunctionTypeFlags(rawValue: rawValue & ~Self.extendedFlagsMask)
         }
     }
 
     public func withNumParameters(_ count: Int) -> FunctionTypeFlags {
         let cleared = rawValue & ~Self.numParametersMask
-        let countBits = (UInt32(count) << Self.numParametersShift) & Self.numParametersMask
+        let countBits = UInt32(count) & Self.numParametersMask
         return FunctionTypeFlags(rawValue: cleared | countBits)
     }
 }
@@ -598,12 +583,13 @@ public enum ImplFunctionDifferentiabilityKind: Sendable {
     case linear
 }
 
-/// Parameter ownership modes
-public enum ParameterOwnership: Sendable {
-    case `default`
-    case `inout`
-    case shared
-    case owned
+/// Parameter ownership modes. Raw values match Swift ABI `ParameterOwnership`
+/// (see `swift/ABI/MetadataValues.h`).
+public enum ParameterOwnership: UInt8, Sendable {
+    case `default` = 0
+    case `inout` = 1
+    case shared = 2
+    case owned = 3
 }
 
 /// Function metadata convention
@@ -627,7 +613,12 @@ public enum FunctionMetadataDifferentiabilityKind: Sendable {
     }
 }
 
-/// Extended function type flags
+/// Extended function type flags. Bit layout matches Swift ABI
+/// `TargetExtendedFunctionTypeFlags` (see `swift/ABI/MetadataValues.h`).
+///
+/// Note: `IsolationMask` (bits 1-3) is an enumerated 3-bit field, not a set of
+/// independent bits. `IsolatedAny` and `NonIsolatedCaller` are mutually exclusive
+/// values within that field; the `with*` methods clear the field before setting.
 public struct ExtendedFunctionTypeFlags: OptionSet, Sendable {
     public let rawValue: UInt32
 
@@ -635,29 +626,55 @@ public struct ExtendedFunctionTypeFlags: OptionSet, Sendable {
         self.rawValue = rawValue
     }
 
-    public static let hasIsolatedAny = ExtendedFunctionTypeFlags(rawValue: 1 << 0)
-    public static let hasNonIsolatedCaller = ExtendedFunctionTypeFlags(rawValue: 1 << 1)
-    public static let hasSendingResult = ExtendedFunctionTypeFlags(rawValue: 1 << 2)
-    public static let hasTypedThrows = ExtendedFunctionTypeFlags(rawValue: 1 << 3)
+    private static let typedThrowsMask: UInt32 = 0x0000_0001
+    private static let isolationMask: UInt32 = 0x0000_000E
+    private static let isolatedAnyValue: UInt32 = 0x0000_0002
+    private static let nonIsolatedCallerValue: UInt32 = 0x0000_0004
+    private static let hasSendingResultMask: UInt32 = 0x0000_0010
+    private static let invertedProtocolShift: UInt32 = 16
+    private static let invertedProtocolMask: UInt32 = 0xFFFF_0000
+
+    public var isTypedThrows: Bool { (rawValue & Self.typedThrowsMask) != 0 }
+    public var isIsolatedAny: Bool { (rawValue & Self.isolationMask) == Self.isolatedAnyValue }
+    public var isNonIsolatedCaller: Bool { (rawValue & Self.isolationMask) == Self.nonIsolatedCallerValue }
+    public var hasSendingResult: Bool { (rawValue & Self.hasSendingResultMask) != 0 }
 
     public func withIsolatedAny() -> ExtendedFunctionTypeFlags {
-        return union(.hasIsolatedAny)
+        return ExtendedFunctionTypeFlags(rawValue: (rawValue & ~Self.isolationMask) | Self.isolatedAnyValue)
     }
 
     public func withNonIsolatedCaller() -> ExtendedFunctionTypeFlags {
-        return union(.hasNonIsolatedCaller)
+        return ExtendedFunctionTypeFlags(rawValue: (rawValue & ~Self.isolationMask) | Self.nonIsolatedCallerValue)
     }
 
-    public func withSendingResult() -> ExtendedFunctionTypeFlags {
-        return union(.hasSendingResult)
+    public func withNonIsolated() -> ExtendedFunctionTypeFlags {
+        return ExtendedFunctionTypeFlags(rawValue: rawValue & ~Self.isolationMask)
+    }
+
+    public func withSendingResult(_ value: Bool = true) -> ExtendedFunctionTypeFlags {
+        if value {
+            return ExtendedFunctionTypeFlags(rawValue: rawValue | Self.hasSendingResultMask)
+        } else {
+            return ExtendedFunctionTypeFlags(rawValue: rawValue & ~Self.hasSendingResultMask)
+        }
     }
 
     public func withTypedThrows(_ value: Bool) -> ExtendedFunctionTypeFlags {
         if value {
-            return union(.hasTypedThrows)
+            return ExtendedFunctionTypeFlags(rawValue: rawValue | Self.typedThrowsMask)
         } else {
-            return subtracting(.hasTypedThrows)
+            return ExtendedFunctionTypeFlags(rawValue: rawValue & ~Self.typedThrowsMask)
         }
+    }
+
+    public var invertedProtocols: UInt16 {
+        return UInt16((rawValue & Self.invertedProtocolMask) >> Self.invertedProtocolShift)
+    }
+
+    public func withInvertedProtocols(_ inverted: UInt16) -> ExtendedFunctionTypeFlags {
+        let cleared = rawValue & ~Self.invertedProtocolMask
+        let bits = (UInt32(inverted) << Self.invertedProtocolShift) & Self.invertedProtocolMask
+        return ExtendedFunctionTypeFlags(rawValue: cleared | bits)
     }
 }
 

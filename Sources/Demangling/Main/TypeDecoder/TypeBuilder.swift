@@ -92,7 +92,6 @@ public protocol TypeBuilder {
 
     // Create special types
     func createDynamicSelfType(base: BuiltType) -> BuiltType
-    func createOpaqueType(descriptor: Node, genericArgs: [ArraySlice<BuiltType>], ordinal: Int) -> BuiltType
     func resolveOpaqueType(descriptor: Node, genericArgs: [ArraySlice<BuiltType>], ordinal: UInt64) -> BuiltType
     func createBuiltinType(name: String, mangledName: String) -> BuiltType
 

@@ -174,7 +174,7 @@ extension TypeDecoder {
         case .builtinTypeName:
             let mangling: String
             do {
-                mangling = try mangleAsString(node)
+                mangling = try mangleAsString(node, flavor: builder.getManglingFlavor())
             } catch {
                 throw TypeLookupError(node: node, message: "failed to mangle node")
             }
@@ -422,6 +422,7 @@ extension TypeDecoder {
                 .withAsync(isAsync)
                 .withThrows(isThrow)
                 .withDifferentiable(diffKind.isDifferentiable)
+                .withGlobalActor(globalActorType != nil)
 
             guard node.children.count >= firstChildIndex + 2 else {
                 throw TypeLookupError(node: node, message: "fewer children (\(node.children.count)) than required (\(firstChildIndex + 2))")
@@ -1046,7 +1047,7 @@ extension TypeDecoder {
             case .implParameterImplicitLeading:
                 options = options.union(T.getImplicitLeading())
             default:
-                break
+                throw TypeLookupError(node: child, message: "unexpected attribute kind")
             }
         }
 
@@ -1095,7 +1096,7 @@ extension TypeDecoder {
                 options = options.union(T.getSending())
 
             default:
-                break
+                throw TypeLookupError(node: child, message: "unexpected attribute kind")
             }
         }
 
@@ -1281,11 +1282,11 @@ extension TypeDecoder {
                 } catch {
                     throw TypeLookupError("Index out of bound.")
                 }
+            }
 
-                return try decodeTypeSequenceElement(node: node, depth: depth + 1) { paramType in
-                    param.setType(paramType)
-                    params.append(param)
-                }
+            try decodeTypeSequenceElement(node: node, depth: depth + 1) { paramType in
+                param.setType(paramType)
+                params.append(param)
             }
         }
 

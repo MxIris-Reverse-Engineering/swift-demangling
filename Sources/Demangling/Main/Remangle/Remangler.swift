@@ -24,7 +24,7 @@ struct Remangler {
 
     let usePunycode: Bool
 
-    let flavor = ManglingFlavor.default
+    let flavor: ManglingFlavor
 
     private var substMerging: SubstitutionMerging = .init()
 
@@ -48,8 +48,9 @@ struct Remangler {
 
     // MARK: - Initialization
 
-    init(usePunycode: Bool) {
+    init(usePunycode: Bool, flavor: ManglingFlavor = .default) {
         self.usePunycode = usePunycode
+        self.flavor = flavor
         inlineSubstitutions.reserveCapacity(Self.inlineSubstCapacity)
     }
 
