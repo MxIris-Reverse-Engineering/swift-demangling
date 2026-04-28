@@ -2296,13 +2296,19 @@ extension Demangler {
         case "e": return Node.create(kind: .type, child: NodeFactory.errorType)
         case "S":
             switch try scanner.readScalar() {
-            case "q": return Node.create(kind: .type, child: NodeFactory.sugaredOptional)
-            case "a": return Node.create(kind: .type, child: NodeFactory.sugaredArray)
+            case "q":
+                let type = try require(pop(kind: .type))
+                return Node.create(kind: .type, child: Node.create(kind: .sugaredOptional, child: type))
+            case "a":
+                let type = try require(pop(kind: .type))
+                return Node.create(kind: .type, child: Node.create(kind: .sugaredArray, child: type))
             case "D":
                 let value = try require(pop(kind: .type))
                 let key = try require(pop(kind: .type))
                 return Node.create(kind: .type, child: Node.create(kind: .sugaredDictionary, children: [key, value]))
-            case "p": return Node.create(kind: .type, child: NodeFactory.sugaredParen)
+            case "p":
+                let type = try require(pop(kind: .type))
+                return Node.create(kind: .type, child: Node.create(kind: .sugaredParen, child: type))
             case "A":
                 let element = try require(pop(kind: .type))
                 let count = try require(pop(kind: .type))
