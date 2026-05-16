@@ -1,9 +1,28 @@
 public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
+    /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth`` from
+    /// ``swift/include/swift/Demangling/Demangle.h``. Bails the print
+    /// recursion with ``<<too complex>>`` once a single root-to-leaf path
+    /// would exceed this many ``printName`` frames, matching the C++ guard
+    /// at ``swift/lib/Demangling/NodePrinter.cpp:1416``.
+    public static var maxPrintDepth: Int { 768 }
+
     private var target: Target
     private var specializationPrefixPrinted: Bool
     private var options: DemangleOptions
     private var hidingCurrentModule: String = ""
     private var dependentMemberTypeDepth: Int = 0
+    private var printDepth: Int = 0
+    /// Memoizes the rendered fragment for each shared substitution node.
+    /// The demangler returns the same ``Node`` instance for every
+    /// back-reference (``A23_`` etc.), so one mangling can produce a DAG
+    /// that — naively walked child-by-child — expands into hundreds of
+    /// thousands of node visits (a SwiftUI ``View.Body`` typealias was
+    /// measured at 394k visits / 246 unique nodes, max-repeat 19, depth
+    /// 41). Caching the printed fragment keyed by ``ObjectIdentifier(node)``
+    /// brings cost back to the size of the unique node set instead of the
+    /// exponential expansion. Apple's own C++ ``NodePrinter`` does not do
+    /// this (so ``swift demangle`` itself hangs on the same input).
+    private var printCache: [ObjectIdentifier: Target] = [:]
 
     public init(options: DemangleOptions = .default) {
         self.target = .init()
@@ -17,6 +36,37 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     }
 
     private mutating func printName(_ name: Node, asPrefixContext: Bool = false) -> Node? {
+        if printDepth > Self.maxPrintDepth {
+            target.write("<<too complex>>")
+            return nil
+        }
+        // Only memoize prints that don't depend on caller-side state. A
+        // `dependentMemberTypeDepth > 0` chain or `asPrefixContext` changes
+        // the rendered output for the same node, so those calls bypass the
+        // cache to stay correct.
+        let canCache = !asPrefixContext && dependentMemberTypeDepth == 0
+        if canCache, let cached = printCache[ObjectIdentifier(name)] {
+            target.append(cached)
+            return nil
+        }
+        printDepth += 1
+        defer { printDepth -= 1 }
+        if canCache {
+            // Redirect output into a fresh sub-target so we can capture the
+            // exact slice produced for `name`, then splice it back into the
+            // live target and remember it for later reuse.
+            var subTarget = Target()
+            swap(&target, &subTarget)
+            let result = dispatchPrintName(name, asPrefixContext: asPrefixContext)
+            swap(&target, &subTarget)
+            printCache[ObjectIdentifier(name)] = subTarget
+            target.append(subTarget)
+            return result
+        }
+        return dispatchPrintName(name, asPrefixContext: asPrefixContext)
+    }
+
+    private mutating func dispatchPrintName(_ name: Node, asPrefixContext: Bool = false) -> Node? {
         switch name.kind {
         case .accessibleFunctionRecord:
             if !options.contains(.shortenThunk) {
