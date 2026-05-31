@@ -38,7 +38,7 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 ### Key Types
 
 - **`Node`** (`Node.swift`) — Immutable tree node (reference type, `Sendable`). Uses a unified `Payload` enum that merges contents (`.text`/`.index`/`.none`) and children (`.oneChild`/`.twoChildren`/`.manyChildren`) into a single discriminated union — contents and children are mutually exclusive. Mutation methods are `fileprivate`; external code must use `NodeBuilder`.
-- **`NodeChildren`** (`NodeChildren.swift`) — Inline storage for 0–2 children without heap allocation; falls back to `ContiguousArray` for 3+.
+- **`Node.Children`** (`Node.Children.swift`) — Inline storage for 0–2 children without heap allocation; falls back to `ContiguousArray` for 3+.
 - **`NodeBuilder`** (`Node.swift`) — Thread-safe builder for constructing `Node` trees incrementally (uses `os_unfair_lock`).
 - **`Node.create()`** (`Node+Init.swift`) — Public static factories that go through `NodeCache.shared` for leaf-node interning. Always use these instead of `Node.init()` when creating nodes that should be cached.
 - **`NodeCache` / `NodeFactory`** (`NodeFactory.swift`) — `NodeCache` is the global leaf-node interning cache. `NodeFactory` provides pre-created singletons for common parameterless nodes (e.g., `NodeFactory.emptyList`, `.asyncAnnotation`). The `Node.init(...)` convenience initializers in `NodeFactory.swift` are **internal** and bypass the cache — they exist for `Demangler`/`Remangler` internals.
@@ -81,7 +81,7 @@ Sources/Demangling/
   Main/Demangle/     — Demangler, DemangleInterface, DemangleOptions
   Main/Remangle/     — Remangler, RemangleInterface
   Main/TypeDecoder/  — TypeDecoder, TypeBuilder protocol
-  Node/              — Node, NodeChildren, NodeBuilder, NodeCache, Kind, Conversions, Sequence, Rewriter
+  Node/              — Node, Node.Children, NodeBuilder, NodeCache, Kind, Conversions, Sequence, Rewriter
   Node/Printer/      — NodePrinter, NodePrinterTarget protocol, NodePrintContext/State
   Enums/             — SugarType, ManglingFlavor, DemanglingError, ManglingError, etc.
   Utils/             — Extensions, Common constants, Punycode

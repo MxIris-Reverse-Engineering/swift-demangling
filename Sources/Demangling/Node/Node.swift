@@ -55,25 +55,25 @@ public final class Node: Sendable {
 
     /// Child nodes. Only modified during demangling.
     @inlinable
-    public var children: NodeChildren {
+    public var children: Children {
         switch payload {
         case .none,
              .index,
              .text:
-            return NodeChildren()
+            return Children()
         case .oneChild(let n):
-            return NodeChildren(n)
+            return Children(n)
         case .twoChildren(let n0, let n1):
-            return NodeChildren(n0, n1)
+            return Children(n0, n1)
         case .manyChildren(let children):
-            return NodeChildren(children)
+            return Children(children)
         }
     }
 
     /// Merge contents and children into the most compact payload case.
     /// When children are present, they take priority (contents and children are mutually exclusive).
     @usableFromInline
-    static func mergedPayload(contents: Contents, children: NodeChildren) -> Payload {
+    static func mergedPayload(contents: Contents, children: Children) -> Payload {
         if children.count > 0 {
             switch children.count {
             case 1: return .oneChild(children[0])
@@ -90,16 +90,16 @@ public final class Node: Sendable {
 
     init(kind: Kind, contents: Contents = .none, children: [Node] = []) {
         self.kind = kind
-        self.payload = Self.mergedPayload(contents: contents, children: NodeChildren(children))
+        self.payload = Self.mergedPayload(contents: contents, children: Children(children))
     }
 
-    init(kind: Kind, contents: Contents = .none, inlineChildren: NodeChildren) {
+    init(kind: Kind, contents: Contents = .none, inlineChildren: Children) {
         self.kind = kind
         self.payload = Self.mergedPayload(contents: contents, children: inlineChildren)
     }
 
     public func copy() -> Node {
-        let copiedChildren = NodeChildren(children.map { $0.copy() })
+        let copiedChildren = Children(children.map { $0.copy() })
         return Node(kind: kind, contents: contents, inlineChildren: copiedChildren)
     }
 }
@@ -163,14 +163,14 @@ extension Node {
         payload = Self.mergedPayload(contents: contents, children: c)
     }
 
-    fileprivate func addChildren(_ newChildren: NodeChildren) {
+    fileprivate func addChildren(_ newChildren: Children) {
         var c = children
         c.append(contentsOf: newChildren)
         payload = Self.mergedPayload(contents: contents, children: c)
     }
 
     fileprivate func setChildren(_ newChildren: [Node]) {
-        payload = Self.mergedPayload(contents: contents, children: NodeChildren(newChildren))
+        payload = Self.mergedPayload(contents: contents, children: Children(newChildren))
     }
 
     fileprivate func setChild(_ child: Node, at index: Int) {

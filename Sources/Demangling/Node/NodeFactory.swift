@@ -86,7 +86,7 @@ public final class NodeCache: @unchecked Sendable {
     /// Creates or retrieves an interned node from inline children.
     /// Called by `Node.create()`. Only leaf nodes (no children) are cached.
     @usableFromInline
-    func createInterned(kind: Node.Kind, contents: Node.Contents, inlineChildren: NodeChildren) -> Node {
+    func createInterned(kind: Node.Kind, contents: Node.Contents, inlineChildren: Node.Children) -> Node {
         if inlineChildren.isEmpty {
             lock.lock()
             defer { lock.unlock() }

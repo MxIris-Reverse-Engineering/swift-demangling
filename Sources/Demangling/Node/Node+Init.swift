@@ -11,7 +11,7 @@ extension Node {
 
     /// Creates a node from inline children. Leaf nodes are automatically interned.
     @inlinable
-    public static func create(kind: Kind, contents: Contents = .none, inlineChildren: NodeChildren) -> Node {
+    public static func create(kind: Kind, contents: Contents = .none, inlineChildren: Children) -> Node {
         NodeCache.shared.createInterned(kind: kind, contents: contents, inlineChildren: inlineChildren)
     }
 

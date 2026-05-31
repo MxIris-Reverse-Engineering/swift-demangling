@@ -108,7 +108,7 @@ print(node.description)
 node.kind          // .global
 node.text          // nil (leaf text content)
 node.index         // nil (leaf index content)
-node.children      // NodeChildren collection
+node.children      // Node.Children collection
 
 // Subscript access
 node[child: 0]             // first child (crashes if out of bounds)

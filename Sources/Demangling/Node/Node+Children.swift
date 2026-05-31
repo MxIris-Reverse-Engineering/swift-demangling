@@ -8,57 +8,60 @@
 ///   - 1 child: saves ~48 bytes heap (array buffer header)
 ///   - 2 children: saves ~48 bytes heap
 ///   - 3+ children: identical (heap-backed)
-public struct NodeChildren: Sendable {
-    @usableFromInline
-    enum Storage: Sendable {
-        case zero
-        case one(Node)
-        case two(Node, Node)
-        case many(ContiguousArray<Node>)
-    }
 
-    @usableFromInline
-    var storage: Storage
-
-    @inlinable
-    public init() {
-        storage = .zero
-    }
-
-    @inlinable
-    init(_ child: Node) {
-        storage = .one(child)
-    }
-
-    @inlinable
-    init(_ child0: Node, _ child1: Node) {
-        storage = .two(child0, child1)
-    }
-
-    @inlinable
-    public init(_ children: [Node]) {
-        switch children.count {
-        case 0: storage = .zero
-        case 1: storage = .one(children[0])
-        case 2: storage = .two(children[0], children[1])
-        default: storage = .many(ContiguousArray(children))
+extension Node {
+    public struct Children: Sendable {
+        @usableFromInline
+        enum Storage: Sendable {
+            case zero
+            case one(Node)
+            case two(Node, Node)
+            case many(ContiguousArray<Node>)
         }
-    }
 
-    @inlinable
-    init(_ children: ContiguousArray<Node>) {
-        switch children.count {
-        case 0: storage = .zero
-        case 1: storage = .one(children[0])
-        case 2: storage = .two(children[0], children[1])
-        default: storage = .many(children)
+        @usableFromInline
+        var storage: Storage
+
+        @inlinable
+        public init() {
+            storage = .zero
+        }
+
+        @inlinable
+        init(_ child: Node) {
+            storage = .one(child)
+        }
+
+        @inlinable
+        init(_ child0: Node, _ child1: Node) {
+            storage = .two(child0, child1)
+        }
+
+        @inlinable
+        public init(_ children: [Node]) {
+            switch children.count {
+            case 0: storage = .zero
+            case 1: storage = .one(children[0])
+            case 2: storage = .two(children[0], children[1])
+            default: storage = .many(ContiguousArray(children))
+            }
+        }
+
+        @inlinable
+        init(_ children: ContiguousArray<Node>) {
+            switch children.count {
+            case 0: storage = .zero
+            case 1: storage = .one(children[0])
+            case 2: storage = .two(children[0], children[1])
+            default: storage = .many(children)
+            }
         }
     }
 }
 
 // MARK: - RandomAccessCollection
 
-extension NodeChildren: RandomAccessCollection, MutableCollection {
+extension Node.Children: RandomAccessCollection, MutableCollection {
     public typealias Index = Int
     public typealias Element = Node
 
@@ -89,10 +92,10 @@ extension NodeChildren: RandomAccessCollection, MutableCollection {
         get {
             switch storage {
             case .zero:
-                fatalError("Index \(index) out of range for empty NodeChildren")
+                fatalError("Index \(index) out of range for empty Node.Children")
             case .one(let n):
                 guard index == 0 else {
-                    fatalError("Index \(index) out of range for NodeChildren with 1 element")
+                    fatalError("Index \(index) out of range for Node.Children with 1 element")
                 }
                 return n
             case .two(let n0, let n1):
@@ -100,7 +103,7 @@ extension NodeChildren: RandomAccessCollection, MutableCollection {
                 case 0: return n0
                 case 1: return n1
                 default:
-                    fatalError("Index \(index) out of range for NodeChildren with 2 elements")
+                    fatalError("Index \(index) out of range for Node.Children with 2 elements")
                 }
             case .many(let arr):
                 return arr[index]
@@ -109,10 +112,10 @@ extension NodeChildren: RandomAccessCollection, MutableCollection {
         set {
             switch storage {
             case .zero:
-                fatalError("Index \(index) out of range for empty NodeChildren")
+                fatalError("Index \(index) out of range for empty Node.Children")
             case .one:
                 guard index == 0 else {
-                    fatalError("Index \(index) out of range for NodeChildren with 1 element")
+                    fatalError("Index \(index) out of range for Node.Children with 1 element")
                 }
                 storage = .one(newValue)
             case .two(let n0, let n1):
@@ -120,7 +123,7 @@ extension NodeChildren: RandomAccessCollection, MutableCollection {
                 case 0: storage = .two(newValue, n1)
                 case 1: storage = .two(n0, newValue)
                 default:
-                    fatalError("Index \(index) out of range for NodeChildren with 2 elements")
+                    fatalError("Index \(index) out of range for Node.Children with 2 elements")
                 }
             case .many(var arr):
                 arr[index] = newValue
@@ -132,7 +135,7 @@ extension NodeChildren: RandomAccessCollection, MutableCollection {
 
 // MARK: - Mutation Methods
 
-extension NodeChildren {
+extension Node.Children {
     @inlinable
     mutating func append(_ element: Node) {
         switch storage {
@@ -262,7 +265,7 @@ extension NodeChildren {
 
 // MARK: - Conversion
 
-extension NodeChildren {
+extension Node.Children {
     @inlinable
     func toContiguousArray() -> ContiguousArray<Node> {
         switch storage {
@@ -286,9 +289,9 @@ extension NodeChildren {
 
 // MARK: - Concatenation Operators
 
-extension NodeChildren {
+extension Node.Children {
     @inlinable
-    static func + (lhs: NodeChildren, rhs: [Node]) -> NodeChildren {
+    static func + (lhs: Self, rhs: [Node]) -> Self {
         if rhs.isEmpty { return lhs }
         var result = lhs
         result.append(contentsOf: rhs)
@@ -296,18 +299,18 @@ extension NodeChildren {
     }
 
     @inlinable
-    static func + (lhs: NodeChildren, rhs: NodeChildren) -> NodeChildren {
+    static func + (lhs: Self, rhs: Self) -> Self {
         if rhs.isEmpty { return lhs }
         if lhs.isEmpty { return rhs }
         var arr = lhs.toContiguousArray()
         arr.append(contentsOf: rhs)
-        return NodeChildren(arr)
+        return Self(arr)
     }
 }
 
 // MARK: - Safe Access (mirrors Array extensions in Extensions.swift)
 
-extension NodeChildren {
+extension Node.Children {
     @inlinable
     public func at(_ index: Int) -> Node? {
         guard index >= 0, index < count else { return nil }
@@ -325,7 +328,7 @@ extension NodeChildren {
     }
 
     @inlinable
-    public func reversedFirst(_ count: Int) -> NodeChildren {
+    public func reversedFirst(_ count: Int) -> Self {
         var result = self
         result.reverseFirst(count)
         return result
@@ -344,9 +347,9 @@ extension NodeChildren {
 
 // MARK: - Equatable
 
-extension NodeChildren: Equatable {
+extension Node.Children: Equatable {
     @inlinable
-    public static func == (lhs: NodeChildren, rhs: NodeChildren) -> Bool {
+    public static func == (lhs: Self, rhs: Self) -> Bool {
         guard lhs.count == rhs.count else { return false }
         switch (lhs.storage, rhs.storage) {
         case (.zero, .zero):
@@ -367,7 +370,7 @@ extension NodeChildren: Equatable {
 
 // MARK: - Hashable
 
-extension NodeChildren: Hashable {
+extension Node.Children: Hashable {
     @inlinable
     public func hash(into hasher: inout Hasher) {
         hasher.combine(count)
