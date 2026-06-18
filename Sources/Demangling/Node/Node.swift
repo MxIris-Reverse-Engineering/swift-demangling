@@ -10,9 +10,9 @@ import SwiftStdlibToolbox
 /// storage into a single discriminated union, mirroring the C++ Swift runtime's
 /// approach where `Text`/`Index`/`InlineChildren`/`Children` share a `union`.
 /// This saves ~24 bytes per node compared to storing them separately.
-public final class Node: Sendable {
+public final class Node: Sendable, Codable {
     /// Legacy contents type preserved for API compatibility.
-    public enum Contents: Hashable, Sendable {
+    public enum Contents: Hashable, Sendable, Codable {
         case none
         case index(UInt64)
         case text(String)
@@ -22,7 +22,7 @@ public final class Node: Sendable {
     /// Mirrors the C++ Swift runtime's union where Text/Index/InlineChildren/Children
     /// are mutually exclusive.
     @usableFromInline
-    enum Payload: Sendable {
+    enum Payload: Sendable, Codable {
         case none
         case index(UInt64)
         case text(String)

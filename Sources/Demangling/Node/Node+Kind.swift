@@ -1,5 +1,5 @@
 extension Node {
-    public enum Kind: String, Hashable, Sendable, CaseIterable {
+    public enum Kind: String, Hashable, Sendable, CaseIterable, Codable {
         case allocator
         case accessibleFunctionRecord
         case accessorFunctionReference
