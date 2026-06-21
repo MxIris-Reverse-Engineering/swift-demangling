@@ -125,6 +125,20 @@ struct TypeDecoderTests {
         #expect(try Self.decodeType(mangled) == expected)
     }
 
+    // B-H5 regression: TypeDecoder must decode the mangled differentiability
+    // CHAR value ('f'/'r'/'d'/'l') stored in the node index — matching the
+    // Apple toolchain. It previously read 1/2/3/4 and always decoded to
+    // .nonDifferentiable, silently dropping differentiability.
+    @Test(arguments: [
+        ("$syyYjfc", "@differentiable(_forward) () -> ()"),
+        ("$syyYjrc", "@differentiable(reverse) () -> ()"),
+        ("$syyYjdc", "@differentiable () -> ()"),
+        ("$syyYjlc", "@differentiable(_linear) () -> ()"),
+    ])
+    func differentiableFunctionTypes(mangled: String, expected: String) throws {
+        #expect(try Self.decodeType(mangled) == expected)
+    }
+
     @Test(arguments: [
         ("$sSi_SfSitD", "(Int, Float, Int)"),
         ("$sSim_Sf1xSitD", "(Int.Type, x: Float, Int)"),
@@ -369,6 +383,13 @@ private struct StringTypeBuilder: TypeBuilder {
         thrownErrorType: String?
     ) -> String {
         var prefix = ""
+        switch diffKind {
+        case .forward: prefix += "@differentiable(_forward) "
+        case .reverse: prefix += "@differentiable(reverse) "
+        case .normal: prefix += "@differentiable "
+        case .linear: prefix += "@differentiable(_linear) "
+        case .nonDifferentiable: break
+        }
         if flags.isSendable { prefix += "@Sendable " }
         if let globalActorType { prefix += "@\(globalActorType) " }
         if extFlags.isIsolatedAny { prefix += "@isolated(any) " }

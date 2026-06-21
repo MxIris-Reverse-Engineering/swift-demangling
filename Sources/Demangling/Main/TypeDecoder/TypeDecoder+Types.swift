@@ -738,15 +738,20 @@ public enum InvertibleProtocolKind: UInt32, Sendable {
 }
 
 extension FunctionMetadataDifferentiabilityKind {
+    /// Maps the mangled differentiability character stored in the
+    /// `differentiableFunctionType` node index (see `MangledDifferentiabilityKind`
+    /// in the Swift compiler: Forward = 'f', Reverse = 'r', Normal = 'd',
+    /// Linear = 'l') to the decoded kind. This mirrors the Demangler/NodePrinter,
+    /// which both encode/decode the raw character value.
     init(from rawValue: UInt8) {
-        switch rawValue {
-        case 1:
+        switch UnicodeScalar(rawValue) {
+        case "f":
             self = .forward
-        case 2:
+        case "r":
             self = .reverse
-        case 3:
+        case "d":
             self = .normal
-        case 4:
+        case "l":
             self = .linear
         default:
             self = .nonDifferentiable

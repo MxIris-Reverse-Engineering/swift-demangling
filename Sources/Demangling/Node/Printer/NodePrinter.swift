@@ -333,7 +333,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .labelList: break
         case .lazyProtocolWitnessTableAccessor: printLazyProtocolWitnesstableAccessor(name)
         case .lazyProtocolWitnessTableCacheVariable: printLazyProtocolWitnesstableCacheVariable(name)
-        case .localDeclName: _ = printOptional(name.children.at(1), suffix: " #\((name.children.at(0)?.index ?? 0) + 1)")
+        case .localDeclName: _ = printOptional(name.children.at(1), suffix: options.contains(.displayLocalNameContexts) ? " #\((name.children.at(0)?.index ?? 0) + 1)" : nil)
         case .macro: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: name.children.count == 3 ? .withColon : .functionStyle, hasName: true)
         case .macroExpansionLoc: printMacroExpansionLoc(name)
         case .macroExpansionUniqueName: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "unique name #", extraIndex: (name.children.at(2)?.index ?? 0) + 1)
@@ -511,7 +511,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .typeSymbolicReference: target.write("type symbolic reference \("0x" + String(name.index ?? 0, radix: 16, uppercase: true))")
         case .uniquable: printFirstChild(name, prefix: "uniquable ")
         case .uniqueExtendedExistentialTypeShapeSymbolicReference:
-            target.write("non-unique existential shape symbolic reference 0x")
+            target.write("unique existential shape symbolic reference 0x")
             target.write((name.index ?? 0).hexadecimalString)
         case .unknownIndex: target.write("unknown index")
         case .unmanaged: printFirstChild(name, prefix: options.contains(.removeReferenceStoragePrefix) ? "" : "unowned(unsafe) ")
@@ -993,7 +993,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         if protocolsTypeList.children.count > 0 {
             printChildren(protocolsTypeList, suffix: " & ", separator: " & ")
         }
-        if options.contains(.qualifyEntities) {
+        if options.contains(.qualifyEntities) && options.contains(.displayStdlibModule) {
             target.write("Swift.")
         }
         target.write("AnyObject")
@@ -1055,7 +1055,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     }
 
     private mutating func printDependentProtocolConformanceOpaque(_ name: Node) {
-        target.write("dependent result conformance ")
+        target.write("opaque result conformance ")
         printFirstChild(name)
         target.write(" of ")
         _ = printOptional(name.children.at(1))
@@ -1697,6 +1697,18 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         }
     }
 
+    /// Mirrors upstream NodePrinter::shouldShowEntityType: a closure's type
+    /// signature is only printed when `showClosureSignature` is set (it is
+    /// otherwise uniquely identified by its index + parent).
+    private func shouldShowEntityType(entityKind: Node.Kind) -> Bool {
+        switch entityKind {
+        case .explicitClosure, .implicitClosure:
+            return options.contains(.showClosureSignature)
+        default:
+            return true
+        }
+    }
+
     private mutating func printEntity(_ name: Node, asPrefixContext: Bool, typePrinting: TypePrinting, hasName: Bool, extraName: String? = nil, extraIndex: UInt64? = nil, overwriteName: String? = nil) -> Node? {
         var genericFunctionTypeList: Node?
         var name = name
@@ -1705,7 +1717,8 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
             genericFunctionTypeList = second
         }
 
-        let multiWordName = extraName?.contains(" ") == true || (hasName && name.children.at(1)?.kind == .localDeclName)
+        let localName = hasName && name.children.at(1)?.kind == .localDeclName
+        let multiWordName = extraName?.contains(" ") == true || (localName && options.contains(.displayLocalNameContexts))
         if asPrefixContext && (typePrinting != .noType || multiWordName) {
             return name
         }
@@ -1789,14 +1802,14 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
                     target.write(" : ")
                     printEntityType(name: name, type: type, genericFunctionTypeList: genericFunctionTypeList)
                 }
-            } else {
+            } else if shouldShowEntityType(entityKind: name.kind) {
                 if multiWordName || type.needSpaceBeforeType {
                     target.write(" ")
                 }
                 printEntityType(name: name, type: type, genericFunctionTypeList: genericFunctionTypeList)
             }
         }
-        if !asPrefixContext, let pfc = postfixContext {
+        if !asPrefixContext, let pfc = postfixContext, !localName || options.contains(.displayLocalNameContexts) {
             switch name.kind {
             case .defaultArgumentInitializer,
                  .initializer,

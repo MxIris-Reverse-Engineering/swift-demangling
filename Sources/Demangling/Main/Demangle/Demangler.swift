@@ -547,7 +547,8 @@ extension Demangler {
                  .packProtocolConformance,
                  .dependentProtocolConformanceRoot,
                  .dependentProtocolConformanceInherited,
-                 .dependentProtocolConformanceAssociated: return true
+                 .dependentProtocolConformanceAssociated,
+                 .dependentProtocolConformanceOpaque: return true
             default: return false
             }
         }

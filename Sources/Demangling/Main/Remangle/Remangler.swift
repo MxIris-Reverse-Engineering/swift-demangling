@@ -3602,39 +3602,46 @@ extension Remangler {
         try mangleChildNode(node, at: 2, depth: depth + 1)
     }
 
+    // Attached-macro nodes are [context, attachedName, macroName, discriminator].
+    // Upstream Remangler mangles children 0,1,2, then "fM"+roleChar, then the
+    // discriminator (child 3) LAST. The MangledChar values come from MacroRoles.def
+    // (Accessor='a', MemberAttribute='r', Member='m', Peer='p', Conformance='c',
+    // Extension='e', Body='b').
+    private mutating func mangleAttachedMacroExpansion(_ node: Node, roleChar: String, depth: Int) throws(ManglingError) {
+        try mangleChildNode(node, at: 0, depth: depth + 1)
+        try mangleChildNode(node, at: 1, depth: depth + 1)
+        try mangleChildNode(node, at: 2, depth: depth + 1)
+        append("fM")
+        append(roleChar)
+        try mangleChildNode(node, at: 3, depth: depth + 1)
+    }
+
     private mutating func mangleAccessorAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
-        append("fMa")
+        try mangleAttachedMacroExpansion(node, roleChar: "a", depth: depth)
     }
 
     private mutating func mangleMemberAttributeAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
-        append("fMA")
+        try mangleAttachedMacroExpansion(node, roleChar: "r", depth: depth)
     }
 
     private mutating func mangleMemberAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
-        append("fMm")
+        try mangleAttachedMacroExpansion(node, roleChar: "m", depth: depth)
     }
 
     private mutating func manglePeerAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
-        append("fMp")
+        try mangleAttachedMacroExpansion(node, roleChar: "p", depth: depth)
     }
 
     private mutating func mangleConformanceAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
-        append("fMc")
+        try mangleAttachedMacroExpansion(node, roleChar: "c", depth: depth)
     }
 
     private mutating func mangleExtensionAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
-        append("fMe")
+        try mangleAttachedMacroExpansion(node, roleChar: "e", depth: depth)
     }
 
     private mutating func mangleBodyAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
-        try mangleChildNodes(node, depth: depth + 1)
-        append("fMb")
+        try mangleAttachedMacroExpansion(node, roleChar: "b", depth: depth)
     }
 
     // MARK: - Additional Missing Node Handlers (109 methods)

@@ -5,4 +5,8 @@ enum SpecializationPass: CaseIterable, Sendable {
     case capturePropagation
     case functionSignatureOpts
     case genericSpecializer
+    case moveDiagnosticInOutToOut
+    case asyncDemotion
+    case packSpecialization
+    case embeddedWitnessCallSpecialization
 }

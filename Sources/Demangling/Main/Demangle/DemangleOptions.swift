@@ -27,6 +27,7 @@ public struct DemangleOptions: OptionSet, Codable, Sendable {
     public static let removeWeakPrefix = DemangleOptions(rawValue: 1 << 22)
     public static let removeBoundGeneric = DemangleOptions(rawValue: 1 << 23)
     public static let removeReferenceStoragePrefix = DemangleOptions(rawValue: 1 << 24)
+    public static let displayLocalNameContexts = DemangleOptions(rawValue: 1 << 25)
 
     public init(rawValue: Int) {
         self.rawValue = rawValue
@@ -49,6 +50,7 @@ public struct DemangleOptions: OptionSet, Codable, Sendable {
         .displayObjCModule,
         .showClosureSignature,
         .showModuleInDependentMemberType,
+        .displayLocalNameContexts,
     ]
 
     public static let simplified: DemangleOptions = [
