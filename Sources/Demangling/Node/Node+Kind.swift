@@ -112,6 +112,7 @@ extension Node {
         case explicitClosure
         case extendedExistentialTypeShape
         case extensionAttachedMacroExpansion
+        case preambleAttachedMacroExpansion
         case extensionDescriptor
         case fieldOffset
         case firstElementMarker
@@ -543,6 +544,7 @@ extension Node.Kind {
         case .peerAttachedMacroExpansion: return true
         case .conformanceAttachedMacroExpansion: return true
         case .extensionAttachedMacroExpansion: return true
+        case .preambleAttachedMacroExpansion: return true
         case .macroExpansionLoc: return true
         default: return false
         }

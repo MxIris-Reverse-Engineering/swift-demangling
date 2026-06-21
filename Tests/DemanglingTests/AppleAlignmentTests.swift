@@ -28,6 +28,19 @@ struct AppleAlignmentTests {
         #expect(node == node2)
     }
 
+    // B-H1 preamble + B-H6: PreambleAttachedMacroExpansion node kind, role char 'q',
+    // printed with the "preamble" introducer. Confirmed via `xcrun swift-demangle`:
+    // "...preamble macro @Foo expansion #1 of P in main".
+    @Test func preambleAttachedMacroRoundTripsAndPrints() throws {
+        let input = "$s4main3FooVAA1P0B0fMq_"
+        let node = try demangleAsNode(input)
+        #expect(node.print(using: .default).contains("preamble macro"))
+        let remangled = try mangleAsString(node)
+        #expect(remangled.contains("fMq"))
+        let node2 = try demangleAsNode(remangled)
+        #expect(node == node2)
+    }
+
     // B-M6: the "Swift." prefix on AnyObject is gated on BOTH qualifyEntities
     // AND displayStdlibModule (matches `swift-demangle -display-stdlib-module=...`).
     @Test func anyObjectStdlibModuleGate() throws {

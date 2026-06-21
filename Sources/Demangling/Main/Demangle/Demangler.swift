@@ -2673,6 +2673,7 @@ extension Demangler {
             case "p": (kind, isAttached, isFreestanding) = (.peerAttachedMacroExpansion, true, false)
             case "c": (kind, isAttached, isFreestanding) = (.conformanceAttachedMacroExpansion, true, false)
             case "e": (kind, isAttached, isFreestanding) = (.extensionAttachedMacroExpansion, true, false)
+            case "q": (kind, isAttached, isFreestanding) = (.preambleAttachedMacroExpansion, true, false)
             case "b": (kind, isAttached, isFreestanding) = (.bodyAttachedMacroExpansion, true, false)
             case "f": (kind, isAttached, isFreestanding) = (.freestandingMacroExpansion, false, true)
             case "u": (kind, isAttached, isFreestanding) = (.macroExpansionUniqueName, false, false)

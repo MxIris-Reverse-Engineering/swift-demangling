@@ -776,6 +776,8 @@ struct Remangler {
             try mangleConformanceAttachedMacroExpansion(node, depth: depth)
         case .extensionAttachedMacroExpansion:
             try mangleExtensionAttachedMacroExpansion(node, depth: depth)
+        case .preambleAttachedMacroExpansion:
+            try manglePreambleAttachedMacroExpansion(node, depth: depth)
         case .bodyAttachedMacroExpansion:
             try mangleBodyAttachedMacroExpansion(node, depth: depth)
         case .asyncFunctionPointer:
@@ -3638,6 +3640,10 @@ extension Remangler {
 
     private mutating func mangleExtensionAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
         try mangleAttachedMacroExpansion(node, roleChar: "e", depth: depth)
+    }
+
+    private mutating func manglePreambleAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
+        try mangleAttachedMacroExpansion(node, roleChar: "q", depth: depth)
     }
 
     private mutating func mangleBodyAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {

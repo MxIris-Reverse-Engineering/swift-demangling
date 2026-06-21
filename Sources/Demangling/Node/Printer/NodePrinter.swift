@@ -246,6 +246,7 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
         case .extendedExistentialTypeShape: printExtendedExistentialTypeShape(name)
         case .extension: printExtension(name)
         case .extensionAttachedMacroExpansion: return printMacro(name: name, asPrefixContext: asPrefixContext, label: "extension")
+        case .preambleAttachedMacroExpansion: return printMacro(name: name, asPrefixContext: asPrefixContext, label: "preamble")
         case .extensionDescriptor: printFirstChild(name, prefix: "extension descriptor ")
         case .fieldOffset: printFieldOffset(name)
         case .firstElementMarker: target.write(" first-element-marker ")
