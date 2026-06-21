@@ -110,8 +110,13 @@ group-a 严格照搬开源源码删掉它们，正是其破坏功能的根因—
 
 ## Part B — 新增 6.3 对齐 gap（Group A 未覆盖）
 
-> 进度（2026-06-21）：**B-H4 与 B-H1 的 extension `'e'` 已修复并合并（`04dc0b4`）**，dyld 4,522,605 符号
-> 0 失败守护。其余（B-H1 的 preamble `'q'`、B-H5、B-H6、Medium/Low）仍待跟进。
+> 进度（2026-06-21）：Part B 已基本清零。
+> - **已修复并合并**：B-H4、B-H1 的 extension `'e'`（`04dc0b4`）；B-H5、B-H2、B-H3、B-M1、B-M2、B-M3、
+>   B-M4、B-M5、B-M6、B-L4（`2099541`）。每项均逐项对照 Apple（IDA 逆向 + `swift-demangle`）验证 + 对抗式
+>   复核 + 新增回归测试，并由 dyld 4,522,605 符号 0 失败 + 379 单测守护。
+> - **仍 open**：B-H1 的 preamble `'q'` 与 B-H6（experimental，按范围排除）。
+> - **撤销（经验证非 bug）**：B-L1（ValueWitnessKind 编号——Apple 把 node index 当 opaque token，用同一
+>   enum 读回，port 输出已与 Apple 一致）。
 
 ### 🔴 High
 
