@@ -110,6 +110,9 @@ group-a 严格照搬开源源码删掉它们，正是其破坏功能的根因—
 
 ## Part B — 新增 6.3 对齐 gap（Group A 未覆盖）
 
+> 进度（2026-06-21）：**B-H4 与 B-H1 的 extension `'e'` 已修复并合并（`04dc0b4`）**，dyld 4,522,605 符号
+> 0 失败守护。其余（B-H1 的 preamble `'q'`、B-H5、B-H6、Medium/Low）仍待跟进。
+
 ### 🔴 High
 
 #### B-H1. Demangler 漏 `@attached(extension)` 与 preamble 宏解析 ✓
@@ -119,7 +122,7 @@ group-a 严格照搬开源源码删掉它们，正是其破坏功能的根因—
   / `Conformance=c` / `Extension=e` / `Preamble=q`(experimental) / `Body=b` / `Freestanding=f`
 - **差异**：缺 `'e'`(extension) 与 `'q'`(preamble)。`extensionAttachedMacroExpansion` node 已存在、
   remangler 也有 `fMe`，但 demangler 无法解析 `…fMe…` → `throw failure`（demangle/remangle 不对称）。
-- **修复**：switch 增 `case "e"`；preamble 随 B-H6 一并补。
+- **修复**：✅ extension `'e'` 已合并（`04dc0b4`，demangle + 既有 remangle `fMe` 对称）；preamble `'q'` 未做（experimental，不在本次范围，随 B-H6）。
 
 #### B-H2. Remangler memberAttribute 字符错误：`fMA` 应为 `fMr` ✓
 - **PORT**：`Remangler.swift:3609`（append `"fMA"`）
@@ -135,10 +138,11 @@ group-a 严格照搬开源源码删掉它们，正是其破坏功能的根因—
   （`Remangler.swift:4113`）写法。
 - **旁注**：freestanding `fMf` 上游顺序更特殊（`Remangler.cpp:3242-3246`），需一并复核。
 
-#### B-H4. `demangleImplResultConvention` 缺 `l`/`g`/`m` ✓
+#### B-H4. `demangleImplResultConvention` 缺 `l`/`g`/`m` ✓ — ✅ 已修（`04dc0b4`）
 - **PORT**：`Demangler.swift:1210-1224`（只有 `r/o/d/u/a/k`）
 - **UPSTREAM**：`Demangler.cpp:2290`（额外 `l`=@guaranteed_address、`g`=@guaranteed、`m`=@inout）
 - 含上述 result 约定的 SIL `I…` impl 函数类型（read/modify coroutine、borrow 返回）会失败。
+- **修复**：✅ demangle 补 `l/g/m` + remangler result 反向映射（`@guaranteed_address/@guaranteed/@inout`），已合并（`04dc0b4`）。
 
 #### B-H5. TypeDecoder differentiability 解码恒为 `nonDifferentiable`
 - **PORT**：`TypeDecoder+Types.swift:741-754`（按 `1/2/3/4` 映射）；调用点 `TypeDecoder.swift:379`
