@@ -4,7 +4,7 @@ struct Demangler<C>: Sendable where C: Collection, C.Iterator.Element == Unicode
     private var substitutions: [Node] = []
     private var words: [String] = []
     private var isOldFunctionTypeMangling: Bool = false
-    private var flavor: ManglingFlavor = .default
+    var flavor: ManglingFlavor = .default
     private var symbolicReferenceIndex: Int = 0
 
     var symbolicReferenceResolver: DemangleSymbolicReferenceResolver?
@@ -47,11 +47,21 @@ extension Demangler {
     }
 
     private mutating func readManglingPrefix() throws(DemanglingError) {
-        let prefixes = [
-            "_T0", "$S", "_$S", "$s", "_$s", "$e", "_$e", "@__swiftmacro_",
+        let prefixTable: [(prefix: String, flavor: ManglingFlavor?)] = [
+            ("_T0", nil),
+            ("$S", nil),
+            ("_$S", nil),
+            ("$s", nil),
+            ("_$s", nil),
+            ("$e", .embedded),
+            ("_$e", .embedded),
+            ("@__swiftmacro_", nil),
         ]
-        for prefix in prefixes {
+        for (prefix, prefixFlavor) in prefixTable {
             if scanner.conditional(string: prefix) {
+                if let prefixFlavor {
+                    flavor = prefixFlavor
+                }
                 return
             }
         }
@@ -122,6 +132,7 @@ extension Demangler {
 
     private mutating func parseAndPushNames() throws(DemanglingError) {
         while !scanner.isAtEnd {
+            if scanner.peek() == "\u{0}" { return }
             try nameStack.append(demangleOperator())
         }
     }
@@ -160,7 +171,10 @@ extension Demangler {
     }
 
     private mutating func demangleOperator() throws(DemanglingError) -> Node {
-        let scalar = try scanner.readScalar()
+        var scalar = try scanner.readScalar()
+        while scalar.value == 0xFF {
+            scalar = try scanner.readScalar()
+        }
         switch scalar {
         case "\u{1}",
              "\u{2}",
@@ -1407,6 +1421,9 @@ extension Demangler {
             try require(t.children.first?.kind.isAnyGeneric == true)
             return try Node.create(kind: .reflectionMetadataSuperclassDescriptor, child: require(t.children.first))
         case "D": return try Node.create(kind: .typeMetadataDemanglingCache, child: require(pop(kind: .type)))
+        // Apple's closed toolchain demangler accepts these metatype forms that the open-source
+        // lib/Demangling source omits: lowercase 'd' (same node as 'D') and 'R'
+        // (TypeMetadataMangledNameRef). Real Apple symbols depend on them — see docs/AlignmentGaps.md.
         case "d": return try Node.create(kind: .typeMetadataDemanglingCache, child: require(pop(kind: .type)))
         case "R": return try Node.create(kind: .typeMetadataMangledNameRef, child: require(pop(kind: .type)))
         case "f": return try Node.create(kind: .fullTypeMetadata, child: require(pop(kind: .type)))
@@ -1712,7 +1729,7 @@ extension Demangler {
         case "H",
              "h":
             let nodeKind: Node.Kind = c == "H" ? .keyPathEqualsThunkHelper : .keyPathHashThunkHelper
-            let isSerialized = scanner.peek() == "q"
+            let isSerialized = scanner.conditional(scalar: "q")
             var types = [Node]()
             let node = try require(pop())
             var genericSig: Node? = nil
@@ -2143,12 +2160,7 @@ extension Demangler {
             var children: [Node] = sig.map { [type, $0] } ?? [type]
             switch try scanner.readScalar() {
             case "B":
-                let type = try require(pop(kind: .type))
-                if let sig = pop(kind: .dependentGenericSignature) {
-                    return Node.create(kind: .outlinedInitializeWithTakeNoValueWitness, children: [type, sig])
-                } else {
-                    return Node.create(kind: .outlinedInitializeWithTakeNoValueWitness, children: [type])
-                }
+                return Node.create(kind: .outlinedInitializeWithTakeNoValueWitness, children: children)
             case "C": return Node.create(kind: .outlinedInitializeWithCopyNoValueWitness, children: children)
             case "D": return Node.create(kind: .outlinedAssignWithTakeNoValueWitness, children: children)
             case "F": return Node.create(kind: .outlinedAssignWithCopyNoValueWitness, children: children)
@@ -2180,6 +2192,7 @@ extension Demangler {
                 guard let identifier = pop(where: { $0.isDeclName }) else { throw failure }
                 declChildren.append(identifier)
             }
+            declChildren.reverse()
             let declList = Node.create(kind: .globalVariableOnceDeclList, children: declChildren)
             return try Node.create(kind: c == "Z" ? .globalVariableOnceFunction : .globalVariableOnceToken, children: [popContext(), declList])
         case "J":
@@ -2379,7 +2392,7 @@ extension Demangler {
             switch try scanner.readScalar() {
             case "O": kind = .owningMutableAddressor
             case "o": kind = .nativeOwningMutableAddressor
-            case "p": kind = .nativePinningMutableAddressor
+            case "P": kind = .nativePinningMutableAddressor
             case "u": kind = .unsafeMutableAddressor
             default: throw failure
             }
