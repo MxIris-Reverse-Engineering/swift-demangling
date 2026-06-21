@@ -1230,6 +1230,9 @@ extension Demangler {
         case "u": attr = "@unowned_inner_pointer"
         case "a": attr = "@autoreleased"
         case "k": attr = "@pack_out"
+        case "l": attr = "@guaranteed_address"
+        case "g": attr = "@guaranteed"
+        case "m": attr = "@inout"
         default:
             try scanner.backtrack()
             return nil
@@ -2668,6 +2671,7 @@ extension Demangler {
             case "m": (kind, isAttached, isFreestanding) = (.memberAttachedMacroExpansion, true, false)
             case "p": (kind, isAttached, isFreestanding) = (.peerAttachedMacroExpansion, true, false)
             case "c": (kind, isAttached, isFreestanding) = (.conformanceAttachedMacroExpansion, true, false)
+            case "e": (kind, isAttached, isFreestanding) = (.extensionAttachedMacroExpansion, true, false)
             case "b": (kind, isAttached, isFreestanding) = (.bodyAttachedMacroExpansion, true, false)
             case "f": (kind, isAttached, isFreestanding) = (.freestandingMacroExpansion, false, true)
             case "u": (kind, isAttached, isFreestanding) = (.macroExpansionUniqueName, false, false)

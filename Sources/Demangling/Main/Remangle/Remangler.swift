@@ -3159,6 +3159,9 @@ extension Remangler {
                 case "@unowned_inner_pointer": "u"
                 case "@autoreleased": "a"
                 case "@pack_out": "k"
+                case "@guaranteed_address": "l"
+                case "@guaranteed": "g"
+                case "@inout": "m"
                 default: nil
                 }
                 if let text {
