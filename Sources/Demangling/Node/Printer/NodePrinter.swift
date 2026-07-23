@@ -142,6 +142,12 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
              .boundGenericProtocol,
              .boundGenericOtherNominalType,
              .boundGenericTypeAlias:
+            // Barrier scope: angle brackets, commas, and sugar punctuation
+            // written by the bound-generic printer belong to no type
+            // reference; the base type and each argument push their own
+            // scopes when they recurse through the nominal cases below.
+            target.pushTypeReferenceScope(nil)
+            defer { target.popTypeReferenceScope() }
             printBoundGeneric(name)
         case .builtinBorrow:
             target.write("Builtin.Borrow<")
@@ -171,7 +177,13 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
              .structure,
              .enum,
              .protocol,
-             .typeAlias: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true)
+             .typeAlias:
+            // The full qualified-name print (module, dots, identifier) for
+            // this nominal reference runs inside one scope so rich targets
+            // can group the writes into a single span keyed by `name`.
+            target.pushTypeReferenceScope(name)
+            defer { target.popTypeReferenceScope() }
+            return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true)
         case .classMetadataBaseOffset: printFirstChild(name, prefix: "class metadata base offset for ")
         case .compileTimeLiteral: printFirstChild(name, prefix: "_const ")
         case .constValue: printFirstChild(name, prefix: "@const ")
