@@ -193,6 +193,40 @@ struct SymbolStoreTests {
         }
     }
 
+    @Test func traversalParityWithNodePath() throws {
+        // NodeReference's Sequence conformance and kind-lookup helpers must
+        // walk the store in the same order the Node path walks the class tree.
+        let mangledSymbols = [
+            "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
+            "$s4main1gyxxlF",
+            "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",
+        ]
+        var builder = SymbolStoreBuilder()
+        var rootIndices = [SymbolStore.NodeIndex]()
+        for mangled in mangledSymbols {
+            rootIndices.append(try builder.demangle(mangled))
+        }
+        let store = builder.freeze()
+
+        for (rootIndex, mangled) in zip(rootIndices, mangledSymbols) {
+            let nodePathTree = try demangleAsNode(mangled, internsSubtrees: false)
+            let reference = store.reference(at: rootIndex)
+
+            let referenceKinds = reference.map(\.kind)
+            let nodeKinds = nodePathTree.map(\.kind)
+            #expect(referenceKinds == nodeKinds, "Preorder kind sequences should match for \(mangled)")
+
+            let referencePostorderKinds = Array(reference.postorder().map(\.kind))
+            let nodePostorderKinds = Array(nodePathTree.postorder().map(\.kind))
+            #expect(referencePostorderKinds == nodePostorderKinds, "Postorder kind sequences should match for \(mangled)")
+
+            #expect(reference.first(of: .identifier)?.text == nodePathTree.first(of: .identifier)?.text)
+            #expect(reference.all(of: .type).count == nodePathTree.all(of: .type).count)
+            #expect(reference.contains(.functionType) == nodePathTree.contains(.functionType))
+            #expect(reference.identifier == nodePathTree.identifier, "identifier should match for \(mangled)")
+        }
+    }
+
     @Test func sharedSubtreesAcrossSymbolsShareIndices() throws {
         var builder = SymbolStoreBuilder()
         let firstRootIndex = try builder.demangle("$sSiD")
