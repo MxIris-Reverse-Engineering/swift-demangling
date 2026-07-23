@@ -227,6 +227,34 @@ struct SymbolStoreTests {
         }
     }
 
+    @Test func directConstructionSharesHashConsingWithTreeInterning() {
+        // Building Swift.Int by hand and interning the equivalent Node tree
+        // must collapse to the same index, and print identically.
+        var builder = SymbolStoreBuilder()
+
+        let moduleIndex = builder.intern(kind: .module, text: "Swift")
+        let identifierIndex = builder.intern(kind: .identifier, text: "Int")
+        let structureIndex = builder.intern(kind: .structure, children: [moduleIndex, identifierIndex])
+        let typeIndex = builder.intern(kind: .type, children: [structureIndex])
+
+        let equivalentTree = Node(kind: .type, children: [
+            Node(kind: .structure, children: [
+                Node(kind: .module, text: "Swift"),
+                Node(kind: .identifier, text: "Int"),
+            ]),
+        ])
+        let internedTreeIndex = builder.intern(equivalentTree)
+        #expect(internedTreeIndex == typeIndex, "Direct construction and tree interning should hash-cons to one index")
+
+        let emptyListIndex = builder.intern(kind: .emptyList)
+        let indexNodeIndex = builder.intern(kind: .index, index: 42)
+
+        let store = builder.freeze()
+        #expect(store.reference(at: typeIndex).print(using: .default) == equivalentTree.print(using: .default))
+        #expect(store.reference(at: emptyListIndex).kind == .emptyList)
+        #expect(store.reference(at: indexNodeIndex).index == 42)
+    }
+
     @Test func remangleParityWithNodePath() throws {
         // Remangling a NodeReference (bridged through materialization) must
         // produce the same mangled string as the Node path.

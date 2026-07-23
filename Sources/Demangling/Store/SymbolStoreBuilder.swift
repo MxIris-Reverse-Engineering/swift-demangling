@@ -54,6 +54,42 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
         return intern(tree)
     }
 
+    // MARK: - Direct Construction
+
+    /// Interns a parameterless node.
+    public mutating func intern(kind: Node.Kind) -> SymbolStore.NodeIndex {
+        SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+    }
+
+    /// Interns a text-carrying leaf node.
+    public mutating func intern(kind: Node.Kind, text: String) -> SymbolStore.NodeIndex {
+        SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .text(text)))
+    }
+
+    /// Interns an index-carrying leaf node.
+    public mutating func intern(kind: Node.Kind, index: UInt64) -> SymbolStore.NodeIndex {
+        SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .index(index)))
+    }
+
+    /// Interns an interior node over already-interned children — e.g. a
+    /// `.type` wrapper around a stored subtree, the pattern index builders
+    /// use for dictionary keys. Children must be indices minted by this
+    /// builder; an empty child list interns a parameterless node.
+    ///
+    /// Hash-consing is shared with every other insertion route: constructing
+    /// a node directly and interning a structurally equal `Node` tree yield
+    /// the same index.
+    public mutating func intern(kind: Node.Kind, children: [SymbolStore.NodeIndex]) -> SymbolStore.NodeIndex {
+        let childIndices = children.map { childIndex in
+            precondition(Int(childIndex.rawValue) < nodes.count, "Child index does not belong to this builder")
+            return childIndex.rawValue
+        }
+        if childIndices.isEmpty {
+            return SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+        }
+        return SymbolStore.NodeIndex(rawValue: internInterior(kind: kind, childIndices: childIndices))
+    }
+
     /// Freezes the builder into an immutable, `Sendable` store.
     ///
     /// Consumes the builder; interning tables are dropped, only the flat
