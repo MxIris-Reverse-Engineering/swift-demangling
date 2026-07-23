@@ -1,5 +1,8 @@
 import Foundation
 
+/// SPI note: exposed as `@_spi(Internals)` so deep consumers driving
+/// `DemanglingPrinter` directly can reuse the same stack-safety wrapper the
+/// library uses for its own print/remangle entry points.
 /// Executes blocks with automatic stack-size safety.
 ///
 /// On Darwin, non-main threads (including Swift Concurrency cooperative workers)
@@ -7,7 +10,8 @@ import Foundation
 /// inside the demangler/remangler. This type detects insufficient remaining stack
 /// space and transparently re-dispatches the block to a dedicated 8MB-stack
 /// `Thread`. On non-Darwin platforms, the block runs directly.
-enum StackSafeExecutor {
+@_spi(Internals)
+public enum StackSafeExecutor {
     #if canImport(Darwin)
     /// Minimum stack space (in bytes) required for safe recursive operations.
     private static let minimumRequiredStackSize = 2 * 1024 * 1024 // 2MB
@@ -18,7 +22,7 @@ enum StackSafeExecutor {
 
     /// Executes the given block, switching to a large-stack thread if the
     /// current thread's remaining stack space is insufficient.
-    static func execute(_ block: @escaping @Sendable () -> String) -> String {
+    public static func execute(_ block: @escaping @Sendable () -> String) -> String {
         #if canImport(Darwin)
         if currentThreadHasSufficientStack {
             return block()
@@ -34,7 +38,7 @@ enum StackSafeExecutor {
     /// Re-dispatches to a dedicated 8MB-stack `Thread` when the current thread
     /// is about to run out of room, and propagates typed errors across the
     /// thread boundary.
-    static func execute<Success: Sendable, Failure: Error>(
+    public static func execute<Success: Sendable, Failure: Error>(
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         #if canImport(Darwin)
@@ -56,7 +60,7 @@ enum StackSafeExecutor {
     /// has enough room, the block runs inline without spawning a thread or
     /// suspending. Use this from async contexts when you want to avoid blocking
     /// a cooperative worker on an OS-level semaphore.
-    static func executeAsync<Success: Sendable, Failure: Error & Sendable>(
+    public static func executeAsync<Success: Sendable, Failure: Error & Sendable>(
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) async throws(Failure) -> Success {
         #if canImport(Darwin)

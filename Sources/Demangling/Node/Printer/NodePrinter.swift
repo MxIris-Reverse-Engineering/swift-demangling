@@ -1,7 +1,15 @@
 /// Generic tree-printing engine shared by the public `NodePrinter<Target>`
 /// (specialized on `Node`) and store-backed printing (specialized on
 /// `NodeReference`). See evolution proposal 0001, Phase 2.
-struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: Sendable {
+///
+/// SPI note: exposed as `@_spi(Internals)` so deep consumers (MachOSwiftSection)
+/// can print `NodeReference` trees into custom rich targets. On the store path
+/// `NodePrintContext.node` and the type-reference scope hooks receive nil
+/// (`name as? Node`); a rich target that keys on the node must account for
+/// that until the hooks are abstracted over `DemanglingNode`. Wrap calls in
+/// `StackSafeExecutor.execute` for deeply nested symbols.
+@_spi(Internals)
+public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: Sendable {
     /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth`` from
     /// ``swift/include/swift/Demangling/Demangle.h``. Bails the print
     /// recursion with ``<<too complex>>`` once a single root-to-leaf path
