@@ -73,13 +73,9 @@ extension Node {
         }
     }
 
-    @inlinable
-    public var hasChildren: Bool {
-        switch payload {
-        case .none, .index, .text: return false
-        default: return true
-        }
-    }
+    // `hasChildren` and `subscript(throwChild:)` live in the `DemanglingNode`
+    // extension (DemanglingNode.swift) as the single implementation for both
+    // `Node` and `NodeReference`.
 
     @inlinable
     public var firstChild: Node? {
@@ -136,17 +132,6 @@ extension Node {
     @inlinable
     public subscript(safeChild childIndex: Int) -> Node? {
         children.at(childIndex)
-    }
-
-    @inlinable
-    public subscript(throwChild childIndex: Int) -> Node {
-        get throws(IndexOutOfBoundError) {
-            if let child = children.at(childIndex) {
-                return child
-            } else {
-                throw .default
-            }
-        }
     }
 
     public struct IndexOutOfBoundError: Error {

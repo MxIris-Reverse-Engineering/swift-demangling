@@ -208,6 +208,28 @@ struct TypeDecoderTests {
     func existentialMetatypes(mangled: String, expected: String) throws {
         #expect(try Self.decodeType(mangled) == expected)
     }
+
+    // MARK: - Store-Backed Decoding Parity (proposal 0001, Phase 2)
+
+    @Test(arguments: [
+        "$sBbD",
+        "$sBf32_Bv4_D",
+        "$sSiD",
+        "$sSaySiGD",
+        "$sSDySSSiGD",
+        "$s17lowered_metatypes5ProtoPXmT",
+    ])
+    func storeBackedDecodingMatchesNodePath(mangled: String) throws {
+        let nodePathResult = try Self.decodeType(mangled)
+
+        var builder = SymbolStoreBuilder()
+        let rootIndex = try builder.demangle(mangled)
+        let store = builder.freeze()
+
+        let decoder = TypeDecoder(builder: StringTypeBuilder())
+        let storePathResult = try decoder.decodeMangledType(node: store.reference(at: rootIndex))
+        #expect(storePathResult == nodePathResult, "Store-backed decoding should match the Node path for \(mangled)")
+    }
 }
 
 // MARK: - StringTypeBuilder

@@ -21,6 +21,12 @@ public protocol DemanglingNode: Sendable {
     var hasIndex: Bool { get }
     var children: Children { get }
     var printCacheIdentity: PrintCacheIdentity { get }
+
+    /// The concrete class-tree form of this subtree, for interop boundaries
+    /// that still require `Node` (`TypeBuilder` handoffs, remangling until the
+    /// `Remangler` is genericized). `Node` returns itself; `NodeReference`
+    /// materializes with subtree sharing preserved.
+    var materializedNode: Node { get }
 }
 
 // MARK: - Derived helpers shared by the printer
@@ -36,6 +42,22 @@ extension DemanglingNode {
         StackSafeExecutor.execute {
             var printer = DemanglingPrinter<String, Self>(options: options)
             return printer.printRoot(self)
+        }
+    }
+
+    @inlinable
+    public var hasChildren: Bool {
+        !children.isEmpty
+    }
+
+    @inlinable
+    public subscript(throwChild childIndex: Int) -> Self {
+        get throws(Node.IndexOutOfBoundError) {
+            if let child = children.at(childIndex) {
+                return child
+            } else {
+                throw .default
+            }
         }
     }
 
@@ -153,6 +175,9 @@ extension DemanglingNodeChildren {
 extension Node: DemanglingNode {
     @inlinable
     public var printCacheIdentity: ObjectIdentifier { ObjectIdentifier(self) }
+
+    @inlinable
+    public var materializedNode: Node { self }
 }
 
 extension Node.Children: DemanglingNodeChildren {}
@@ -168,6 +193,9 @@ extension NodeReference: DemanglingNode {
 
     @inlinable
     public var printCacheIdentity: SymbolStore.NodeIndex { nodeIndex }
+
+    @inlinable
+    public var materializedNode: Node { materialize() }
 }
 
 extension NodeReference.ChildrenView: DemanglingNodeChildren {}
