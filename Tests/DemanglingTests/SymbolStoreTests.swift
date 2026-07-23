@@ -227,6 +227,30 @@ struct SymbolStoreTests {
         }
     }
 
+    @Test func remangleParityWithNodePath() throws {
+        // Remangling a NodeReference (bridged through materialization) must
+        // produce the same mangled string as the Node path.
+        let mangledSymbols = [
+            "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
+            "$s4main1gyxxlF",
+            "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",
+            "$s4main3FooVAA1P0B0fMq_",
+        ]
+        var builder = SymbolStoreBuilder()
+        var rootIndices = [SymbolStore.NodeIndex]()
+        for mangled in mangledSymbols {
+            rootIndices.append(try builder.demangle(mangled))
+        }
+        let store = builder.freeze()
+
+        for (rootIndex, mangled) in zip(rootIndices, mangledSymbols) {
+            let nodePathTree = try demangleAsNode(mangled, internsSubtrees: false)
+            let nodePathMangled = try mangleAsString(nodePathTree)
+            let storePathMangled = try mangleAsString(store.reference(at: rootIndex))
+            #expect(storePathMangled == nodePathMangled, "Store-backed remangling should match the Node path for \(mangled)")
+        }
+    }
+
     @Test func sharedSubtreesAcrossSymbolsShareIndices() throws {
         var builder = SymbolStoreBuilder()
         let firstRootIndex = try builder.demangle("$sSiD")
