@@ -43,6 +43,43 @@ public struct NodeReference: Sendable {
         return nil
     }
 
+    /// Zero-copy view of this node's text as UTF-8 bytes in the store's
+    /// string table. Only covers text physically stored in the table;
+    /// `.dependentGenericParamType`'s synthesized name is not included
+    /// (use `text` for the composed form).
+    public var textUTF8: ArraySlice<UInt8>? {
+        let compact = compactNode
+        guard case .text = compact.payloadKind else { return nil }
+        let start = Int(compact.payloadWord0)
+        return store.textBytes[start ..< start + Int(compact.payloadWord1)]
+    }
+
+    /// Allocation-free witness: compares string-table bytes directly for
+    /// ASCII needles (every kind/sugar check the printer performs), falling
+    /// back to `String` comparison for non-ASCII to preserve Unicode
+    /// canonical-equivalence semantics.
+    public func isIdentifier(desired: String) -> Bool {
+        guard kind == .identifier else { return false }
+        return textMatches(desired)
+    }
+
+    /// Allocation-free witness, same strategy as `isIdentifier(desired:)`.
+    public var isSwiftModule: Bool {
+        guard kind == .module else { return false }
+        return textMatches(stdlibName)
+    }
+
+    private func textMatches(_ expected: String) -> Bool {
+        guard let bytes = textUTF8 else {
+            return text == expected
+        }
+        let expectedUTF8 = expected.utf8
+        guard expectedUTF8.allSatisfy({ $0 < 0x80 }) else {
+            return text == expected
+        }
+        return bytes.elementsEqual(expectedUTF8)
+    }
+
     /// The index contents, if this node carries an index.
     public var index: UInt64? {
         let compact = compactNode

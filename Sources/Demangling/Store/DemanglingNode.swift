@@ -27,6 +27,13 @@ public protocol DemanglingNode: Sendable {
     /// `Remangler` is genericized). `Node` returns itself; `NodeReference`
     /// materializes with subtree sharing preserved.
     var materializedNode: Node { get }
+
+    /// Requirements (with derived defaults) so representations can provide
+    /// allocation-free fast paths — `NodeReference` witnesses these with
+    /// byte comparisons against the store's string table instead of
+    /// constructing a `String` per check.
+    func isIdentifier(desired: String) -> Bool
+    var isSwiftModule: Bool { get }
 }
 
 // MARK: - Derived helpers shared by the printer

@@ -284,6 +284,33 @@ struct SymbolStoreTests {
         #expect(store.reference(at: indexNodeIndex).index == 42)
     }
 
+    @Test func byteLevelTextWitnessesMatchNodePath() throws {
+        // The allocation-free isIdentifier/isSwiftModule witnesses and the
+        // zero-copy textUTF8 view must agree with the Node path everywhere.
+        let mangledSymbols = [
+            "$sSaySiGD",
+            "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
+        ]
+        var builder = SymbolStoreBuilder()
+        var rootIndices = [SymbolStore.NodeIndex]()
+        for mangled in mangledSymbols {
+            rootIndices.append(try builder.demangle(mangled))
+        }
+        let store = builder.freeze()
+
+        for (rootIndex, mangled) in zip(rootIndices, mangledSymbols) {
+            let nodePathTree = try demangleAsNode(mangled, internsSubtrees: false)
+            for (reference, node) in zip(store.reference(at: rootIndex), nodePathTree) {
+                #expect(reference.isSwiftModule == node.isSwiftModule)
+                #expect(reference.isIdentifier(desired: "Array") == node.isIdentifier(desired: "Array"))
+                #expect(reference.isIdentifier(desired: "Int") == node.isIdentifier(desired: "Int"))
+                if let bytes = reference.textUTF8 {
+                    #expect(Array(bytes) == Array((node.text ?? "").utf8), "textUTF8 should be the exact stored bytes")
+                }
+            }
+        }
+    }
+
     @Test func remangleParityWithNodePath() throws {
         // Remangling a NodeReference (bridged through materialization) must
         // produce the same mangled string as the Node path.
