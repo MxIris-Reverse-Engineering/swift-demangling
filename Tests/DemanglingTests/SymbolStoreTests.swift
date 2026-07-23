@@ -139,12 +139,22 @@ struct SymbolStoreTests {
     // MARK: - Demangle Parity
 
     @Test func demangleParityWithNodePath() throws {
+        // Zero-materialization store printing must be byte-identical to the Node
+        // path across option sets, including generic params (dependentGenericParamType
+        // text synthesis) and sugared types.
         let mangledSymbols = [
             "$sSiD",
             "$sSaySiGD",
             "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
             "$s4main3FooVAA1P0B0fMq_",
             "$s7SwiftUI4ViewP",
+            "$s4main1gyxxlF",                                   // g<A>(A) -> A
+            "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",        // ModifiedContent<A, B> conformance
+        ]
+        let optionSets: [DemangleOptions] = [
+            .default,
+            .simplified,
+            .default.union(.synthesizeSugarOnTypes),
         ]
 
         var builder = SymbolStoreBuilder()
@@ -154,10 +164,12 @@ struct SymbolStoreTests {
         }
         let store = builder.freeze()
 
-        for (rootIndex, mangled) in zip(rootIndices, mangledSymbols) {
-            let storePrinted = store.reference(at: rootIndex).print(using: .default)
-            let nodePrinted = try demangleAsNode(mangled, internsSubtrees: false).print(using: .default)
-            #expect(storePrinted == nodePrinted, "Store-backed printing should match the Node path for \(mangled)")
+        for options in optionSets {
+            for (rootIndex, mangled) in zip(rootIndices, mangledSymbols) {
+                let storePrinted = store.reference(at: rootIndex).print(using: options)
+                let nodePrinted = try demangleAsNode(mangled, internsSubtrees: false).print(using: options)
+                #expect(storePrinted == nodePrinted, "Store-backed printing should match the Node path for \(mangled)")
+            }
         }
     }
 

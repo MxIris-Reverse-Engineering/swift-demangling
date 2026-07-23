@@ -26,10 +26,21 @@ public struct NodeReference: Sendable {
     }
 
     /// The text contents, if this node carries text.
+    ///
+    /// Mirrors `Node.text`: for `.dependentGenericParamType` (which stores
+    /// `[depth, index]` as children rather than text) the generic parameter
+    /// name is synthesized, matching what the printer expects.
     public var text: String? {
         let compact = compactNode
-        guard case .text = compact.payloadKind else { return nil }
-        return store.text(offset: compact.payloadWord0, length: compact.payloadWord1)
+        if case .text = compact.payloadKind {
+            return store.text(offset: compact.payloadWord0, length: compact.payloadWord1)
+        }
+        if compact.kind == .dependentGenericParamType {
+            let childrenView = children
+            guard let depth = childrenView.at(0)?.index, let parameterIndex = childrenView.at(1)?.index else { return nil }
+            return genericParameterName(depth: depth, index: parameterIndex)
+        }
+        return nil
     }
 
     /// The index contents, if this node carries an index.
@@ -53,12 +64,13 @@ public struct NodeReference: Sendable {
         store.materializeNode(at: nodeIndex.rawValue)
     }
 
-    /// Prints the demangled form of this subtree.
-    ///
-    /// Phase 1 materializes and delegates to `Node.print(using:)`; proposal
-    /// 0001 Phase 2 replaces this with a zero-materialization printer path.
+    /// Prints the demangled form of this subtree directly from the store,
+    /// without materializing a `Node` tree (proposal 0001, Phase 2).
     public func print(using options: DemangleOptions = .default) -> String {
-        materialize().print(using: options)
+        StackSafeExecutor.execute {
+            var printer = DemanglingPrinter<String, NodeReference>(options: options)
+            return printer.printRoot(self)
+        }
     }
 }
 
