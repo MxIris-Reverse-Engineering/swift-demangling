@@ -13,22 +13,32 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
     private var edges: ContiguousArray<UInt32> = []
     private var textBytes: ContiguousArray<UInt8> = []
 
+    // Interning tables are open-addressing slot arrays that store only node
+    // (or text) indices — 4 bytes per slot, no separate key storage. Keys are
+    // recovered from the flat buffers on comparison, so the tables add ~2 MB
+    // for a whole-framework build instead of the ~10 MB the dictionary-keyed
+    // scheme cost (proposal 0001, Phase 3 intern-table slimming).
+
+    /// Slot sentinel for an empty open-addressing slot.
+    private static let emptySlot: UInt32 = .max
+
     /// Interning table for nodes whose 12-byte representation is already
     /// canonical: leaves (text offsets are canonical because text is interned
     /// first) and nodes with one or two children (child indices are canonical).
-    private var uniqueNodeIndices: [CompactNode: UInt32] = [:]
+    /// Slots hold node indices; the key is `nodes[slot]` itself.
+    private var compactSlots = ContiguousArray<UInt32>(repeating: emptySlot, count: 4096)
+    private var compactCount = 0
 
     /// Interning table for nodes with three or more children, whose edges
     /// offset is allocation-dependent and therefore cannot serve as a key.
-    private var uniqueManyChildrenIndices: [ManyChildrenKey: UInt32] = [:]
+    /// Slots hold node indices; comparison walks the `edges` range.
+    private var manyChildrenSlots = ContiguousArray<UInt32>(repeating: emptySlot, count: 1024)
+    private var manyChildrenCount = 0
 
-    /// Interning table for text contents.
-    private var uniqueTextLocations: [String: TextLocation] = [:]
-
-    private struct ManyChildrenKey: Hashable {
-        let kindAndPayloadKind: UInt16
-        let childIndices: [UInt32]
-    }
+    /// Interning table for text contents. Slots index into `uniqueTexts`;
+    /// comparison reads the `textBytes` range.
+    private var textSlots = ContiguousArray<UInt32>(repeating: emptySlot, count: 1024)
+    private var uniqueTexts: ContiguousArray<TextLocation> = []
 
     private struct TextLocation {
         let offset: UInt32
@@ -47,10 +57,11 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
 
     /// Demangles a mangled symbol and interns the resulting tree in one step.
     ///
-    /// The intermediate `Node` tree is transient, so the global `NodeCache`
-    /// subtree interning is skipped — nothing accumulates outside this builder.
+    /// The intermediate `Node` tree is transient and fully cache-free: neither
+    /// leaves nor subtrees touch `NodeCache.shared`, so bulk demangling leaves
+    /// no trace in global state (proposal 0001, Phase 3).
     public mutating func demangle(_ mangled: String, isType: Bool = false) throws(DemanglingError) -> SymbolStore.NodeIndex {
-        let tree = try demangleAsNode(mangled, isType: isType, internsSubtrees: false)
+        let tree = try demangleAsNodeTransient(mangled, isType: isType)
         return intern(tree)
     }
 
@@ -170,34 +181,8 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
                 payloadWord1: childIndices[1]
             ))
         default:
-            let key = ManyChildrenKey(
-                kindAndPayloadKind: CompactNode(kind: kind, payloadKind: .manyChildren, payloadWord0: 0, payloadWord1: 0).kindAndPayloadKind,
-                childIndices: childIndices
-            )
-            if let existingIndex = uniqueManyChildrenIndices[key] {
-                return existingIndex
-            }
-            precondition(edges.count + childIndices.count <= Int(UInt32.max), "SymbolStore edges buffer exceeded UInt32 index space")
-            let edgesOffset = UInt32(edges.count)
-            edges.append(contentsOf: childIndices)
-            let newIndex = appendNode(CompactNode(
-                kind: kind,
-                payloadKind: .manyChildren,
-                payloadWord0: edgesOffset,
-                payloadWord1: UInt32(childIndices.count)
-            ))
-            uniqueManyChildrenIndices[key] = newIndex
-            return newIndex
+            return internManyChildren(kind: kind, childIndices: childIndices)
         }
-    }
-
-    private mutating func internCanonicalCompact(_ compact: CompactNode) -> UInt32 {
-        if let existingIndex = uniqueNodeIndices[compact] {
-            return existingIndex
-        }
-        let newIndex = appendNode(compact)
-        uniqueNodeIndices[compact] = newIndex
-        return newIndex
     }
 
     private mutating func appendNode(_ compact: CompactNode) -> UInt32 {
@@ -207,15 +192,172 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
         return newIndex
     }
 
+    // MARK: - Open-Addressing Interning Tables
+
+    private static func mix(_ currentHash: Int, _ value: Int) -> Int {
+        (currentHash &* 0x9E3779B1) &+ value
+    }
+
+    private static func hash(of compact: CompactNode) -> Int {
+        var combined = Int(compact.kindAndPayloadKind)
+        combined = mix(combined, Int(compact.payloadWord0))
+        combined = mix(combined, Int(compact.payloadWord1))
+        return mix(combined, 0)
+    }
+
+    private mutating func internCanonicalCompact(_ compact: CompactNode) -> UInt32 {
+        if (compactCount &+ 1) &* 4 >= compactSlots.count &* 3 {
+            growCompactSlots()
+        }
+        let mask = compactSlots.count - 1
+        var slot = Self.hash(of: compact) & mask
+        while true {
+            let existing = compactSlots[slot]
+            if existing == Self.emptySlot {
+                let newIndex = appendNode(compact)
+                compactSlots[slot] = newIndex
+                compactCount += 1
+                return newIndex
+            }
+            if nodes[Int(existing)] == compact {
+                return existing
+            }
+            slot = (slot + 1) & mask
+        }
+    }
+
+    private mutating func growCompactSlots() {
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: compactSlots.count * 2)
+        let mask = grownSlots.count - 1
+        for existing in compactSlots where existing != Self.emptySlot {
+            var slot = Self.hash(of: nodes[Int(existing)]) & mask
+            while grownSlots[slot] != Self.emptySlot {
+                slot = (slot + 1) & mask
+            }
+            grownSlots[slot] = existing
+        }
+        compactSlots = grownSlots
+    }
+
+    private static func hashOfManyChildren(kindAndPayloadKind: UInt16, childIndices: some Sequence<UInt32>) -> Int {
+        var combined = Int(kindAndPayloadKind)
+        for childIndex in childIndices {
+            combined = Self.mix(combined, Int(childIndex))
+        }
+        return Self.mix(combined, 0)
+    }
+
+    private func manyChildrenNodeMatches(_ existingIndex: UInt32, kindAndPayloadKind: UInt16, childIndices: [UInt32]) -> Bool {
+        let existing = nodes[Int(existingIndex)]
+        guard existing.kindAndPayloadKind == kindAndPayloadKind,
+              Int(existing.payloadWord1) == childIndices.count else {
+            return false
+        }
+        let edgesStart = Int(existing.payloadWord0)
+        return edges[edgesStart ..< edgesStart + childIndices.count].elementsEqual(childIndices)
+    }
+
+    private mutating func internManyChildren(kind: Node.Kind, childIndices: [UInt32]) -> UInt32 {
+        if (manyChildrenCount &+ 1) &* 4 >= manyChildrenSlots.count &* 3 {
+            growManyChildrenSlots()
+        }
+        let kindAndPayloadKind = CompactNode(kind: kind, payloadKind: .manyChildren, payloadWord0: 0, payloadWord1: 0).kindAndPayloadKind
+        let mask = manyChildrenSlots.count - 1
+        var slot = Self.hashOfManyChildren(kindAndPayloadKind: kindAndPayloadKind, childIndices: childIndices) & mask
+        while true {
+            let existing = manyChildrenSlots[slot]
+            if existing == Self.emptySlot {
+                precondition(edges.count + childIndices.count <= Int(UInt32.max), "SymbolStore edges buffer exceeded UInt32 index space")
+                let edgesOffset = UInt32(edges.count)
+                edges.append(contentsOf: childIndices)
+                let newIndex = appendNode(CompactNode(
+                    kind: kind,
+                    payloadKind: .manyChildren,
+                    payloadWord0: edgesOffset,
+                    payloadWord1: UInt32(childIndices.count)
+                ))
+                manyChildrenSlots[slot] = newIndex
+                manyChildrenCount += 1
+                return newIndex
+            }
+            if manyChildrenNodeMatches(existing, kindAndPayloadKind: kindAndPayloadKind, childIndices: childIndices) {
+                return existing
+            }
+            slot = (slot + 1) & mask
+        }
+    }
+
+    private mutating func growManyChildrenSlots() {
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: manyChildrenSlots.count * 2)
+        let mask = grownSlots.count - 1
+        for existing in manyChildrenSlots where existing != Self.emptySlot {
+            let compact = nodes[Int(existing)]
+            let edgesStart = Int(compact.payloadWord0)
+            let childCount = Int(compact.payloadWord1)
+            var slot = Self.hashOfManyChildren(
+                kindAndPayloadKind: compact.kindAndPayloadKind,
+                childIndices: edges[edgesStart ..< edgesStart + childCount]
+            ) & mask
+            while grownSlots[slot] != Self.emptySlot {
+                slot = (slot + 1) & mask
+            }
+            grownSlots[slot] = existing
+        }
+        manyChildrenSlots = grownSlots
+    }
+
+    private static func hashOfTextBytes(_ bytes: some Sequence<UInt8>) -> Int {
+        // FNV-1a
+        var combined = Int(bitPattern: 0xCBF2_9CE4_8422_2325 as UInt)
+        for byte in bytes {
+            combined = (combined ^ Int(byte)) &* 0x100_0000_01B3
+        }
+        return combined
+    }
+
+    private func textLocationMatches(_ location: TextLocation, utf8Bytes: [UInt8]) -> Bool {
+        guard Int(location.length) == utf8Bytes.count else { return false }
+        let start = Int(location.offset)
+        return textBytes[start ..< start + utf8Bytes.count].elementsEqual(utf8Bytes)
+    }
+
     private mutating func internText(_ textValue: String) -> TextLocation {
-        if let existingLocation = uniqueTextLocations[textValue] {
-            return existingLocation
+        if (uniqueTexts.count &+ 1) &* 4 >= textSlots.count &* 3 {
+            growTextSlots()
         }
         let utf8Bytes = Array(textValue.utf8)
-        precondition(textBytes.count + utf8Bytes.count <= Int(UInt32.max), "SymbolStore text buffer exceeded UInt32 offset space")
-        let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Bytes.count))
-        textBytes.append(contentsOf: utf8Bytes)
-        uniqueTextLocations[textValue] = location
-        return location
+        let mask = textSlots.count - 1
+        var slot = Self.hashOfTextBytes(utf8Bytes) & mask
+        while true {
+            let existing = textSlots[slot]
+            if existing == Self.emptySlot {
+                precondition(textBytes.count + utf8Bytes.count <= Int(UInt32.max), "SymbolStore text buffer exceeded UInt32 offset space")
+                let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Bytes.count))
+                textBytes.append(contentsOf: utf8Bytes)
+                textSlots[slot] = UInt32(uniqueTexts.count)
+                uniqueTexts.append(location)
+                return location
+            }
+            let existingLocation = uniqueTexts[Int(existing)]
+            if textLocationMatches(existingLocation, utf8Bytes: utf8Bytes) {
+                return existingLocation
+            }
+            slot = (slot + 1) & mask
+        }
+    }
+
+    private mutating func growTextSlots() {
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: textSlots.count * 2)
+        let mask = grownSlots.count - 1
+        for existing in textSlots where existing != Self.emptySlot {
+            let location = uniqueTexts[Int(existing)]
+            let start = Int(location.offset)
+            var slot = Self.hashOfTextBytes(textBytes[start ..< start + Int(location.length)]) & mask
+            while grownSlots[slot] != Self.emptySlot {
+                slot = (slot + 1) & mask
+            }
+            grownSlots[slot] = existing
+        }
+        textSlots = grownSlots
     }
 }

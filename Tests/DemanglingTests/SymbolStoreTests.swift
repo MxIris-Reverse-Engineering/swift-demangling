@@ -227,6 +227,35 @@ struct SymbolStoreTests {
         }
     }
 
+    @Test func bridgeDemanglingLeavesNodeCacheUntouched() throws {
+        // Phase 3: the builder's demangle bridge must be fully cache-free.
+        // Cache-free demangling constructs fresh leaves every time, so two
+        // transient runs share no instances; the cached path interns leaves
+        // eagerly, so the same leaf is one canonical instance across runs.
+        // (Identity-based so concurrent suites interning into the global
+        // NodeCache cannot flake this test.)
+        let mangled = "$s4main27TestPhase3CacheFreeSentinelVD"
+
+        let transientFirst = try demangleAsNodeTransient(mangled)
+        let transientSecond = try demangleAsNodeTransient(mangled)
+        let transientIdentifierFirst = try #require(transientFirst.first(of: .identifier))
+        let transientIdentifierSecond = try #require(transientSecond.first(of: .identifier))
+        #expect(transientIdentifierFirst.text == "TestPhase3CacheFreeSentinel")
+        #expect(transientIdentifierFirst !== transientIdentifierSecond, "Transient demangling should not canonicalize leaves")
+
+        let cachedFirst = try demangleAsNode(mangled, internsSubtrees: false)
+        let cachedSecond = try demangleAsNode(mangled, internsSubtrees: false)
+        let cachedIdentifierFirst = try #require(cachedFirst.first(of: .identifier))
+        let cachedIdentifierSecond = try #require(cachedSecond.first(of: .identifier))
+        #expect(cachedIdentifierFirst === cachedIdentifierSecond, "Cached demangling interns leaves globally")
+
+        // The transient tree still interns into the store correctly.
+        var builder = SymbolStoreBuilder()
+        let rootIndex = try builder.demangle(mangled)
+        let store = builder.freeze()
+        #expect(store.reference(at: rootIndex).print(using: .default) == cachedFirst.print(using: .default))
+    }
+
     @Test func directConstructionSharesHashConsingWithTreeInterning() {
         // Building Swift.Int by hand and interning the equivalent Node tree
         // must collapse to the same index, and print identically.
