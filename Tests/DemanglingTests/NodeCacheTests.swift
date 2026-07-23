@@ -51,10 +51,10 @@ struct NodeCacheTests {
         let parent1 = cache.intern(kind: .type, children: [child1, child2])
         let parent2 = cache.intern(kind: .type, children: [child1, child2])
 
-        // Tree nodes (with children) are NOT cached — each call creates a new instance
-        #expect(parent1 !== parent2, "Nodes with children should not be cached")
-        // Only leaf nodes are cached
+        // Interior nodes are hash-consed — structurally equal subtrees share one instance
+        #expect(parent1 === parent2, "Nodes with identical children should be interned")
         #expect(cache.count == 2) // child1, child2
+        #expect(cache.subtreeCount == 1) // the shared .type parent
     }
 
     @Test func differentChildrenProduceDifferentNodes() {
@@ -81,11 +81,11 @@ struct NodeCacheTests {
             Node(kind: .identifier, text: "B")
         ])
 
-        // Intern the tree — only leaf nodes get deduplicated, tree roots are not cached
+        // Intern the tree — the whole tree is hash-consed bottom-up
         let interned1 = cache.intern(tree)
         let interned2 = cache.intern(tree)
 
-        // Tree roots are not cached, but leaf children should be shared
+        #expect(interned1 === interned2, "Interning the same tree twice should return the canonical instance")
         #expect(interned1.children[0] === interned2.children[0], "Leaf children should be deduplicated")
         #expect(interned1.children[1] === interned2.children[1], "Leaf children should be deduplicated")
     }
@@ -115,10 +115,13 @@ struct NodeCacheTests {
 
         #expect(leaf1 === leaf2, "Identical leaf nodes should be deduplicated")
 
-        // But the parent .type nodes (with children) should NOT be the same instance
+        // The structurally equal .type subtrees should also collapse to one instance
         let type1 = interned1.children[0]
         let type2 = interned2.children[0]
-        #expect(type1 !== type2, "Tree nodes with children are not cached")
+        #expect(type1 === type2, "Structurally equal subtrees should be interned")
+
+        // The roots differ in kind and must stay distinct
+        #expect(interned1 !== interned2, "Roots with different kinds should remain distinct")
     }
 
     @Test func internBatchOfNodes() {
@@ -132,10 +135,10 @@ struct NodeCacheTests {
 
         let interned = cache.intern(trees)
 
-        // Tree roots are not cached, so they are different instances
-        #expect(interned[0] !== interned[1], "Tree nodes with children are not cached")
-        // But their shared leaf children should be the same instance
+        // Structurally equal trees collapse to one canonical instance
+        #expect(interned[0] === interned[1], "Structurally equal trees should be interned")
         #expect(interned[0].children[0] === interned[1].children[0], "Identical leaf children should be deduplicated")
+        #expect(interned[0] !== interned[2], "Structurally different trees should remain distinct")
         #expect(interned[0].children[0] !== interned[2].children[0], "Different leaf children should remain different")
     }
 
@@ -160,7 +163,7 @@ struct NodeCacheTests {
         let interned1 = cache.internTreeUnsafe(tree)
         let interned2 = cache.internTreeUnsafe(tree)
 
-        // Tree roots are not cached, but leaf children should be shared
+        #expect(interned1 === interned2, "Re-interning the same tree should return the canonical instance")
         #expect(interned1.children[0] === interned2.children[0], "Leaf children should be deduplicated")
     }
 
@@ -236,17 +239,46 @@ struct NodeCacheDemangleTests {
         #expect(module1 === module2, "Same leaf nodes should be deduplicated via NodeCache.shared")
     }
 
-    @Test func sharedSubtreesAreInterned() throws {
-        // These symbols both contain Swift module
+    @Test func demangleAsNodeInternsWholeTree() throws {
+        // With subtree interning (the default), demangling the same symbol twice
+        // returns the same canonical root instance
+        let node1 = try demangleAsNode("$sSiD")
+        let node2 = try demangleAsNode("$sSiD")
+
+        #expect(node1 === node2, "Same symbol should demangle to the canonical tree instance")
+    }
+
+    @Test func demangleAsNodeSharesSubtreesAcrossSymbols() throws {
+        // Different symbols mentioning the same type should share the type's subtree
         let node1 = try demangleAsNode("$sSiD")  // Swift.Int
-        let node2 = try demangleAsNode("$sSaySSGD")  // Array<String>
+        let node2 = try demangleAsNode("$sSaySiGD")  // Array<Int>
 
-        // Both should have Swift module node interned
-        let module1 = node1.first(of: .module)
-        let module2 = node2.first(of: .module)
+        let intStructure1 = node1.all(of: .structure).first { $0.first(of: .identifier)?.text == "Int" }
+        let intStructure2 = node2.all(of: .structure).first { $0.first(of: .identifier)?.text == "Int" }
 
-        #expect(module1 != nil)
-        #expect(module2 != nil)
+        #expect(intStructure1 != nil)
+        #expect(intStructure2 != nil)
+        #expect(intStructure1 === intStructure2, "The Swift.Int subtree should be shared across symbols")
+    }
+
+    @Test func demangleAsNodeWithoutSubtreeInterning() throws {
+        // Opting out returns fresh interior nodes, but they stay structurally equal
+        let node1 = try demangleAsNode("$sSiD", internsSubtrees: false)
+        let node2 = try demangleAsNode("$sSiD", internsSubtrees: false)
+
+        #expect(node1 !== node2, "Without subtree interning, roots should be distinct instances")
+        #expect(node1 == node2, "Structural equality should be unaffected")
+        #expect(node1.print(using: .default) == node2.print(using: .default))
+    }
+
+    @Test func interningDoesNotAffectPrintingOrRemangling() throws {
+        let mangled = "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc"
+        let interned = try demangleAsNode(mangled)
+        let uninterned = try demangleAsNode(mangled, internsSubtrees: false)
+
+        #expect(interned == uninterned, "Interned and uninterned trees should be structurally equal")
+        #expect(interned.print(using: .default) == uninterned.print(using: .default))
+        #expect(try mangleAsString(interned) == mangleAsString(uninterned), "Remangling should be unaffected by interning")
 
         // Clean up
         NodeCache.shared.clear()
@@ -277,21 +309,14 @@ struct NodeCacheMemoryTests {
         // Intern all trees
         let interned = cache.intern(trees)
 
-        // Tree roots are NOT cached, so they are different instances
-        #expect(interned[0] !== interned[1], "Tree nodes with children are not cached")
-
-        // But all leaf nodes should be shared across all trees
-        // Every tree's deepest leaves (.module "Swift" and .identifier "Int") should be the same instance
-        let leaf0a = interned[0].children[0].children[0].children[0] // .module "Swift"
-        let leaf0b = interned[0].children[0].children[0].children[1] // .identifier "Int"
+        // All 100 structurally equal trees collapse to a single canonical instance
         for i in 1..<interned.count {
-            let leafA = interned[i].children[0].children[0].children[0]
-            let leafB = interned[i].children[0].children[0].children[1]
-            #expect(leaf0a === leafA, "Leaf .module nodes should be deduplicated")
-            #expect(leaf0b === leafB, "Leaf .identifier nodes should be deduplicated")
+            #expect(interned[0] === interned[i], "Structurally equal trees should share one instance")
         }
 
         // Cache should only have 2 unique leaf nodes (module "Swift", identifier "Int")
         #expect(cache.count == 2, "Should have exactly 2 unique leaf nodes")
+        // And 3 unique interior subtrees (.structure, .type, .global)
+        #expect(cache.subtreeCount == 3, "Should have exactly 3 unique interior subtrees")
     }
 }

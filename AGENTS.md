@@ -40,7 +40,7 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 - **`Node.Children`** (`Node.Children.swift`) — Inline storage for 0–2 children without heap allocation; falls back to `ContiguousArray` for 3+.
 - **`NodeBuilder`** (`Node.swift`) — Thread-safe builder for constructing `Node` trees incrementally (uses `os_unfair_lock`).
 - **`Node.create()`** (`Node+Init.swift`) — Public static factories that go through `NodeCache.shared` for leaf-node interning. Always use these instead of `Node.init()` when creating nodes that should be cached.
-- **`NodeCache` / `NodeFactory`** (`NodeFactory.swift`) — `NodeCache` is the global leaf-node interning cache. `NodeFactory` provides pre-created singletons for common parameterless nodes (e.g., `NodeFactory.emptyList`, `.asyncAnnotation`). The `Node.init(...)` convenience initializers in `NodeFactory.swift` are **internal** and bypass the cache — they exist for `Demangler`/`Remangler` internals.
+- **`NodeCache` / `NodeFactory`** (`NodeFactory.swift`) — `NodeCache` is the global interning cache with two levels: leaf nodes are interned eagerly at creation time, and whole trees are hash-consed bottom-up via `intern(_:)` / `internTreeUnsafe(_:)` (structurally equal subtrees collapse to one shared instance; interior-node keys compare children by `===`, which is safe because children are canonicalized before their parent). `demangleAsNode` runs the tree-interning pass by default (`internsSubtrees: true`), so identical symbols demangle to the identical (`===`) tree; opt out with `internsSubtrees: false`. `NodeFactory` provides pre-created singletons for common parameterless nodes (e.g., `NodeFactory.emptyList`, `.asyncAnnotation`). The `Node.init(...)` convenience initializers in `NodeFactory.swift` are **internal** and bypass the cache — they exist for `Demangler`/`Remangler` internals.
 - **`Node.Kind`** (`Node+Kind.swift`) — Exhaustive enum of ~300 node kinds matching the Swift compiler's `Demangle::Node::Kind`.
 - **`Demangler`** (`Demangler.swift`) — Generic over `Collection<UnicodeScalar>`. Parses mangled prefixes `_T0`, `_$S`, `_$s`, `$S`, `$s`, `$e`, `_$e`, `@__swiftmacro_`.
 - **`Remangler`** (`Remangler.swift`) — Converts a `Node` tree back to a mangled string. Uses hash-based substitution merging.
@@ -52,7 +52,7 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 
 ### Node Identity vs Equality
 
-`Node` is a reference type with structural `Hashable` conformance: `==` compares kind + contents + children recursively, while `===` checks identity. Interned leaf nodes from `NodeCache` guarantee identity equality for structurally equal leaves.
+`Node` is a reference type with structural `Hashable` conformance: `==` compares kind + contents + children recursively, while `===` checks identity. Interned nodes from `NodeCache` guarantee identity equality for structurally equal trees: leaves are canonical from creation, and any tree returned by `demangleAsNode` (default `internsSubtrees: true`) is fully canonical, so structurally equal subtrees are the same instance across all demangled symbols.
 
 ### Public API Entry Points
 

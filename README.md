@@ -2,7 +2,7 @@
 
 A pure Swift library for demangling and remangling Swift mangled symbols, with full support for Swift 6 strict concurrency.
 
-This project is derived from [CwlDemangle](https://github.com/mattgallagher/CwlDemangle) by Matt Gallagher, which is itself a line-by-line translation of the Swift compiler's C++ `Demangler` into Swift. Building on that foundation, this library has been significantly expanded with remangling, type decoding, tree traversal/rewriting APIs, leaf-node interning, and a generic printer target system.
+This project is derived from [CwlDemangle](https://github.com/mattgallagher/CwlDemangle) by Matt Gallagher, which is itself a line-by-line translation of the Swift compiler's C++ `Demangler` into Swift. Building on that foundation, this library has been significantly expanded with remangling, type decoding, tree traversal/rewriting APIs, node interning (hash-consing), and a generic printer target system.
 
 ## Features
 
@@ -11,7 +11,7 @@ This project is derived from [CwlDemangle](https://github.com/mattgallagher/CwlD
 - **Remangle** modified trees back into valid mangled strings
 - **Decode types** from mangled nodes via a pluggable `TypeBuilder` protocol
 - **Traverse & rewrite** trees with built-in iterators and `Node.Rewriter`
-- **Leaf-node interning** via `NodeCache` for memory-efficient batch processing
+- **Node interning (hash-consing)** via `NodeCache` — structurally equal subtrees share one instance, reducing memory ~4x for whole-binary demangling
 - Supports all mangling prefixes: `_T0`, `_$S`, `_$s`, `$S`, `$s`, `$e`, `_$e`, `@__swiftmacro_`
 - Swift 6 strict concurrency — all public types are `Sendable`
 
@@ -220,16 +220,24 @@ let type = try decoder.decodeMangledType(node: node)
 
 ### Memory Management
 
-When processing many symbols (e.g., scanning a binary), use `NodeCache` for deduplication:
+`demangleAsNode` interns the resulting tree through `NodeCache.shared` by default: leaf nodes are deduplicated at creation time, and the finished tree goes through a bottom-up subtree interning (hash-consing) pass. Structurally equal subtrees — across all demangled symbols — share a single `Node` instance, which reduces memory by roughly 4x when demangling a whole binary:
 
 ```swift
-// Leaf nodes are automatically interned during demangling
+// Structurally equal subtrees are shared automatically
 let node1 = try demangleAsNode(symbol1)
 let node2 = try demangleAsNode(symbol2)
-// Shared leaf nodes (e.g., .module("Swift")) use the same instance
+// e.g. the `Swift.Int` type subtree in both trees is the same instance
 
-// Clear the cache when done to free memory
+// Interned trees are retained by the cache; clear it when done to free memory
 NodeCache.shared.clear()
+```
+
+Because interned nodes are canonical, demangling the same symbol twice returns the identical (`===`) tree instance. Interning never changes structural equality (`==`), printing, or remangling results.
+
+For one-off demangling where the cache should not grow, opt out per call:
+
+```swift
+let node = try demangleAsNode(symbol, internsSubtrees: false)
 ```
 
 ## Acknowledgments
