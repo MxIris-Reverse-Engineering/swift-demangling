@@ -25,9 +25,11 @@ public protocol DemanglingNode: Sendable {
 
 // MARK: - Derived helpers shared by the printer
 
-/// Generic ports of the `Node` convenience properties the printer engine uses.
-/// On `Node` its own concrete members take precedence (identical behavior); the
-/// generic engine resolves these when specialized on `NodeReference`.
+/// The convenience properties the printer engine derives from the protocol
+/// primitives. These are the single implementation for both `Node` and
+/// `NodeReference`: they are extension members (not requirements), so the
+/// generic engine statically dispatches here for every conformer — keeping a
+/// parallel copy on a concrete type would silently drift.
 extension DemanglingNode {
     /// Prints this subtree with the given options. Mirrors `Node.print(using:)`.
     public func print(using options: DemangleOptions = .default) -> String {
@@ -37,10 +39,12 @@ extension DemanglingNode {
         }
     }
 
+    @inlinable
     public func isIdentifier(desired: String) -> Bool {
         kind == .identifier && text == desired
     }
 
+    @inlinable
     public var isSwiftModule: Bool {
         kind == .module && text == stdlibName
     }
