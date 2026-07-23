@@ -2,7 +2,7 @@
 
 - **Proposal**: 0001
 - **Author**: Mx-Iris
-- **Status**: Draft
+- **Status**: In Progress
 - **Date**: 2026-07-23
 - **Last Updated**: 2026-07-23
 - **Branch**: `feature/symbol-store`
@@ -137,3 +137,5 @@ store 自带索引级 intern，store 路径不经过全局 `NodeCache`；批量�
 | Date | Decision | Notes |
 |---|---|---|
 | 2026-07-23 | Created as Draft | 基于 48B class 下限与 C++ 24B 对比分析，确定 arena + 索引句柄方向；分四阶段渐进迁移，不破坏现有 `Node` API |
+| 2026-07-23 | Status → In Progress，Phase 1 落地 | 用户确认迭代方向，在 worktree `feature/symbol-store` 实施。`CompactNode`（实测 size/stride = 12）、`SymbolStoreBuilder`（`~Copyable` + `consuming freeze()`）、`SymbolStore`、`NodeReference` + `ChildrenView` 完成，含 `intern(_ node:)` 导入与 `materialize()` 导出互操作、桥接式 `demangle(_:)`（经 `internsSubtrees: false` 的临时 `Node` 树） |
+| 2026-07-23 | Phase 1 实测达标 | 49k 语料：唯一节点 201,876（与 `NodeCache` 全树 hash-consing 计数逐一吻合，交叉验证正确性）；平铺存储 3.0 MB（nodes 2.4 + edges 0.43 + text 0.26），优于 ≤6 MB 目标；打印抽样 2000 条零差异；构建 0.87s，不劣于 class 路径。**新发现**：构建期高水位 ~16 MB，由 intern 表（`[CompactNode: UInt32]` 等，~10 MB 量级）与桥接路径的临时 class 节点构成，且已冻结后 dirty pages 不随 `malloc_zone_pressure_relief` 回落；两轮连建仅 +6 MB，确认内存复用、无累积。结论：①「49k ≤6 MB」按保留存储口径已达成，进程口径需 Phase 3（直写 arena，消除临时树）+ intern 表瘦身（改为指向 nodes 缓冲的 open-addressing 索引表，去掉独立 key 存储）；②桥接路径会向全局 `NodeCache` 写入叶节点（实测 11k 条），Phase 3 前的批量用户建议构建后 `NodeCache.shared.clear()` |

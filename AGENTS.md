@@ -49,6 +49,7 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 - **`TypeDecoder<Builder>`** (`TypeDecoder.swift`) — Walks a `Node` tree and builds abstract types via the `TypeBuilder` protocol.
 - **`Node.Rewriter`** (`Node+Rewriter.swift`) — Open class for bottom-up tree rewriting. Override `visit(_:)` to transform nodes.
 - **`Node` as `Sequence`** (`Node+Sequence.swift`) — `Node` conforms to `Sequence` with preorder traversal as default. Also provides `.inorder()`, `.postorder()`, `.levelorder()`. Sequence extensions add `first(of:)`, `all(of:)`, `contains(_:)` by `Node.Kind`.
+- **`SymbolStore` / `SymbolStoreBuilder` / `NodeReference`** (`Store/`) — Arena-based compact storage for bulk demangling (evolution proposal 0001, Phase 1). Nodes are flat 12-byte `CompactNode` values referenced by `UInt32` indices in one contiguous buffer; the `~Copyable` builder hash-conses on insert and `consuming freeze()` produces an immutable `Sendable` store. `NodeReference` is a 16-byte value handle mirroring `Node` accessors (kind/text/index/children) with `materialize()` / `print(using:)` interop. The builder's `demangle(_:)` currently bridges through a transient `Node` tree (`internsSubtrees: false`); Phase 3 will parse directly into the arena.
 
 ### Node Identity vs Equality
 
@@ -82,6 +83,7 @@ Sources/Demangling/
   Main/TypeDecoder/  — TypeDecoder, TypeBuilder protocol
   Node/              — Node, Node.Children, NodeBuilder, NodeCache, Kind, Conversions, Sequence, Rewriter
   Node/Printer/      — NodePrinter, NodePrinterTarget protocol, NodePrintContext/State
+  Store/             — CompactNode, SymbolStore, SymbolStoreBuilder, NodeReference (evolution proposal 0001)
   Enums/             — SugarType, ManglingFlavor, DemanglingError, ManglingError, etc.
   Utils/             — Extensions, Common constants, Punycode
 Tests/DemanglingTests/
