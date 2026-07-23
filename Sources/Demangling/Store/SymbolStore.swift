@@ -87,22 +87,35 @@ public final class SymbolStore: Sendable {
     /// Rebuilds a `Node` tree for the subtree rooted at the given raw index.
     ///
     /// The returned tree is freshly constructed and does not interact with the
-    /// global `NodeCache`.
+    /// global `NodeCache`. The store is hash-consed, so a subtree referenced
+    /// from multiple parents is a single index; the memo rebuilds each index
+    /// once and reuses the instance, preserving the store's DAG shape.
+    /// Expanding instead would multiply node count for symbols with heavy
+    /// substitution sharing and defeat the printer's per-instance memoization.
     func materializeNode(at rawIndex: UInt32) -> Node {
+        var materializedByIndex: [UInt32: Node] = [:]
+        return materializeNode(at: rawIndex, materializedByIndex: &materializedByIndex)
+    }
+
+    private func materializeNode(at rawIndex: UInt32, materializedByIndex: inout [UInt32: Node]) -> Node {
+        if let shared = materializedByIndex[rawIndex] {
+            return shared
+        }
         let compact = compactNode(at: rawIndex)
+        let node: Node
         switch compact.payloadKind {
         case .none:
-            return Node(kind: compact.kind)
+            node = Node(kind: compact.kind)
         case .index:
-            return Node(kind: compact.kind, index: UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
+            node = Node(kind: compact.kind, index: UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
         case .text:
-            return Node(kind: compact.kind, text: text(offset: compact.payloadWord0, length: compact.payloadWord1))
+            node = Node(kind: compact.kind, text: text(offset: compact.payloadWord0, length: compact.payloadWord1))
         case .oneChild:
-            return Node(kind: compact.kind, children: [materializeNode(at: compact.payloadWord0)])
+            node = Node(kind: compact.kind, children: [materializeNode(at: compact.payloadWord0, materializedByIndex: &materializedByIndex)])
         case .twoChildren:
-            return Node(kind: compact.kind, children: [
-                materializeNode(at: compact.payloadWord0),
-                materializeNode(at: compact.payloadWord1),
+            node = Node(kind: compact.kind, children: [
+                materializeNode(at: compact.payloadWord0, materializedByIndex: &materializedByIndex),
+                materializeNode(at: compact.payloadWord1, materializedByIndex: &materializedByIndex),
             ])
         case .manyChildren:
             let edgesStart = Int(compact.payloadWord0)
@@ -110,9 +123,11 @@ public final class SymbolStore: Sendable {
             var children = [Node]()
             children.reserveCapacity(childCount)
             for edgeOffset in edgesStart ..< (edgesStart + childCount) {
-                children.append(materializeNode(at: edges[edgeOffset]))
+                children.append(materializeNode(at: edges[edgeOffset], materializedByIndex: &materializedByIndex))
             }
-            return Node(kind: compact.kind, children: children)
+            node = Node(kind: compact.kind, children: children)
         }
+        materializedByIndex[rawIndex] = node
+        return node
     }
 }

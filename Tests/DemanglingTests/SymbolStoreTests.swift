@@ -173,6 +173,26 @@ struct SymbolStoreTests {
         }
     }
 
+    @Test func materializePreservesSubtreeSharing() throws {
+        // g<A>(A) -> A: the generic parameter type occurs as both argument and
+        // return type, so the hash-consed store holds one index for it. The
+        // materialized tree must keep that sharing as one Node instance rather
+        // than expanding the DAG into duplicates.
+        var builder = SymbolStoreBuilder()
+        let rootIndex = try builder.demangle("$s4main1gyxxlF")
+        let store = builder.freeze()
+
+        let materialized = store.reference(at: rootIndex).materialize()
+        let nodePathTree = try demangleAsNode("$s4main1gyxxlF", internsSubtrees: false)
+        #expect(materialized == nodePathTree)
+
+        let genericParameterNodes = materialized.all(of: .dependentGenericParamType)
+        #expect(genericParameterNodes.count >= 2, "Expected the generic parameter to occur in multiple positions")
+        for genericParameterNode in genericParameterNodes.dropFirst() {
+            #expect(genericParameterNode === genericParameterNodes[0], "Shared store subtrees should materialize as one shared instance")
+        }
+    }
+
     @Test func sharedSubtreesAcrossSymbolsShareIndices() throws {
         var builder = SymbolStoreBuilder()
         let firstRootIndex = try builder.demangle("$sSiD")
