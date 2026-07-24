@@ -192,7 +192,11 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             // The full qualified-name print (module, dots, identifier) for
             // this nominal reference runs inside one scope so rich targets
             // can group the writes into a single span keyed by `name`.
-            target.pushTypeReferenceScope(name)
+            // The autoclosure defers materialization: targets that ignore
+            // scopes (String) never evaluate it, so store-backed plain-text
+            // printing stays allocation-free; rich targets materialize only
+            // this nominal reference's small subtree.
+            target.pushTypeReferenceScope(name.materializedNode)
             defer { target.popTypeReferenceScope() }
             return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true)
         case .classMetadataBaseOffset: printFirstChild(name, prefix: "class metadata base offset for ")

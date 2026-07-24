@@ -117,7 +117,7 @@ struct NodeStoreTests {
 
     @Test func referenceAccessorsMatchMaterializedTree() throws {
         var builder = NodeStoreBuilder()
-        let mangled = "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc"
+        let mangled = "$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC"
         let rootIndex = try builder.demangle(mangled)
         let store = builder.freeze()
 
@@ -145,7 +145,7 @@ struct NodeStoreTests {
         let mangledSymbols = [
             "$sSiD",
             "$sSaySiGD",
-            "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
+            "$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC",
             "$s4main3FooVAA1P0B0fMq_",
             "$s7SwiftUI4ViewP",
             "$s4main1gyxxlF",                                   // g<A>(A) -> A
@@ -197,7 +197,7 @@ struct NodeStoreTests {
         // NodeReference's Sequence conformance and kind-lookup helpers must
         // walk the store in the same order the Node path walks the class tree.
         let mangledSymbols = [
-            "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
+            "$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC",
             "$s4main1gyxxlF",
             "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",
         ]
@@ -289,7 +289,7 @@ struct NodeStoreTests {
         // zero-copy textUTF8 view must agree with the Node path everywhere.
         let mangledSymbols = [
             "$sSaySiGD",
-            "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
+            "$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC",
         ]
         var builder = NodeStoreBuilder()
         var rootIndices = [NodeStore.NodeIndex]()
@@ -315,7 +315,7 @@ struct NodeStoreTests {
         // Remangling a NodeReference (bridged through materialization) must
         // produce the same mangled string as the Node path.
         let mangledSymbols = [
-            "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
+            "$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC",
             "$s4main1gyxxlF",
             "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",
             "$s4main3FooVAA1P0B0fMq_",
@@ -419,5 +419,45 @@ struct NodeReferenceStructuralEqualityTests {
         #expect(wrapperReference.structurallyEquals(Node.create(kind: .type, child: Node.create(kind: .identifier, text: "padding"))))
         #expect(!wrapperReference.structurallyEquals(Node.create(kind: .type, child: Node.create(kind: .identifier, text: "spacing"))))
         #expect(!wrapperReference.structurallyEquals(Node.create(kind: .identifier, text: "padding")))
+    }
+}
+
+// MARK: - Interning convenience (Stage 5 upstream additions)
+
+@Suite
+struct NodeReferenceInterningConvenienceTests {
+    @Test func interningInitializerRoundTrip() throws {
+        let tree = try demangleAsNodeTransient("$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC")
+        let reference = NodeReference(interning: tree)
+        #expect(reference.structurallyEquals(tree))
+        #expect(reference.print(using: .default) == tree.print(using: .default))
+    }
+
+    @Test func crossStoreStructuralEquality() throws {
+        let mangled = "$sSaySiGD"
+        var firstBuilder = NodeStoreBuilder()
+        let firstIndex = try firstBuilder.demangle(mangled)
+        let firstReference = firstBuilder.freeze().reference(at: firstIndex)
+
+        var secondBuilder = NodeStoreBuilder()
+        _ = try secondBuilder.demangle("$sS2iIegyd_D")
+        let secondIndex = try secondBuilder.demangle(mangled)
+        let secondReference = secondBuilder.freeze().reference(at: secondIndex)
+
+        #expect(firstReference != secondReference)
+        #expect(firstReference.structurallyEquals(secondReference))
+        #expect(secondReference.structurallyEquals(firstReference))
+
+        let differentReference = NodeReference(interning: try demangleAsNodeTransient("$sSiD"))
+        #expect(!firstReference.structurallyEquals(differentReference))
+    }
+
+    @Test func sameStoreStructuralEqualityIsIndexEquality() throws {
+        var builder = NodeStoreBuilder()
+        let firstIndex = try builder.demangle("$sSaySiGD")
+        let secondIndex = try builder.demangle("$sSaySiGD")
+        let store = builder.freeze()
+        #expect(firstIndex == secondIndex)
+        #expect(store.reference(at: firstIndex).structurallyEquals(store.reference(at: secondIndex)))
     }
 }

@@ -14,7 +14,13 @@ public protocol NodePrinterTarget: Sendable {
     /// a nested push overrides it. Printers push the enclosing nominal
     /// node around a full qualified-name print (module, dots, identifier)
     /// so rich targets can group those writes into one logical span.
-    mutating func pushTypeReferenceScope(_ node: Node?)
+    ///
+    /// The node is delivered lazily: store-backed printing must materialize
+    /// a `Node` to service this hook, and only targets that actually use
+    /// scope identity (rich targets) should pay that cost. Targets that
+    /// ignore scopes (`String`, the default implementation) never evaluate
+    /// the autoclosure, keeping the plain-text store path allocation-free.
+    mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?)
     mutating func popTypeReferenceScope()
 }
 
@@ -23,7 +29,7 @@ extension NodePrinterTarget {
         write(content)
     }
 
-    public mutating func pushTypeReferenceScope(_ node: Node?) {}
+    public mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
 
     public mutating func popTypeReferenceScope() {}
 

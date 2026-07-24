@@ -14,6 +14,21 @@ public struct NodeReference: Sendable {
         self.nodeIndex = nodeIndex
     }
 
+    /// Interns a single `Node` tree into a fresh private store and
+    /// references its root.
+    ///
+    /// This is the convenience path for holding one externally built tree
+    /// (for example a transient demangle or a synthesized `Node`) in
+    /// compact form: the reference keeps its private store alive, so the
+    /// value is self-contained and `Sendable`. For bulk interning, drive a
+    /// `NodeStoreBuilder` directly so trees share one arena and its
+    /// deduplication.
+    public init(interning node: Node) {
+        var builder = NodeStoreBuilder()
+        let rootNodeIndex = builder.intern(node)
+        self = builder.freeze().reference(at: rootNodeIndex)
+    }
+
     @usableFromInline
     var compactNode: CompactNode {
         store.compactNode(at: nodeIndex.rawValue)
@@ -150,6 +165,45 @@ public struct NodeReference: Sendable {
         }
         return true
     }
+
+    /// Whether this subtree is structurally equal to another reference's
+    /// subtree, matching `Node.==` semantics across stores.
+    ///
+    /// Within one store this is O(1): hash-consing makes index equality
+    /// coincide with structural equality. Across two stores it walks both
+    /// subtrees. Text payloads compare by string-table bytes first and
+    /// fall back to `String` equality so Unicode canonical equivalence
+    /// matches `Node.==`.
+    public func structurallyEquals(_ other: NodeReference) -> Bool {
+        if store === other.store {
+            return nodeIndex == other.nodeIndex
+        }
+        let compact = compactNode
+        let otherCompact = other.compactNode
+        guard compact.kind == otherCompact.kind else { return false }
+
+        switch (compact.payloadKind, otherCompact.payloadKind) {
+        case (.text, .text):
+            guard let bytes = textUTF8, let otherBytes = other.textUTF8 else { return false }
+            if !bytes.elementsEqual(otherBytes) {
+                guard text == other.text else { return false }
+            }
+        case (.index, .index):
+            guard index == other.index else { return false }
+        case (.text, _), (_, .text), (.index, _), (_, .index):
+            return false
+        default:
+            break
+        }
+
+        let selfChildren = children
+        let otherChildren = other.children
+        guard selfChildren.count == otherChildren.count else { return false }
+        for (selfChild, otherChild) in zip(selfChildren, otherChildren) {
+            guard selfChild.structurallyEquals(otherChild) else { return false }
+        }
+        return true
+    }
 }
 
 // MARK: - CustomStringConvertible
@@ -172,6 +226,35 @@ extension NodeReference: Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(ObjectIdentifier(store))
         hasher.combine(nodeIndex)
+    }
+
+    /// Hashes this subtree by structure (kind + contents + children,
+    /// recursively), consistent with `structurallyEquals(_:)` across
+    /// stores: structurally equal references — even from different stores —
+    /// produce the same hash.
+    ///
+    /// This is the building block for value types that key dictionaries by
+    /// a node's structure while storing a `NodeReference` (whose intrinsic
+    /// `Hashable` is store-identity based and would split structurally
+    /// equal keys from different stores).
+    public func structuralHash(into hasher: inout Hasher) {
+        let compact = compactNode
+        hasher.combine(compact.kind)
+        switch compact.payloadKind {
+        case .text:
+            hasher.combine(1)
+            hasher.combine(text)
+        case .index:
+            hasher.combine(2)
+            hasher.combine(index)
+        case .none, .oneChild, .twoChildren, .manyChildren:
+            hasher.combine(0)
+        }
+        let childrenView = children
+        hasher.combine(childrenView.count)
+        for child in childrenView {
+            child.structuralHash(into: &hasher)
+        }
     }
 }
 

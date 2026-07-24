@@ -70,9 +70,9 @@ private func demangleAsNode<C: Collection & Sendable>(_ mangled: C, isType: Bool
 /// structurally equal nodes are distinct instances, so `===`-based sharing
 /// assumptions and `NodeCache` identity guarantees do not apply.
 @_spi(Internals)
-public func demangleAsNodeTransient(_ mangled: String, isType: Bool = false) throws(DemanglingError) -> Node {
+public func demangleAsNodeTransient(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil) throws(DemanglingError) -> Node {
     let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
-        try demangleAsNode(mangled.unicodeScalars, isType: isType, internsSubtrees: false, internsLeaves: false)
+        try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: false, internsLeaves: false)
     }
     return try StackSafeExecutor.execute(demangleBlock)
 }

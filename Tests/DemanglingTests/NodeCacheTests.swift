@@ -272,7 +272,7 @@ struct NodeCacheDemangleTests {
     }
 
     @Test func interningDoesNotAffectPrintingOrRemangling() throws {
-        let mangled = "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc"
+        let mangled = "$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC"
         let interned = try demangleAsNode(mangled)
         let uninterned = try demangleAsNode(mangled, internsSubtrees: false)
 
