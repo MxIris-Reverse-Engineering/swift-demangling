@@ -133,3 +133,8 @@ let package = Package(
         ),
     ],
 )
+
+// NOTE: This branch intentionally diverges from main in this manifest so that
+// SwiftPM's content-hash-keyed manifest cache cannot serve an evaluation made
+// in the main checkout (where relative local-dependency candidates resolve to
+// sibling checkouts) to builds running in a worktree, or vice versa.
