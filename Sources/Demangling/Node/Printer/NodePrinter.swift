@@ -2216,7 +2216,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 ///
 /// A thin, source-compatible facade over `DemanglingPrinter<Target, Node>`.
 /// The printing logic lives in the generic engine so it can also print
-/// `NodeReference` trees straight from a `SymbolStore` without materializing
+/// `NodeReference` trees straight from a `NodeStore` without materializing
 /// a class tree (see `NodeReference.print(using:)`).
 public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     public static var maxPrintDepth: Int { DemanglingPrinter<Target, Node>.maxPrintDepth }

@@ -1,14 +1,14 @@
-/// Append-only builder that constructs a `SymbolStore`.
+/// Append-only builder that constructs a `NodeStore`.
 ///
 /// The builder is noncopyable: exactly one owner may build at a time, and
 /// `freeze()` consumes the builder, so "immutable after freezing" is enforced
 /// by the type system rather than by locks or documentation.
 ///
 /// Every inserted node is hash-consed on entry: structurally equal subtrees
-/// receive the same `SymbolStore.NodeIndex`. Interior-node keys use child
+/// receive the same `NodeStore.NodeIndex`. Interior-node keys use child
 /// indices, which is exact because children are always interned before their
 /// parent (the same bottom-up scheme as `NodeCache.internTreeUnsafe`).
-public struct SymbolStoreBuilder: ~Copyable, Sendable {
+public struct NodeStoreBuilder: ~Copyable, Sendable {
     private var nodes: ContiguousArray<CompactNode> = []
     private var edges: ContiguousArray<UInt32> = []
     private var textBytes: ContiguousArray<UInt8> = []
@@ -50,9 +50,9 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
     // MARK: - Building
 
     /// Interns an existing `Node` tree, returning the canonical index of its root.
-    public mutating func intern(_ node: Node) -> SymbolStore.NodeIndex {
+    public mutating func intern(_ node: Node) -> NodeStore.NodeIndex {
         var visitedIndices = [ObjectIdentifier: UInt32]()
-        return SymbolStore.NodeIndex(rawValue: internRecursively(node, visitedIndices: &visitedIndices))
+        return NodeStore.NodeIndex(rawValue: internRecursively(node, visitedIndices: &visitedIndices))
     }
 
     /// Demangles a mangled symbol and interns the resulting tree in one step.
@@ -60,7 +60,7 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
     /// The intermediate `Node` tree is transient and fully cache-free: neither
     /// leaves nor subtrees touch `NodeCache.shared`, so bulk demangling leaves
     /// no trace in global state (proposal 0001, Phase 3).
-    public mutating func demangle(_ mangled: String, isType: Bool = false) throws(DemanglingError) -> SymbolStore.NodeIndex {
+    public mutating func demangle(_ mangled: String, isType: Bool = false) throws(DemanglingError) -> NodeStore.NodeIndex {
         let tree = try demangleAsNodeTransient(mangled, isType: isType)
         return intern(tree)
     }
@@ -68,18 +68,18 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
     // MARK: - Direct Construction
 
     /// Interns a parameterless node.
-    public mutating func intern(kind: Node.Kind) -> SymbolStore.NodeIndex {
-        SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+    public mutating func intern(kind: Node.Kind) -> NodeStore.NodeIndex {
+        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
     }
 
     /// Interns a text-carrying leaf node.
-    public mutating func intern(kind: Node.Kind, text: String) -> SymbolStore.NodeIndex {
-        SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .text(text)))
+    public mutating func intern(kind: Node.Kind, text: String) -> NodeStore.NodeIndex {
+        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .text(text)))
     }
 
     /// Interns an index-carrying leaf node.
-    public mutating func intern(kind: Node.Kind, index: UInt64) -> SymbolStore.NodeIndex {
-        SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .index(index)))
+    public mutating func intern(kind: Node.Kind, index: UInt64) -> NodeStore.NodeIndex {
+        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .index(index)))
     }
 
     /// Interns an interior node over already-interned children — e.g. a
@@ -90,15 +90,15 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
     /// Hash-consing is shared with every other insertion route: constructing
     /// a node directly and interning a structurally equal `Node` tree yield
     /// the same index.
-    public mutating func intern(kind: Node.Kind, children: [SymbolStore.NodeIndex]) -> SymbolStore.NodeIndex {
+    public mutating func intern(kind: Node.Kind, children: [NodeStore.NodeIndex]) -> NodeStore.NodeIndex {
         let childIndices = children.map { childIndex in
             precondition(Int(childIndex.rawValue) < nodes.count, "Child index does not belong to this builder")
             return childIndex.rawValue
         }
         if childIndices.isEmpty {
-            return SymbolStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+            return NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
         }
-        return SymbolStore.NodeIndex(rawValue: internInterior(kind: kind, childIndices: childIndices))
+        return NodeStore.NodeIndex(rawValue: internInterior(kind: kind, childIndices: childIndices))
     }
 
     /// Freezes the builder into an immutable, `Sendable` store.
@@ -106,8 +106,8 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
     /// Consumes the builder; interning tables are dropped, only the flat
     /// buffers survive. Indices minted by this builder remain valid in the
     /// frozen store.
-    public consuming func freeze() -> SymbolStore {
-        SymbolStore(nodes: nodes, edges: edges, textBytes: textBytes)
+    public consuming func freeze() -> NodeStore {
+        NodeStore(nodes: nodes, edges: edges, textBytes: textBytes)
     }
 
     // MARK: - Statistics
@@ -186,7 +186,7 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func appendNode(_ compact: CompactNode) -> UInt32 {
-        precondition(nodes.count < Int(UInt32.max), "SymbolStore node buffer exceeded UInt32 index space")
+        precondition(nodes.count < Int(UInt32.max), "NodeStore node buffer exceeded UInt32 index space")
         let newIndex = UInt32(nodes.count)
         nodes.append(compact)
         return newIndex
@@ -267,7 +267,7 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
         while true {
             let existing = manyChildrenSlots[slot]
             if existing == Self.emptySlot {
-                precondition(edges.count + childIndices.count <= Int(UInt32.max), "SymbolStore edges buffer exceeded UInt32 index space")
+                precondition(edges.count + childIndices.count <= Int(UInt32.max), "NodeStore edges buffer exceeded UInt32 index space")
                 let edgesOffset = UInt32(edges.count)
                 edges.append(contentsOf: childIndices)
                 let newIndex = appendNode(CompactNode(
@@ -331,7 +331,7 @@ public struct SymbolStoreBuilder: ~Copyable, Sendable {
         while true {
             let existing = textSlots[slot]
             if existing == Self.emptySlot {
-                precondition(textBytes.count + utf8Bytes.count <= Int(UInt32.max), "SymbolStore text buffer exceeded UInt32 offset space")
+                precondition(textBytes.count + utf8Bytes.count <= Int(UInt32.max), "NodeStore text buffer exceeded UInt32 offset space")
                 let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Bytes.count))
                 textBytes.append(contentsOf: utf8Bytes)
                 textSlots[slot] = UInt32(uniqueTexts.count)

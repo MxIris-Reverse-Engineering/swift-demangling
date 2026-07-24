@@ -11,6 +11,15 @@
       }
     },
     {
+      "identity" : "machokit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/MxIris-Reverse-Engineering/MachOKit",
+      "state" : {
+        "revision" : "9de6599aaba425632bb38a35cf9acd12a022d8f2",
+        "version" : "0.51.100"
+      }
+    },
+    {
       "identity" : "objectarchivekit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/p-x9/ObjectArchiveKit.git",

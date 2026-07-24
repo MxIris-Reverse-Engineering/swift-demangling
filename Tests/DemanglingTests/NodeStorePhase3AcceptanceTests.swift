@@ -9,7 +9,7 @@ import Testing
 /// the 1.2x budget (asserted generously at 2x to absorb CI noise; measured
 /// numbers are recorded in the proposal's decision log).
 @Suite
-final class SymbolStorePhase3AcceptanceTests: DyldCacheSymbolTests, @unchecked Sendable {
+final class NodeStorePhase3AcceptanceTests: DyldCacheSymbolTests, @unchecked Sendable {
     private static func physicalFootprint() -> Int? {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
@@ -42,7 +42,7 @@ final class SymbolStorePhase3AcceptanceTests: DyldCacheSymbolTests, @unchecked S
 
         let footprintBefore = Self.physicalFootprint()
         let storeBuildStart = ContinuousClock.now
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
         var storeFailureCount = 0
         for mangled in corpus {
             do {

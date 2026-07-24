@@ -323,11 +323,6 @@ extension Node.Children {
     }
 
     @inlinable
-    public var second: Node? {
-        at(1)
-    }
-
-    @inlinable
     public func reversedFirst(_ count: Int) -> Self {
         var result = self
         result.reverseFirst(count)

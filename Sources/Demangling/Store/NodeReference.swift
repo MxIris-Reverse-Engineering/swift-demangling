@@ -1,15 +1,15 @@
-/// A lightweight handle to a node stored in a `SymbolStore`.
+/// A lightweight handle to a node stored in a `NodeStore`.
 ///
 /// Sixteen bytes as a value: a store reference plus a node index. Because
 /// stores are fully hash-consed, equality is O(1) — two references are equal
 /// exactly when they address the same index of the same store, which within
 /// one store coincides with structural equality.
 public struct NodeReference: Sendable {
-    public let store: SymbolStore
-    public let nodeIndex: SymbolStore.NodeIndex
+    public let store: NodeStore
+    public let nodeIndex: NodeStore.NodeIndex
 
     @usableFromInline
-    init(store: SymbolStore, nodeIndex: SymbolStore.NodeIndex) {
+    init(store: NodeStore, nodeIndex: NodeStore.NodeIndex) {
         self.store = store
         self.nodeIndex = nodeIndex
     }
@@ -109,6 +109,57 @@ public struct NodeReference: Sendable {
             return printer.printRoot(self)
         }
     }
+
+    /// Whether this subtree is structurally equal to a `Node` tree, matching
+    /// the semantics of `Node.==` (kind + contents + children, recursively)
+    /// without materializing anything.
+    ///
+    /// This is the bridge for callers that hold an externally demangled
+    /// `Node` (for example from `demangleAsNode`) and need to find it among
+    /// `NodeReference` dictionary keys: reference-to-reference equality stays
+    /// O(1) via hash-consing, while reference-to-`Node` equality walks both
+    /// trees. Text payloads compare by string-table bytes first and fall back
+    /// to `String` equality so Unicode canonical equivalence matches `Node.==`.
+    public func structurallyEquals(_ node: Node) -> Bool {
+        let compact = compactNode
+        guard compact.kind == node.kind else { return false }
+
+        switch node.contents {
+        case .none:
+            switch compact.payloadKind {
+            case .index, .text:
+                return false
+            case .none, .oneChild, .twoChildren, .manyChildren:
+                break
+            }
+        case .index(let indexValue):
+            guard index == indexValue else { return false }
+        case .text(let textValue):
+            guard case .text = compact.payloadKind else { return false }
+            guard let bytes = textUTF8 else { return false }
+            if !bytes.elementsEqual(textValue.utf8) {
+                guard text == textValue else { return false }
+            }
+        }
+
+        let referenceChildren = children
+        let nodeChildren = node.children
+        guard referenceChildren.count == nodeChildren.count else { return false }
+        for (referenceChild, nodeChild) in zip(referenceChildren, nodeChildren) {
+            guard referenceChild.structurallyEquals(nodeChild) else { return false }
+        }
+        return true
+    }
+}
+
+// MARK: - CustomStringConvertible
+
+extension NodeReference: CustomStringConvertible {
+    /// Debug tree dump matching `Node.description`. Bridges through
+    /// materialization — a debugging convenience, not a hot path.
+    public var description: String {
+        materialize().description
+    }
 }
 
 // MARK: - Hashable
@@ -133,13 +184,13 @@ extension NodeReference {
         public typealias Index = Int
 
         @usableFromInline
-        let store: SymbolStore
+        let store: NodeStore
 
         @usableFromInline
         let compactNode: CompactNode
 
         @usableFromInline
-        init(store: SymbolStore, compactNode: CompactNode) {
+        init(store: NodeStore, compactNode: CompactNode) {
             self.store = store
             self.compactNode = compactNode
         }
@@ -166,7 +217,7 @@ extension NodeReference {
             case .none, .index, .text:
                 preconditionFailure("Child index out of range for a node without children")
             }
-            return NodeReference(store: store, nodeIndex: SymbolStore.NodeIndex(rawValue: rawChildIndex))
+            return NodeReference(store: store, nodeIndex: NodeStore.NodeIndex(rawValue: rawChildIndex))
         }
     }
 }

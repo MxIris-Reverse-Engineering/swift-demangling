@@ -1,5 +1,5 @@
 /// The read-only tree shape shared by `Node` (the class tree) and
-/// `NodeReference` (a handle into a `SymbolStore`).
+/// `NodeReference` (a handle into a `NodeStore`).
 ///
 /// It exists so that traversal-only consumers — first the `NodePrinter`
 /// engine — can walk either representation without materializing a class
@@ -66,6 +66,11 @@ extension DemanglingNode {
                 throw .default
             }
         }
+    }
+
+    @inlinable
+    public func isKind(of kinds: Node.Kind...) -> Bool {
+        kinds.contains(kind)
     }
 
     @inlinable
@@ -166,6 +171,11 @@ extension DemanglingNodeChildren {
     }
 
     @inlinable
+    public var second: Element? {
+        at(1)
+    }
+
+    @inlinable
     public func slice(_ from: Int, _ to: Int) -> ArraySlice<Element> {
         let elements = Array(self)
         if from > to || from > elements.endIndex || to < elements.startIndex {
@@ -199,7 +209,7 @@ extension NodeReference: DemanglingNode {
     }
 
     @inlinable
-    public var printCacheIdentity: SymbolStore.NodeIndex { nodeIndex }
+    public var printCacheIdentity: NodeStore.NodeIndex { nodeIndex }
 
     @inlinable
     public var materializedNode: Node { materialize() }

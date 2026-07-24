@@ -11,7 +11,7 @@ struct Demangler<C>: Sendable where C: Collection, C.Iterator.Element == Unicode
 
     /// When false, node construction bypasses `NodeCache.shared` entirely —
     /// no leaf interning, no global lock traffic, nothing retained after the
-    /// tree is dropped. Used by the `SymbolStore` bridge, whose trees are
+    /// tree is dropped. Used by the `NodeStore` bridge, whose trees are
     /// transient by design (proposal 0001, Phase 3).
     let internsLeaves: Bool
 

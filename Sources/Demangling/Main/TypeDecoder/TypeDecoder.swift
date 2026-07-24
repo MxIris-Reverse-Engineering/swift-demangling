@@ -1481,7 +1481,7 @@ private func getObjCClassOrProtocolName(_ node: some DemanglingNode) -> String? 
 ///
 /// A thin, source-compatible facade over `TypeDecoderEngine`. The decoding
 /// logic lives in the generic engine so it can also decode `NodeReference`
-/// trees straight from a `SymbolStore` without materializing the class tree
+/// trees straight from a `NodeStore` without materializing the class tree
 /// (`TypeBuilder` implementations keep receiving concrete `Node` subtrees at
 /// the handoff points).
 public final class TypeDecoder<Builder: TypeBuilder> {
@@ -1508,7 +1508,7 @@ public final class TypeDecoder<Builder: TypeBuilder> {
             .decodeMangledType(node: node, forRequirement: forRequirement)
     }
 
-    /// Store-backed variant: decodes straight from a `SymbolStore` without
+    /// Store-backed variant: decodes straight from a `NodeStore` without
     /// materializing a `Node` tree (proposal 0001, Phase 2).
     public func decodeMangledType(node: NodeReference, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
         try TypeDecoderEngine<Builder, NodeReference>(builder: builder)

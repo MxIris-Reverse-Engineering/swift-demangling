@@ -222,7 +222,7 @@ struct TypeDecoderTests {
     func storeBackedDecodingMatchesNodePath(mangled: String) throws {
         let nodePathResult = try Self.decodeType(mangled)
 
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
         let rootIndex = try builder.demangle(mangled)
         let store = builder.freeze()
 

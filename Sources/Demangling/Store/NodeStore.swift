@@ -1,5 +1,5 @@
 /// An immutable, memory-compact symbol database produced by
-/// `SymbolStoreBuilder.freeze()`.
+/// `NodeStoreBuilder.freeze()`.
 ///
 /// All nodes live in flat contiguous buffers — 12 bytes per node, 4 bytes per
 /// child edge beyond two, and deduplicated UTF-8 text bytes — with no per-node
@@ -9,10 +9,10 @@
 ///
 /// The store is deeply immutable after freezing, so it is `Sendable` and reads
 /// take no locks. See evolution proposal 0001 for the overall design.
-public final class SymbolStore: Sendable {
+public final class NodeStore: Sendable {
     /// A stable identifier of a node within its store.
     ///
-    /// Indices are minted by `SymbolStoreBuilder` and remain valid in the
+    /// Indices are minted by `NodeStoreBuilder` and remain valid in the
     /// frozen store. They are only meaningful for the store they came from.
     public struct NodeIndex: Hashable, Sendable {
         @usableFromInline

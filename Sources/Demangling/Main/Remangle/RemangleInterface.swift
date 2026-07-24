@@ -35,7 +35,7 @@ public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: Mangl
 // MARK: - Store-Backed Remangling
 
 /// Remangle any `DemanglingNode` representation — in particular a
-/// `NodeReference` pointing into a `SymbolStore`.
+/// `NodeReference` pointing into a `NodeStore`.
 ///
 /// The remangling algorithm constructs transient helper nodes while walking
 /// (unspecialized nominals, SIL box layout wrappers), exactly like the C++

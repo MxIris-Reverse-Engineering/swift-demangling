@@ -1,4 +1,4 @@
-/// Flat 12-byte node representation used by `SymbolStore`.
+/// Flat 12-byte node representation used by `NodeStore`.
 ///
 /// Nodes live in one contiguous buffer and refer to each other by `UInt32`
 /// indices instead of pointers, eliminating per-node heap allocations, object

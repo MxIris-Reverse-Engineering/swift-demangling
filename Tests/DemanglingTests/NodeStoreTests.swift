@@ -1,10 +1,10 @@
 import Foundation
 import Testing
-@testable import Demangling
+@_spi(Internals) @testable import Demangling
 
-/// Unit tests for SymbolStore — arena-based compact node storage (proposal 0001, Phase 1).
+/// Unit tests for NodeStore — arena-based compact node storage (proposal 0001, Phase 1).
 @Suite
-struct SymbolStoreTests {
+struct NodeStoreTests {
 
     // MARK: - Kind Ordinal Mapping
 
@@ -24,7 +24,7 @@ struct SymbolStoreTests {
     // MARK: - Import / Materialize Round-Trip
 
     @Test func importAndMaterializeRoundTrip() {
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
 
         let tree = Node(kind: .global, children: [
             Node(kind: .type, children: [
@@ -46,10 +46,10 @@ struct SymbolStoreTests {
     }
 
     @Test func largeIndexPayloadRoundTrips() {
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
         let indexValues: [UInt64] = [0, 1, UInt64(UInt32.max), UInt64(UInt32.max) + 1, UInt64.max]
 
-        var rootIndices = [SymbolStore.NodeIndex]()
+        var rootIndices = [NodeStore.NodeIndex]()
         for indexValue in indexValues {
             rootIndices.append(builder.intern(Node(kind: .index, index: indexValue)))
         }
@@ -63,7 +63,7 @@ struct SymbolStoreTests {
     // MARK: - Hash-Consing
 
     @Test func structurallyEqualTreesShareOneIndex() {
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
 
         func makeTree() -> Node {
             Node(kind: .type, children: [
@@ -83,7 +83,7 @@ struct SymbolStoreTests {
     }
 
     @Test func manyChildrenNodesDeduplicate() {
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
 
         func makeWideTree() -> Node {
             Node(kind: .tuple, children: [
@@ -104,7 +104,7 @@ struct SymbolStoreTests {
     }
 
     @Test func textBytesDeduplicate() {
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
 
         _ = builder.intern(Node(kind: .identifier, text: "duplicated"))
         _ = builder.intern(Node(kind: .module, text: "duplicated"))
@@ -116,7 +116,7 @@ struct SymbolStoreTests {
     // MARK: - Reference Accessors
 
     @Test func referenceAccessorsMatchMaterializedTree() throws {
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
         let mangled = "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc"
         let rootIndex = try builder.demangle(mangled)
         let store = builder.freeze()
@@ -157,8 +157,8 @@ struct SymbolStoreTests {
             .default.union(.synthesizeSugarOnTypes),
         ]
 
-        var builder = SymbolStoreBuilder()
-        var rootIndices = [SymbolStore.NodeIndex]()
+        var builder = NodeStoreBuilder()
+        var rootIndices = [NodeStore.NodeIndex]()
         for mangled in mangledSymbols {
             rootIndices.append(try builder.demangle(mangled))
         }
@@ -178,7 +178,7 @@ struct SymbolStoreTests {
         // return type, so the hash-consed store holds one index for it. The
         // materialized tree must keep that sharing as one Node instance rather
         // than expanding the DAG into duplicates.
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
         let rootIndex = try builder.demangle("$s4main1gyxxlF")
         let store = builder.freeze()
 
@@ -201,8 +201,8 @@ struct SymbolStoreTests {
             "$s4main1gyxxlF",
             "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",
         ]
-        var builder = SymbolStoreBuilder()
-        var rootIndices = [SymbolStore.NodeIndex]()
+        var builder = NodeStoreBuilder()
+        var rootIndices = [NodeStore.NodeIndex]()
         for mangled in mangledSymbols {
             rootIndices.append(try builder.demangle(mangled))
         }
@@ -250,7 +250,7 @@ struct SymbolStoreTests {
         #expect(cachedIdentifierFirst === cachedIdentifierSecond, "Cached demangling interns leaves globally")
 
         // The transient tree still interns into the store correctly.
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
         let rootIndex = try builder.demangle(mangled)
         let store = builder.freeze()
         #expect(store.reference(at: rootIndex).print(using: .default) == cachedFirst.print(using: .default))
@@ -259,7 +259,7 @@ struct SymbolStoreTests {
     @Test func directConstructionSharesHashConsingWithTreeInterning() {
         // Building Swift.Int by hand and interning the equivalent Node tree
         // must collapse to the same index, and print identically.
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
 
         let moduleIndex = builder.intern(kind: .module, text: "Swift")
         let identifierIndex = builder.intern(kind: .identifier, text: "Int")
@@ -291,8 +291,8 @@ struct SymbolStoreTests {
             "$sSaySiGD",
             "$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc",
         ]
-        var builder = SymbolStoreBuilder()
-        var rootIndices = [SymbolStore.NodeIndex]()
+        var builder = NodeStoreBuilder()
+        var rootIndices = [NodeStore.NodeIndex]()
         for mangled in mangledSymbols {
             rootIndices.append(try builder.demangle(mangled))
         }
@@ -320,8 +320,8 @@ struct SymbolStoreTests {
             "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",
             "$s4main3FooVAA1P0B0fMq_",
         ]
-        var builder = SymbolStoreBuilder()
-        var rootIndices = [SymbolStore.NodeIndex]()
+        var builder = NodeStoreBuilder()
+        var rootIndices = [NodeStore.NodeIndex]()
         for mangled in mangledSymbols {
             rootIndices.append(try builder.demangle(mangled))
         }
@@ -336,7 +336,7 @@ struct SymbolStoreTests {
     }
 
     @Test func sharedSubtreesAcrossSymbolsShareIndices() throws {
-        var builder = SymbolStoreBuilder()
+        var builder = NodeStoreBuilder()
         let firstRootIndex = try builder.demangle("$sSiD")
         let secondRootIndex = try builder.demangle("$sSaySiGD")
         let store = builder.freeze()
@@ -363,18 +363,61 @@ struct SymbolStoreTests {
     // MARK: - Reference Identity
 
     @Test func referenceEqualityIsStoreAndIndexBased() {
-        var firstBuilder = SymbolStoreBuilder()
+        var firstBuilder = NodeStoreBuilder()
         _ = firstBuilder.intern(Node(kind: .identifier, text: "same"))
         let firstStore = firstBuilder.freeze()
 
-        var secondBuilder = SymbolStoreBuilder()
+        var secondBuilder = NodeStoreBuilder()
         _ = secondBuilder.intern(Node(kind: .identifier, text: "same"))
         let secondStore = secondBuilder.freeze()
 
-        let firstReference = firstStore.reference(at: SymbolStore.NodeIndex(rawValue: 0))
-        let secondReference = secondStore.reference(at: SymbolStore.NodeIndex(rawValue: 0))
+        let firstReference = firstStore.reference(at: NodeStore.NodeIndex(rawValue: 0))
+        let secondReference = secondStore.reference(at: NodeStore.NodeIndex(rawValue: 0))
 
         #expect(firstReference != secondReference, "References into different stores should not be equal")
-        #expect(firstReference == firstStore.reference(at: SymbolStore.NodeIndex(rawValue: 0)))
+        #expect(firstReference == firstStore.reference(at: NodeStore.NodeIndex(rawValue: 0)))
+    }
+}
+
+// MARK: - Cross-Representation Structural Equality
+
+@Suite
+struct NodeReferenceStructuralEqualityTests {
+    private static let mangledSymbol = "$s7SwiftUI4ViewPAAE7paddingyQrAA4EdgeO3SetV_12CoreGraphics7CGFloatVSgtF"
+
+    @Test func structurallyEqualsMatchesEquivalentNodeTree() throws {
+        var builder = NodeStoreBuilder()
+        let nodeIndex = try builder.demangle(Self.mangledSymbol)
+        let reference = builder.freeze().reference(at: nodeIndex)
+
+        let equivalentTree = try demangleAsNode(Self.mangledSymbol)
+        #expect(reference.structurallyEquals(equivalentTree))
+
+        let differentTree = try demangleAsNode("$s7SwiftUI4ViewP")
+        #expect(!reference.structurallyEquals(differentTree))
+    }
+
+    @Test func structurallyEqualsDistinguishesTextAndIndexPayloads() {
+        var builder = NodeStoreBuilder()
+        let identifierIndex = builder.intern(kind: .identifier, text: "padding")
+        let store = builder.freeze()
+        let reference = store.reference(at: identifierIndex)
+
+        #expect(reference.structurallyEquals(Node.create(kind: .identifier, text: "padding")))
+        #expect(!reference.structurallyEquals(Node.create(kind: .identifier, text: "spacing")))
+        #expect(!reference.structurallyEquals(Node.create(kind: .module, text: "padding")))
+        #expect(!reference.structurallyEquals(Node.create(kind: .identifier)))
+    }
+
+    @Test func structurallyEqualsWalksChildren() throws {
+        var builder = NodeStoreBuilder()
+        let childIndex = builder.intern(kind: .identifier, text: "padding")
+        let wrapperIndex = builder.intern(kind: .type, children: [childIndex])
+        let store = builder.freeze()
+        let wrapperReference = store.reference(at: wrapperIndex)
+
+        #expect(wrapperReference.structurallyEquals(Node.create(kind: .type, child: Node.create(kind: .identifier, text: "padding"))))
+        #expect(!wrapperReference.structurallyEquals(Node.create(kind: .type, child: Node.create(kind: .identifier, text: "spacing"))))
+        #expect(!wrapperReference.structurallyEquals(Node.create(kind: .identifier, text: "padding")))
     }
 }

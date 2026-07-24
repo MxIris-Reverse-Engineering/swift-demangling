@@ -5,7 +5,7 @@
 /// which intern leaves in `NodeCache.shared` — the historical behavior. With
 /// `internsLeaves: false` they construct plain uncached nodes: no global lock
 /// traffic and nothing retained once the transient tree is dropped, which is
-/// what the `SymbolStore` bridge wants.
+/// what the `NodeStore` bridge wants.
 extension Demangler {
     @inline(__always)
     func createNode(kind: Node.Kind, contents: Node.Contents = .none, children: [Node] = []) -> Node {

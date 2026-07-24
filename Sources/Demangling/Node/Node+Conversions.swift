@@ -118,13 +118,6 @@ extension Node {
 
 extension Node {
     @inlinable
-    public func isKind(of kinds: Node.Kind...) -> Bool {
-        return kinds.contains(kind)
-    }
-}
-
-extension Node {
-    @inlinable
     public subscript(child childIndex: Int) -> Node {
         children[childIndex]
     }
