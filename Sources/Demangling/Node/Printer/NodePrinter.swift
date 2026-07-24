@@ -1745,7 +1745,18 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
                 let currentPos = target.count
                 postfixContext = printName(context, asPrefixContext: true)
                 if target.count != currentPos {
-                    target.write(".")
+                    // A module→type dot stays inside the current type's scope
+                    // so a fully-qualified name selects as one span; a nested
+                    // type's separator dot joins two independently navigable
+                    // spans, so emit it under a barrier instead of fusing it
+                    // onto this leaf's span.
+                    if context.kind == .module {
+                        target.write(".")
+                    } else {
+                        target.pushTypeReferenceScope(nil)
+                        target.write(".")
+                        target.popTypeReferenceScope()
+                    }
                 }
             }
         }
