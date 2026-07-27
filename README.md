@@ -12,6 +12,7 @@ This project is derived from [CwlDemangle](https://github.com/mattgallagher/CwlD
 - **Decode types** from mangled nodes via a pluggable `TypeBuilder` protocol
 - **Traverse & rewrite** trees with built-in iterators and `Node.Rewriter`
 - **Node interning (hash-consing)** via `NodeCache` — structurally equal subtrees share one instance, reducing memory ~4x for whole-binary demangling
+- **Compact bulk storage** via `NodeStore` — an arena packing each node into 12 flat bytes with no object header, reference counting, or per-node allocation; printing and type decoding read straight from it without materializing a `Node` tree
 - Supports all mangling prefixes: `_T0`, `_$S`, `_$s`, `$S`, `$s`, `$e`, `_$e`, `@__swiftmacro_`
 - Swift 6 strict concurrency — all public types are `Sendable`
 
@@ -239,6 +240,42 @@ For one-off demangling where the cache should not grow, opt out per call:
 ```swift
 let node = try demangleAsNode(symbol, internsSubtrees: false)
 ```
+
+### Bulk Demangling with NodeStore
+
+When demangling a whole binary and keeping every result, `NodeStore` stores nodes in a flat arena instead of as individual class instances: 12 bytes per node, no object header, no reference counting, no per-node allocation. Build with `NodeStoreBuilder`, then `freeze()` into an immutable, `Sendable` store:
+
+```swift
+var builder = NodeStoreBuilder()
+var rootIndices: [NodeStore.NodeIndex] = []
+for symbol in symbols {
+    rootIndices.append(try builder.demangle(symbol))
+}
+let store = builder.freeze()
+```
+
+Nodes are addressed by `NodeReference`, a 16-byte value handle that mirrors `Node`'s accessors. Printing and type decoding read directly from the arena — no `Node` tree is materialized:
+
+```swift
+let reference = store.reference(at: rootIndices[0])
+let readable = reference.print(using: .default)
+
+for child in reference.children where child.kind == .identifier {
+    // `textUTF8` borrows the store's string table without allocating
+    print(child.text ?? "")
+}
+```
+
+The builder hash-conses on insert, so structurally equal subtrees collapse to one index and `NodeReference` equality is O(1) within a store. This path never touches `NodeCache.shared`, so bulk indexing leaves global state untouched.
+
+Interop with the `Node` API stays available in both directions — `builder.intern(existingNode)` imports a tree, and `reference.materialize()` rebuilds a standalone one:
+
+```swift
+let index = builder.intern(try demangleAsNode(symbol))
+let node = store.reference(at: index).materialize()
+```
+
+Measured on a SwiftUI dyld-cache corpus of 234,232 symbols: 619,688 unique nodes in 8.75 MB of flat storage (14.1 bytes per unique node), built no slower than the `Node` path.
 
 ## Acknowledgments
 

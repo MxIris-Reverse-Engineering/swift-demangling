@@ -4,10 +4,14 @@
 ///
 /// SPI note: exposed as `@_spi(Internals)` so deep consumers (MachOSwiftSection)
 /// can print `NodeReference` trees into custom rich targets. On the store path
-/// `NodePrintContext.node` and the type-reference scope hooks receive nil
-/// (`name as? Node`); a rich target that keys on the node must account for
-/// that until the hooks are abstracted over `DemanglingNode`. Wrap calls in
-/// `StackSafeExecutor.execute` for deeply nested symbols.
+/// `NodePrintContext.node` receives nil (`name as? Node`); a rich target that
+/// keys on it must account for that until the context is abstracted over
+/// `DemanglingNode`. The type-reference scope hooks do receive a node on both
+/// paths, but only the `Node` path delivers a canonical instance: store-backed
+/// printing materializes a fresh subtree per evaluation, so scopes must be
+/// keyed by structure (e.g. the remangled string) rather than by
+/// `===`/`ObjectIdentifier`. Wrap calls in `StackSafeExecutor.execute` for
+/// deeply nested symbols.
 @_spi(Internals)
 public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: Sendable {
     /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth`` from

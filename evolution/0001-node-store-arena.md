@@ -2,9 +2,9 @@
 
 - **Proposal**: 0001
 - **Author**: Mx-Iris
-- **Status**: In Progress
+- **Status**: Implemented（Phase 1–3 已落地；Phase 4 平铺序列化推迟）
 - **Date**: 2026-07-23
-- **Last Updated**: 2026-07-24
+- **Last Updated**: 2026-07-27
 - **Branch**: `feature/node-store`
 - **Related**: `Documentations/SubtreeInterning.md`（前置优化：全子树 hash-consing，已合入 main `5788472`）
 
@@ -28,18 +28,20 @@
 ### 存储布局
 
 ```swift
-@frozen struct CompactNode {          // size 12, alignment 4, 无对象头
-    var kindAndPayloadKind: UInt16    // bit 0-8: kind（~300 种，9 位）
+struct CompactNode {                  // size 12, alignment 4, 无对象头
+    var kindAndPayloadKind: UInt16    // bit 0-8: kind 序号（9 位，512 槽）
                                       // bit 9-11: payloadKind（6 种，3 位）
                                       // bit 12-15: 保留
-    var payloadA: UInt32
-    var payloadB: UInt32
+    var payloadWord0: UInt32
+    var payloadWord1: UInt32
 }
 ```
 
-`payloadA/payloadB` 按 `payloadKind` 解释（沿用现有 `Payload` 的互斥不变量：contents 与 children 不共存）：
+落地形态是 `@usableFromInline struct`（非 public、非 `@frozen`）：`NodeStore` 的公共面只暴露 `NodeReference`，`CompactNode` 是内部布局细节。kind 序号取自 `Node.Kind.storeOrdinal`（`allCases` 中的位置），**仅在单次进程运行内稳定，不是序列化格式**——Phase 4 的持久化格式须自带稳定的 kind 映射表。
 
-| payloadKind | payloadA | payloadB | 覆盖比例（49k 语料实测） |
+`payloadWord0/payloadWord1` 按 `payloadKind` 解释（沿用现有 `Payload` 的互斥不变量：contents 与 children 不共存）：
+
+| payloadKind | payloadWord0 | payloadWord1 | 覆盖比例（49k 语料实测） |
 |---|---|---|---|
 | `none` | — | — | 与 leaf 部分重叠 |
 | `index` | `UInt64` 低 32 位 | 高 32 位 | 少量 |
@@ -53,7 +55,7 @@
 - `nodes: ContiguousArray<CompactNode>` — 主 arena，`append` 即 bump 分配；
 - `edges: ContiguousArray<UInt32>` — 仅 3+ 孩子节点使用的孩子索引连续区段；
 - `textBytes: ContiguousArray<UInt8>` — 字符串表，全部 identifier 的 UTF-8 字节连续存放并去重；
-- intern 哈希表 — 把已实现的 hash-consing 从 `ObjectIdentifier` 键迁移为索引键：`(kindAndPayloadKind, payloadA, payloadB)` 经孩子索引规范化后即天然唯一，键就是 12 字节本身。
+- intern 表 — 把已实现的 hash-consing 从 `ObjectIdentifier` 键迁移为索引键：`(kindAndPayloadKind, payloadWord0, payloadWord1)` 经孩子索引规范化后即天然唯一。落地形态是三张 open-addressing 槽数组（节点 / 多孩子节点 / 文本），每槽仅 4 字节索引，键按需从平铺缓冲区取回比较——不再为键单独存一份拷贝（Phase 3 的 intern 表瘦身，见 Decision Log）。表随 `freeze()` 丢弃，不进入冻结后的 store。
 
 容量边界：`UInt32` 索引上限 42.9 亿节点、字符串表 4 GB——对单个 store（哪怕整个 dyld cache）远够；越界走 `precondition` 失败而非静默截断。
 
@@ -61,23 +63,35 @@
 
 ### 类型与 API 面
 
+以下为落地签名（与实现一致）：
+
 ```swift
-/// 冻结后的不可变符号库。构建完成即 Sendable，读路径零锁。
+/// 构建期的单写者。~Copyable，consuming freeze() 交出不可变 store。
+public struct NodeStoreBuilder: ~Copyable, Sendable {
+    public mutating func demangle(_ mangled: String, isType: Bool = false) throws(DemanglingError) -> NodeStore.NodeIndex
+    public mutating func intern(_ node: Node) -> NodeStore.NodeIndex        // 导入现有树（intern 拷贝）
+    public mutating func intern(kind: Node.Kind, children: [NodeStore.NodeIndex]) -> NodeStore.NodeIndex
+    public consuming func freeze() -> NodeStore
+}
+
+/// 冻结后的不可变符号库。Sendable，读路径零锁。
 public final class NodeStore: Sendable {
-    public func demangleAsReference(_ mangled: String) throws(DemanglingError) -> NodeReference   // Phase 3
-    public func reference(of node: Node) -> NodeReference                                          // 导入现有树（intern 拷贝）
+    public func reference(at nodeIndex: NodeIndex) -> NodeReference
 }
 
 /// 轻量句柄：store 引用 + 索引，16 字节值类型。
 public struct NodeReference: Hashable, Sendable {
     public var kind: Node.Kind { get }
-    public var text: Substring? { get }          // 借用字符串表，零拷贝
+    public var text: String? { get }                  // 从字符串表解码
+    public var textUTF8: ArraySlice<UInt8>? { get }   // 借用字符串表字节，零拷贝
     public var index: UInt64? { get }
-    public var children: ChildrenView { get }     // RandomAccessCollection<NodeReference>
-    public func materialize() -> Node             // 物化为现有 Node 树（互操作出口）
+    public var children: ChildrenView { get }         // RandomAccessCollection<NodeReference>
+    public func materialize() -> Node                 // 物化为现有 Node 树（互操作出口）
     public func print(using options: DemangleOptions) -> String
 }
 ```
+
+解析入口最终定在 builder 而非 store（提案原稿写的是 `NodeStore.demangleAsReference`）：冻结后的 store 不可变，解析必然要写入，天然属于 builder。`text` 保持 `String?` 以镜像 `Node.text` 的语义（含 `.dependentGenericParamType` 的泛型名合成，这是 printer 依赖的行为），零拷贝需求由并列的 `textUTF8` 满足。
 
 - 构建期使用 `NodeStoreBuilder`（`~Copyable`）：单写者约束由编译器保证，`consuming func freeze() -> NodeStore` 完成冻结——把现在靠 `NSLock` + 文档契约维持的「构建后不可变」升级为类型系统保证；
 - `Hashable`/`==` 基于 (store identity, index)：因为 store 内全量 hash-consed，索引相等 ⇔ 结构相等，比较从 O(树) 降为 O(1)；
@@ -85,19 +99,23 @@ public struct NodeReference: Hashable, Sendable {
 
 ### 构建流程（两代空间）
 
-1. Demangler 把节点写入**每符号复用的 scratch arena**（容量保留、每符号 `removeAll(keepingCapacity: true)`）——解析中产生的临时节点零成本丢弃，等价于 C++ 每符号销毁 `NodeFactory`；
-2. 解析成功后，从根出发把可达节点自底向上 intern 拷贝进持久 store——**去重与垃圾回收是同一个 pass**，键规范化逻辑与已合入的 `internTreeUnsafe` 完全同构；
-3. scratch 重置，处理下一符号。
+原稿设想的是让 Demangler 直写一块每符号复用的 scratch arena。落地形态改为「cache-free 临时 `Node` 树」作为第一代空间：
 
-并行策略：每线程一个 scratch arena；持久 store 的 intern 写入初期沿用单锁（与现状一致），若成为瓶颈再演进为分片锁或每线程局部 store + 终态合并。
+1. `demangleAsNodeTransient` 以 `internsLeaves: false` 解析，构造出的临时 `Node` 树完全不碰 `NodeCache.shared`——无叶节点泄漏、无全局锁竞争；
+2. `builder.intern(tree)` 从根出发把可达节点自底向上 intern 进持久 arena——**去重与垃圾回收是同一个 pass**，键规范化逻辑与已合入的 `internTreeUnsafe` 完全同构；
+3. 临时树失去引用即被 ARC 回收，处理下一符号。
+
+保留 `Node` 作为第一代空间，是因为 Demangler 的解析逻辑（回填、substitution 复用）建立在引用语义之上，改为直写索引式 arena 等于重写全部 ~594 个构造点。实测该取舍成本可忽略：234k 符号语料上构建期 phys_footprint 增量 9.9 MB ≈ 留存 + ~1 MB 瞬态，且 store 构建 25.3s 反而快于 interning `Node` 路径的 28.5s（详见 Decision Log 的 Phase 3 验收）。
+
+并行策略：`NodeStoreBuilder` 是 `~Copyable` 单写者，天然无锁但也不可共享。多线程批量场景应每线程一个 builder，终态合并——合并 API 尚未实现，列为 Future Direction。
 
 ### 渐进式迁移分期
 
 每个阶段独立可交付、测试全绿、`Node` API 始终不动：
 
-- **Phase 1 — 存储层与互操作**：`CompactNode` / `NodeStoreBuilder` / `NodeStore` / `NodeReference`；`reference(of:)` 导入现有 `Node` 树，`materialize()` 导出。打印/remangle 暂走物化慢路径。验收：任意树 导入→导出 与原树 `==`；导入两棵结构相等的树得到同一索引。
+- **Phase 1 — 存储层与互操作**：`CompactNode` / `NodeStoreBuilder` / `NodeStore` / `NodeReference`；`intern(_:)` 导入现有 `Node` 树，`materialize()` 导出。打印/remangle 暂走物化慢路径。验收：任意树 导入→导出 与原树 `==`；导入两棵结构相等的树得到同一索引。
 - **Phase 2 — 零物化读路径**：将 `NodePrinter` / `Remangler` / `TypeDecoder` 的树访问抽象为协议（kind/text/index/children 四个只读需求），`Node` 与 `NodeReference` 双双 conform；打印与 remangle 直接从 store 读，不再物化。验收：全量 dyld cache 对齐测试在 `NodeReference` 路径下 0 失败。
-- **Phase 3 — 解析直写 arena**：`Demangler` 的节点构造抽象为存储策略（默认策略维持现有 `Node` 行为不变；store 策略直写 scratch arena），提供批量入口 `NodeStore.demangleAsReference(_:)`。此阶段起，批量场景完全绕开 class 分配。验收：内存达标（49k 语料 ≤6 MB）、吞吐不劣于现状 1.2 倍。
+- **Phase 3 — cache-free 批量解析**：`Demangler` 的节点构造收敛到 `createNode(...)` seam，`internsLeaves: false` 时完全绕开 `NodeCache.shared`；批量入口 `NodeStoreBuilder.demangle(_:)` 走「cache-free 临时 `Node` 树 → intern 进 arena → 丢弃临时树」。此阶段起批量场景不再向全局缓存写入任何东西。验收：内存达标（49k 语料 ≤6 MB）、吞吐不劣于现状 1.2 倍。
 - **Phase 4（可选）— 平铺序列化**：store 的几个缓冲直接二进制序列化/反序列化（接近 memcpy 量级），支持 mmap 加载——符号数据库能力，为 RuntimeViewer 类工具缓存整个 dyld cache 的解析结果。
 
 ### 与现有 NodeCache 的关系
