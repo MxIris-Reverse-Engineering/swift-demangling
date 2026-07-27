@@ -27,6 +27,12 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     private var hidingCurrentModule: String = ""
     private var dependentMemberTypeDepth: Int = 0
     private var printDepth: Int = 0
+    /// Address the stack must not grow past, or 0 when this printer may recurse
+    /// freely. See ``printRootWithinStackBudget(_:)``.
+    private var stackFloorAddress: UInt = 0
+    /// Set once the recursion stopped early because it reached
+    /// ``stackFloorAddress``; the partial ``target`` is then unusable.
+    private var didExhaustStackBudget: Bool = false
     /// Memoizes the rendered fragment for each shared substitution node.
     /// The demangler returns the same ``SomeNode`` instance for every
     /// back-reference (``A23_`` etc.), so one mangling can produce a DAG
@@ -50,7 +56,34 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         return target
     }
 
+    /// Prints `root` only as long as the recursion stays clear of
+    /// `stackFloorAddress`, returning `nil` the moment it would not.
+    ///
+    /// Lets a caller on a small stack — every Swift Concurrency cooperative
+    /// worker and every libdispatch worker gets 512KB — run the overwhelmingly
+    /// common shallow symbol inline, and pay for a large-stack thread only for
+    /// the rare input that genuinely needs one.
+    public mutating func printRootWithinStackBudget(_ root: SomeNode, stackFloorAddress: UInt) -> Target? {
+        self.stackFloorAddress = stackFloorAddress
+        _ = printName(root)
+        return didExhaustStackBudget ? nil : target
+    }
+
     private mutating func printName(_ name: SomeNode, asPrefixContext: Bool = false) -> SomeNode? {
+        // Unwind the whole recursion once any frame ran out of budget: the
+        // result is discarded, so continuing would only risk the overflow the
+        // budget exists to avoid.
+        if didExhaustStackBudget {
+            return nil
+        }
+        if stackFloorAddress != 0 {
+            var stackProbe = 0
+            let currentAddress = withUnsafeMutablePointer(to: &stackProbe) { UInt(bitPattern: $0) }
+            if currentAddress <= stackFloorAddress {
+                didExhaustStackBudget = true
+                return nil
+            }
+        }
         if printDepth > Self.maxPrintDepth {
             target.write("<<too complex>>")
             return nil
@@ -2237,5 +2270,10 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
 
     public mutating func printRoot(_ root: Node) -> Target {
         engine.printRoot(root)
+    }
+
+    /// See ``DemanglingPrinter/printRootWithinStackBudget(_:stackFloorAddress:)``.
+    public mutating func printRootWithinStackBudget(_ root: Node, stackFloorAddress: UInt) -> Target? {
+        engine.printRootWithinStackBudget(root, stackFloorAddress: stackFloorAddress)
     }
 }

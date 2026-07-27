@@ -17,7 +17,11 @@ public enum StackSafeExecutor {
     private static let minimumRequiredStackSize = 2 * 1024 * 1024 // 2MB
 
     /// Stack size allocated for the dedicated large-stack thread.
-    private static let largeStackThreadSize = 8 * 1024 * 1024 // 8MB
+    fileprivate static let largeStackThreadSize = 8 * 1024 * 1024 // 8MB
+
+    /// Stack space reserved below a budgeted recursion for the non-recursive
+    /// work that still has to run once the recursion unwinds.
+    private static let stackSafetyMargin = 64 * 1024 // 64KB
     #endif
 
     /// Executes the given block, switching to a large-stack thread if the
@@ -68,16 +72,13 @@ public enum StackSafeExecutor {
             return try block()
         }
         let outcome: Result<Success, Failure> = await withCheckedContinuation { continuation in
-            let thread = Thread {
+            LargeStackThreadPool.shared.submit {
                 do throws(Failure) {
                     continuation.resume(returning: .success(try block()))
                 } catch {
                     continuation.resume(returning: .failure(error))
                 }
             }
-            thread.stackSize = largeStackThreadSize
-            thread.qualityOfService = .userInitiated
-            thread.start()
         }
         return try outcome.get()
         #else
@@ -85,7 +86,61 @@ public enum StackSafeExecutor {
         #endif
     }
 
+    /// Runs a recursion that can bail out when it approaches the end of the
+    /// current thread's stack, falling back to a large-stack worker only for
+    /// the inputs that actually need one.
+    ///
+    /// ``execute(_:)`` has to assume the worst about every input, so on a
+    /// 512KB-stack thread it hands *every* call to a worker thread. Most real
+    /// inputs are nowhere near deep enough to need that: `printName` recursion
+    /// for a typical symbol is a few dozen frames. `budgetedAttempt` receives
+    /// the address the stack must not grow past and returns `nil` if it hit
+    /// that limit; only then does `unbudgetedFallback` run on a worker.
+    ///
+    /// - Parameters:
+    ///   - budgetedAttempt: runs inline on the current thread. Must return
+    ///     `nil` — having produced no side effects the caller depends on —
+    ///     when the recursion reaches `stackFloorAddress`.
+    ///   - unbudgetedFallback: re-runs the same work with no depth limit, on a
+    ///     thread known to have room for it.
+    public static func executeWithinStackBudget<Success: Sendable>(
+        budgetedAttempt: (_ stackFloorAddress: UInt) -> Success?,
+        unbudgetedFallback: @escaping @Sendable () -> Success
+    ) -> Success {
+        #if canImport(Darwin)
+        if currentThreadHasSufficientStack {
+            return unbudgetedFallback()
+        }
+        if let result = budgetedAttempt(stackFloorAddressForCurrentThread) {
+            return result
+        }
+        return executeOnLargeStackThreadReturning(unbudgetedFallback)
+        #else
+        return unbudgetedFallback()
+        #endif
+    }
+
     #if canImport(Darwin)
+    private static var stackFloorAddressForCurrentThread: UInt {
+        let stackAddress = pthread_get_stackaddr_np(pthread_self())
+        let stackSize = pthread_get_stacksize_np(pthread_self())
+        let stackBase = UInt(bitPattern: stackAddress - stackSize)
+        return stackBase + UInt(stackSafetyMargin)
+    }
+
+    private static func executeOnLargeStackThreadReturning<Success: Sendable>(
+        _ block: @escaping @Sendable () -> Success
+    ) -> Success {
+        nonisolated(unsafe) var result: Success!
+        let semaphore = DispatchSemaphore(value: 0)
+        LargeStackThreadPool.shared.submit {
+            result = block()
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return result
+    }
+
     private static var currentThreadHasSufficientStack: Bool {
         let stackAddress = pthread_get_stackaddr_np(pthread_self())
         let stackSize = pthread_get_stacksize_np(pthread_self())
@@ -99,13 +154,10 @@ public enum StackSafeExecutor {
     private static func executeOnLargeStackThread(_ block: @escaping @Sendable () -> String) -> String {
         nonisolated(unsafe) var result: String = ""
         let semaphore = DispatchSemaphore(value: 0)
-        let thread = Thread {
+        LargeStackThreadPool.shared.submit {
             result = block()
             semaphore.signal()
         }
-        thread.stackSize = largeStackThreadSize
-        thread.qualityOfService = .userInitiated
-        thread.start()
         semaphore.wait()
         return result
     }
@@ -115,7 +167,7 @@ public enum StackSafeExecutor {
     ) throws(Failure) -> Success {
         nonisolated(unsafe) var outcome: Result<Success, Failure>!
         let semaphore = DispatchSemaphore(value: 0)
-        let thread = Thread {
+        LargeStackThreadPool.shared.submit {
             do throws(Failure) {
                 outcome = .success(try block())
             } catch {
@@ -123,11 +175,76 @@ public enum StackSafeExecutor {
             }
             semaphore.signal()
         }
-        thread.stackSize = largeStackThreadSize
-        thread.qualityOfService = .userInitiated
-        thread.start()
         semaphore.wait()
         return try outcome.get()
     }
     #endif
 }
+
+#if canImport(Darwin)
+/// A pool of long-lived large-stack worker threads, reused across calls.
+///
+/// Every call used to create — and then join — a brand new `Thread`. Because
+/// ``StackSafeExecutor/currentThreadHasSufficientStack`` demands 2MB of
+/// *remaining* stack while a Swift Concurrency cooperative worker and a
+/// libdispatch worker both get a 512KB stack in total, the large-stack branch
+/// is taken unconditionally off the main thread: measured on this package,
+/// 2000 demangles cost 64ms on the main thread (run inline) against 163ms on a
+/// `DispatchQueue.global()` thread, i.e. roughly 50µs of thread setup on top of
+/// a ~32µs demangle. Bulk work — demangling every symbol of a framework, or
+/// printing every declaration of an interface — paid that per item.
+///
+/// Threads are created on demand, reused while work keeps arriving, and retired
+/// after an idle period so a burst does not leave workers resident forever.
+///
+/// A worker never submits back into the pool: it runs on an 8MB stack, so
+/// ``StackSafeExecutor/execute(_:)`` takes its inline branch there, and nested
+/// demangle/remangle calls cannot deadlock against a saturated pool.
+private final class LargeStackThreadPool: @unchecked Sendable {
+    static let shared = LargeStackThreadPool()
+
+    /// How long an idle worker waits for new work before retiring.
+    private static let idleTimeout: TimeInterval = 30
+
+    private let condition = NSCondition()
+    private var pendingWorkItems: [@Sendable () -> Void] = []
+    private var idleWorkerCount = 0
+
+    func submit(_ workItem: @escaping @Sendable () -> Void) {
+        condition.lock()
+        pendingWorkItems.append(workItem)
+        // Only spin up a worker when the queue outgrows the idle workers that
+        // are already parked on the condition; overshooting under a race just
+        // creates one extra worker, which then retires on its idle timeout.
+        let needsAdditionalWorker = pendingWorkItems.count > idleWorkerCount
+        condition.signal()
+        condition.unlock()
+
+        if needsAdditionalWorker {
+            let thread = Thread { [self] in runWorkerLoop() }
+            thread.stackSize = StackSafeExecutor.largeStackThreadSize
+            thread.qualityOfService = .userInitiated
+            thread.start()
+        }
+    }
+
+    private func runWorkerLoop() {
+        while true {
+            condition.lock()
+            idleWorkerCount += 1
+            while pendingWorkItems.isEmpty {
+                if !condition.wait(until: Date(timeIntervalSinceNow: Self.idleTimeout)) {
+                    idleWorkerCount -= 1
+                    condition.unlock()
+                    return
+                }
+            }
+            idleWorkerCount -= 1
+            let workItem = pendingWorkItems.removeFirst()
+            condition.unlock()
+
+            workItem()
+        }
+    }
+}
+#endif

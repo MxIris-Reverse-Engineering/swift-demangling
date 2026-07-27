@@ -6,6 +6,7 @@
 
 - [SubtreeInterning.md](SubtreeInterning.md) — 全子树 interning（hash-consing）内存优化。把 interning 从叶节点扩展到全部子树，49k 符号语料解析驻留 39.5 MB → 12.9 MB。
 - [NodeStoreArena.md](NodeStoreArena.md) — `NodeStore` arena 式紧凑存储。节点平铺进连续缓冲，每节点 12 字节、无对象头、无引用计数；printer 与 TypeDecoder 泛型化后可零物化直读。
+- [StackSafeExecution.md](StackSafeExecution.md) — `StackSafeExecutor` 的线程复用与乐观内联。原本在任何非主线程上每次调用都新建 8 MB 栈线程；改为常驻线程池 + 打印路径栈预算回退后，512 KB 栈线程上的打印提速 7.3 倍。
 
 两篇是承接关系：`SubtreeInterning` 把 class 形态下能做的去重做到头，`NodeStoreArena` 兑现了它结尾列为「待将来单独评估」的 arena 方向。
 

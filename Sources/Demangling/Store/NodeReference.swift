@@ -119,7 +119,10 @@ public struct NodeReference: Sendable {
     /// Prints the demangled form of this subtree directly from the store,
     /// without materializing a `Node` tree (proposal 0001, Phase 2).
     public func print(using options: DemangleOptions = .default) -> String {
-        StackSafeExecutor.execute {
+        StackSafeExecutor.executeWithinStackBudget { stackFloorAddress in
+            var printer = DemanglingPrinter<String, NodeReference>(options: options)
+            return printer.printRootWithinStackBudget(self, stackFloorAddress: stackFloorAddress)
+        } unbudgetedFallback: {
             var printer = DemanglingPrinter<String, NodeReference>(options: options)
             return printer.printRoot(self)
         }

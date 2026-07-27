@@ -14,7 +14,10 @@ extension Node: CustomStringConvertible {
     /// - Parameter options: an option set containing the different `DemangleOptions` from the Swift project.
     /// - Returns: `self` printed to a string according to the specified options.
     public func print(using options: DemangleOptions = .default) -> String {
-        StackSafeExecutor.execute {
+        StackSafeExecutor.executeWithinStackBudget { stackFloorAddress in
+            var printer = NodePrinter<String>(options: options)
+            return printer.printRootWithinStackBudget(self, stackFloorAddress: stackFloorAddress)
+        } unbudgetedFallback: {
             var printer = NodePrinter<String>(options: options)
             return printer.printRoot(self)
         }

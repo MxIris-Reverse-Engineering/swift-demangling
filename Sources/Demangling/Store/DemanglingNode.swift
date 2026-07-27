@@ -46,7 +46,10 @@ public protocol DemanglingNode: Sendable {
 extension DemanglingNode {
     /// Prints this subtree with the given options. Mirrors `Node.print(using:)`.
     public func print(using options: DemangleOptions = .default) -> String {
-        StackSafeExecutor.execute {
+        StackSafeExecutor.executeWithinStackBudget { stackFloorAddress in
+            var printer = DemanglingPrinter<String, Self>(options: options)
+            return printer.printRootWithinStackBudget(self, stackFloorAddress: stackFloorAddress)
+        } unbudgetedFallback: {
             var printer = DemanglingPrinter<String, Self>(options: options)
             return printer.printRoot(self)
         }
