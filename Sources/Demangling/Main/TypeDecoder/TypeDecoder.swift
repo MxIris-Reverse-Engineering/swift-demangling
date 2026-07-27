@@ -1,36 +1,40 @@
-/// Decode a mangled type to construct an abstract type using a custom builder.
-/// This is a Swifty implementation that uses throws for error handling.
-public final class TypeDecoder<Builder: TypeBuilder> {
-    public typealias BuiltType = Builder.BuiltType
-    public typealias BuiltTypeDecl = Builder.BuiltTypeDecl
-    public typealias BuiltProtocolDecl = Builder.BuiltProtocolDecl
-    public typealias Field = Builder.BuiltSILBoxField
-    public typealias BuiltSubstitution = Builder.BuiltSubstitution
-    public typealias BuiltRequirement = Builder.BuiltRequirement
-    public typealias BuiltInverseRequirement = Builder.BuiltInverseRequirement
-    public typealias BuiltLayoutConstraint = Builder.BuiltLayoutConstraint
-    public typealias BuiltGenericSignature = Builder.BuiltGenericSignature
-    public typealias BuiltSubstitutionMap = Builder.BuiltSubstitutionMap
+/// Generic type-decoding engine shared by the public `TypeDecoder<Builder>`
+/// (specialized on `Node`) and store-backed decoding (specialized on
+/// `NodeReference`). The tree walk is representation-agnostic; the
+/// `TypeBuilder` handoff points pass `materializedNode` so the public
+/// `TypeBuilder` protocol keeps receiving concrete `Node` subtrees.
+/// See evolution proposal 0001, Phase 2.
+struct TypeDecoderEngine<Builder: TypeBuilder, SomeNode: DemanglingNode> {
+    typealias BuiltType = Builder.BuiltType
+    typealias BuiltTypeDecl = Builder.BuiltTypeDecl
+    typealias BuiltProtocolDecl = Builder.BuiltProtocolDecl
+    typealias Field = Builder.BuiltSILBoxField
+    typealias BuiltSubstitution = Builder.BuiltSubstitution
+    typealias BuiltRequirement = Builder.BuiltRequirement
+    typealias BuiltInverseRequirement = Builder.BuiltInverseRequirement
+    typealias BuiltLayoutConstraint = Builder.BuiltLayoutConstraint
+    typealias BuiltGenericSignature = Builder.BuiltGenericSignature
+    typealias BuiltSubstitutionMap = Builder.BuiltSubstitutionMap
 
     private let builder: Builder
 
     private static var maxDepth: Int { 1024 }
 
-    public init(builder: Builder) {
+    init(builder: Builder) {
         self.builder = builder
     }
 
     /// Given a demangle tree, attempt to turn it into a type.
-    public func decodeMangledType(node: Node, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
+    func decodeMangledType(node: SomeNode, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
         try decodeMangledType(node: node, depth: 0, forRequirement: forRequirement)
     }
 }
 
 // MARK: - Main Type Decoding
 
-extension TypeDecoder {
+extension TypeDecoderEngine {
     private func decodeMangledType(
-        node: Node,
+        node: SomeNode,
         depth: Int,
         forRequirement: Bool = true
     ) throws(TypeLookupError) -> BuiltType {
@@ -174,7 +178,7 @@ extension TypeDecoder {
         case .builtinTypeName:
             let mangling: String
             do {
-                mangling = try mangleAsString(node, flavor: builder.getManglingFlavor())
+                mangling = try mangleAsString(node.materializedNode, flavor: builder.getManglingFlavor())
             } catch {
                 throw TypeLookupError(node: node, message: "failed to mangle node")
             }
@@ -219,7 +223,7 @@ extension TypeDecoder {
             let shapeNode = node.children[0]
             let args = try decodeGenericArgs(node: node.children[1], depth: depth + 1)
 
-            return builder.createSymbolicExtendedExistentialType(shapeNode: shapeNode, args: args)
+            return builder.createSymbolicExtendedExistentialType(shapeNode: shapeNode.materializedNode, args: args)
 
         case .protocolList,
              .protocolListWithAnyObject,
@@ -942,7 +946,7 @@ extension TypeDecoder {
                 genericArgs.append(genericArgsBuf[start ..< end])
             }
 
-            return builder.resolveOpaqueType(descriptor: descriptor, genericArgs: genericArgs, ordinal: ordinal)
+            return builder.resolveOpaqueType(descriptor: descriptor.materializedNode, genericArgs: genericArgs, ordinal: ordinal)
 
         case .integer:
             guard let index = node.index else {
@@ -970,9 +974,9 @@ extension TypeDecoder {
     }
 }
 
-extension TypeDecoder {
+extension TypeDecoderEngine {
     private func decodeTypeSequenceElement(
-        node: Node,
+        node: SomeNode,
         depth: Int,
         resultCallback: (BuiltType) throws(TypeLookupError) -> Void
     ) throws(TypeLookupError) {
@@ -1004,7 +1008,7 @@ extension TypeDecoder {
     }
 
     private func decodeImplFunctionParam<T: ImplFunctionParamProtocol>(
-        node: Node,
+        node: SomeNode,
         depth: Int,
         results: inout [T]
     ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
@@ -1055,7 +1059,7 @@ extension TypeDecoder {
     }
 
     private func decodeImplFunctionResult<T: ImplFunctionResultProtocol>(
-        node: Node,
+        node: SomeNode,
         depth: Int,
         results: inout [T]
     ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
@@ -1104,7 +1108,7 @@ extension TypeDecoder {
         results.append(result)
     }
 
-    private func decodeGenericArgs(node: Node, depth: Int) throws(TypeLookupError) -> [BuiltType] {
+    private func decodeGenericArgs(node: SomeNode, depth: Int) throws(TypeLookupError) -> [BuiltType] {
         guard node.kind == .typeList else {
             throw TypeLookupError(node: node, message: "is not TypeList")
         }
@@ -1118,7 +1122,7 @@ extension TypeDecoder {
     }
 
     private func decodeMangledTypeDecl(
-        node: Node,
+        node: SomeNode,
         depth: Int,
         typeDecl: inout BuiltTypeDecl?,
         parent: inout BuiltType?,
@@ -1138,10 +1142,12 @@ extension TypeDecoder {
             )
         }
 
+        // The decl handoff to `TypeBuilder` requires the class representation,
+        // so `declNode` is materialized here (free on the `Node` path).
         var declNode: Node
         if node.kind == .typeSymbolicReference {
             // A symbolic reference can be directly resolved to a nominal type
-            declNode = node
+            declNode = node.materializedNode
         } else {
             guard node.children.count >= 2 else {
                 throw TypeLookupError(node: node, message: "Number of node children (\(node.children.count)) less than required (2)")
@@ -1154,7 +1160,7 @@ extension TypeDecoder {
             // in addition to a reference to the parent type. The
             // mangled name already includes the module and parent
             // types, if any.
-            declNode = node
+            declNode = node.materializedNode
 
             switch parentContext.kind {
             case .module:
@@ -1176,7 +1182,7 @@ extension TypeDecoder {
 
                 // Remove any generic arguments from the context node, producing a
                 // node that references the nominal type declaration.
-                if let unspecNode = getUnspecialized(node) {
+                if let unspecNode = getUnspecialized(declNode) {
                     declNode = unspecNode
                 } else {
                     throw TypeLookupError("Failed to unspecialize type")
@@ -1190,7 +1196,7 @@ extension TypeDecoder {
         }
     }
 
-    private func decodeMangledProtocolType(node: Node, depth: Int) -> BuiltProtocolDecl? {
+    private func decodeMangledProtocolType(node: SomeNode, depth: Int) -> BuiltProtocolDecl? {
         guard depth <= Self.maxDepth else {
             return nil
         }
@@ -1216,11 +1222,11 @@ extension TypeDecoder {
         }
         #endif
 
-        return builder.createProtocolDecl(node: node)
+        return builder.createProtocolDecl(node: node.materializedNode)
     }
 
     private func decodeMangledFunctionInputType(
-        node: Node,
+        node: SomeNode,
         depth: Int,
         params: inout [FunctionParam<BuiltType>],
         hasParamFlags: inout Bool
@@ -1241,7 +1247,7 @@ extension TypeDecoder {
             return
         }
 
-        func decodeParamTypeAndFlags(node: Node, param: inout FunctionParam<BuiltType>) throws(TypeLookupError) {
+        func decodeParamTypeAndFlags(node: SomeNode, param: inout FunctionParam<BuiltType>) throws(TypeLookupError) {
             var node = node
             var recurse = true
             while recurse {
@@ -1290,7 +1296,7 @@ extension TypeDecoder {
             }
         }
 
-        func decodeParam(node: Node) throws(TypeLookupError) {
+        func decodeParam(node: SomeNode) throws(TypeLookupError) {
             guard node.kind == .tupleElement else {
                 return
             }
@@ -1330,7 +1336,7 @@ extension TypeDecoder {
     }
 }
 
-extension TypeDecoder {
+extension TypeDecoderEngine {
     private func functionConvention(for kind: Node.Kind) -> FunctionMetadataConvention {
         switch kind {
         case .objCBlock,
@@ -1357,8 +1363,8 @@ extension TypeDecoder {
     }
 }
 
-private func decodeRequirements<BuilderType: TypeBuilder>(
-    node: Node,
+private func decodeRequirements<BuilderType: TypeBuilder, SomeNode: DemanglingNode>(
+    node: SomeNode,
     requirements: inout [BuilderType.BuiltRequirement],
     inverseRequirements: inout [BuilderType.BuiltInverseRequirement],
     builder: BuilderType
@@ -1379,16 +1385,16 @@ private func decodeRequirements<BuilderType: TypeBuilder>(
         }
 
         // Decode subject type
-        let subjectType = try builder.decodeMangledType(node: child.children[0], forRequirement: true)
+        let subjectType = try builder.decodeMangledType(node: child.children[0].materializedNode, forRequirement: true)
 
         switch child.kind {
         case .dependentGenericConformanceRequirement:
-            let constraintType = try builder.decodeMangledType(node: child.children[1], forRequirement: true)
+            let constraintType = try builder.decodeMangledType(node: child.children[1].materializedNode, forRequirement: true)
             let kind: RequirementKind = builder.isExistential(type: constraintType) ? .conformance : .superclass
             requirements.append(builder.createRequirement(kind: kind, subjectType: subjectType, constraintType: constraintType))
 
         case .dependentGenericSameTypeRequirement:
-            let constraintType = try builder.decodeMangledType(node: child.children[1], forRequirement: false)
+            let constraintType = try builder.decodeMangledType(node: child.children[1].materializedNode, forRequirement: false)
             requirements.append(builder.createRequirement(kind: .sameType, subjectType: subjectType, constraintType: constraintType))
 
         case .dependentGenericInverseConformanceRequirement:
@@ -1443,7 +1449,7 @@ private func decodeRequirements<BuilderType: TypeBuilder>(
 }
 
 #if canImport(ObjectiveC)
-private func getObjCClassOrProtocolName(_ node: Node) -> String? {
+private func getObjCClassOrProtocolName(_ node: some DemanglingNode) -> String? {
     guard node.kind == .class || node.kind == .protocol else {
         return nil
     }
@@ -1467,3 +1473,45 @@ private func getObjCClassOrProtocolName(_ node: Node) -> String? {
     return nameNode.text
 }
 #endif
+
+// MARK: - Public facade
+
+/// Decode a mangled type to construct an abstract type using a custom builder.
+/// This is a Swifty implementation that uses throws for error handling.
+///
+/// A thin, source-compatible facade over `TypeDecoderEngine`. The decoding
+/// logic lives in the generic engine so it can also decode `NodeReference`
+/// trees straight from a `NodeStore` without materializing the class tree
+/// (`TypeBuilder` implementations keep receiving concrete `Node` subtrees at
+/// the handoff points).
+public final class TypeDecoder<Builder: TypeBuilder> {
+    public typealias BuiltType = Builder.BuiltType
+    public typealias BuiltTypeDecl = Builder.BuiltTypeDecl
+    public typealias BuiltProtocolDecl = Builder.BuiltProtocolDecl
+    public typealias Field = Builder.BuiltSILBoxField
+    public typealias BuiltSubstitution = Builder.BuiltSubstitution
+    public typealias BuiltRequirement = Builder.BuiltRequirement
+    public typealias BuiltInverseRequirement = Builder.BuiltInverseRequirement
+    public typealias BuiltLayoutConstraint = Builder.BuiltLayoutConstraint
+    public typealias BuiltGenericSignature = Builder.BuiltGenericSignature
+    public typealias BuiltSubstitutionMap = Builder.BuiltSubstitutionMap
+
+    private let builder: Builder
+
+    public init(builder: Builder) {
+        self.builder = builder
+    }
+
+    /// Given a demangle tree, attempt to turn it into a type.
+    public func decodeMangledType(node: Node, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
+        try TypeDecoderEngine<Builder, Node>(builder: builder)
+            .decodeMangledType(node: node, forRequirement: forRequirement)
+    }
+
+    /// Store-backed variant: decodes straight from a `NodeStore` without
+    /// materializing a `Node` tree (proposal 0001, Phase 2).
+    public func decodeMangledType(node: NodeReference, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
+        try TypeDecoderEngine<Builder, NodeReference>(builder: builder)
+            .decodeMangledType(node: node, forRequirement: forRequirement)
+    }
+}

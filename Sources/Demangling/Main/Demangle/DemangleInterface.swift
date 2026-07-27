@@ -42,8 +42,8 @@ public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicRefe
 ///   - isType: if true, no prefix is parsed and, on completion, the first item on the parse stack is returned.
 /// - Returns: the successfully parsed result
 /// - Throws: a SwiftSymbolParseError error that contains parse position when the error occurred.
-private func demangleAsNode<C: Collection & Sendable>(_ mangled: C, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool = true) throws(DemanglingError) -> Node where C.Iterator.Element == UnicodeScalar, C.Index: Sendable {
-    var demangler = Demangler(scalars: mangled)
+private func demangleAsNode<C: Collection & Sendable>(_ mangled: C, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool = true, internsLeaves: Bool = true) throws(DemanglingError) -> Node where C.Iterator.Element == UnicodeScalar, C.Index: Sendable {
+    var demangler = Demangler(scalars: mangled, internsLeaves: internsLeaves)
     demangler.symbolicReferenceResolver = symbolicReferenceResolver
     let demangledNode: Node
     if isType {
@@ -57,4 +57,22 @@ private func demangleAsNode<C: Collection & Sendable>(_ mangled: C, isType: Bool
         return demangledNode
     }
     return NodeCache.shared.intern(demangledNode)
+}
+
+/// Fully cache-free demangle for transient trees (proposal 0001, Phase 3):
+/// neither leaves nor subtrees touch `NodeCache.shared`, so bulk demangling
+/// through `NodeStoreBuilder` leaves no trace in global state.
+///
+/// Exported via `@_spi(Internals)` for bulk-indexing consumers
+/// (MachOSwiftSection's `SymbolIndexStore`) that classify each symbol on the
+/// transient tree before interning it into a `NodeStoreBuilder`, so the whole
+/// pipeline stays off the global cache. The returned tree is NOT canonical:
+/// structurally equal nodes are distinct instances, so `===`-based sharing
+/// assumptions and `NodeCache` identity guarantees do not apply.
+@_spi(Internals)
+public func demangleAsNodeTransient(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil) throws(DemanglingError) -> Node {
+    let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
+        try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: false, internsLeaves: false)
+    }
+    return try StackSafeExecutor.execute(demangleBlock)
 }

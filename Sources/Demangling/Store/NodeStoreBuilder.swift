@@ -1,0 +1,363 @@
+/// Append-only builder that constructs a `NodeStore`.
+///
+/// The builder is noncopyable: exactly one owner may build at a time, and
+/// `freeze()` consumes the builder, so "immutable after freezing" is enforced
+/// by the type system rather than by locks or documentation.
+///
+/// Every inserted node is hash-consed on entry: structurally equal subtrees
+/// receive the same `NodeStore.NodeIndex`. Interior-node keys use child
+/// indices, which is exact because children are always interned before their
+/// parent (the same bottom-up scheme as `NodeCache.internTreeUnsafe`).
+public struct NodeStoreBuilder: ~Copyable, Sendable {
+    private var nodes: ContiguousArray<CompactNode> = []
+    private var edges: ContiguousArray<UInt32> = []
+    private var textBytes: ContiguousArray<UInt8> = []
+
+    // Interning tables are open-addressing slot arrays that store only node
+    // (or text) indices — 4 bytes per slot, no separate key storage. Keys are
+    // recovered from the flat buffers on comparison, so the tables add ~2 MB
+    // for a whole-framework build instead of the ~10 MB the dictionary-keyed
+    // scheme cost (proposal 0001, Phase 3 intern-table slimming).
+
+    /// Slot sentinel for an empty open-addressing slot.
+    private static let emptySlot: UInt32 = .max
+
+    /// Interning table for nodes whose 12-byte representation is already
+    /// canonical: leaves (text offsets are canonical because text is interned
+    /// first) and nodes with one or two children (child indices are canonical).
+    /// Slots hold node indices; the key is `nodes[slot]` itself.
+    private var compactSlots = ContiguousArray<UInt32>(repeating: emptySlot, count: 4096)
+    private var compactCount = 0
+
+    /// Interning table for nodes with three or more children, whose edges
+    /// offset is allocation-dependent and therefore cannot serve as a key.
+    /// Slots hold node indices; comparison walks the `edges` range.
+    private var manyChildrenSlots = ContiguousArray<UInt32>(repeating: emptySlot, count: 1024)
+    private var manyChildrenCount = 0
+
+    /// Interning table for text contents. Slots index into `uniqueTexts`;
+    /// comparison reads the `textBytes` range.
+    private var textSlots = ContiguousArray<UInt32>(repeating: emptySlot, count: 1024)
+    private var uniqueTexts: ContiguousArray<TextLocation> = []
+
+    private struct TextLocation {
+        let offset: UInt32
+        let length: UInt32
+    }
+
+    public init() {}
+
+    // MARK: - Building
+
+    /// Interns an existing `Node` tree, returning the canonical index of its root.
+    public mutating func intern(_ node: Node) -> NodeStore.NodeIndex {
+        var visitedIndices = [ObjectIdentifier: UInt32]()
+        return NodeStore.NodeIndex(rawValue: internRecursively(node, visitedIndices: &visitedIndices))
+    }
+
+    /// Demangles a mangled symbol and interns the resulting tree in one step.
+    ///
+    /// The intermediate `Node` tree is transient and fully cache-free: neither
+    /// leaves nor subtrees touch `NodeCache.shared`, so bulk demangling leaves
+    /// no trace in global state (proposal 0001, Phase 3).
+    public mutating func demangle(_ mangled: String, isType: Bool = false) throws(DemanglingError) -> NodeStore.NodeIndex {
+        let tree = try demangleAsNodeTransient(mangled, isType: isType)
+        return intern(tree)
+    }
+
+    // MARK: - Direct Construction
+
+    /// Interns a parameterless node.
+    public mutating func intern(kind: Node.Kind) -> NodeStore.NodeIndex {
+        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+    }
+
+    /// Interns a text-carrying leaf node.
+    public mutating func intern(kind: Node.Kind, text: String) -> NodeStore.NodeIndex {
+        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .text(text)))
+    }
+
+    /// Interns an index-carrying leaf node.
+    public mutating func intern(kind: Node.Kind, index: UInt64) -> NodeStore.NodeIndex {
+        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .index(index)))
+    }
+
+    /// Interns an interior node over already-interned children — e.g. a
+    /// `.type` wrapper around a stored subtree, the pattern index builders
+    /// use for dictionary keys. Children must be indices minted by this
+    /// builder; an empty child list interns a parameterless node.
+    ///
+    /// Hash-consing is shared with every other insertion route: constructing
+    /// a node directly and interning a structurally equal `Node` tree yield
+    /// the same index.
+    public mutating func intern(kind: Node.Kind, children: [NodeStore.NodeIndex]) -> NodeStore.NodeIndex {
+        let childIndices = children.map { childIndex in
+            precondition(Int(childIndex.rawValue) < nodes.count, "Child index does not belong to this builder")
+            return childIndex.rawValue
+        }
+        if childIndices.isEmpty {
+            return NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+        }
+        return NodeStore.NodeIndex(rawValue: internInterior(kind: kind, childIndices: childIndices))
+    }
+
+    /// Freezes the builder into an immutable, `Sendable` store.
+    ///
+    /// Consumes the builder; interning tables are dropped, only the flat
+    /// buffers survive. Indices minted by this builder remain valid in the
+    /// frozen store.
+    public consuming func freeze() -> NodeStore {
+        NodeStore(nodes: nodes, edges: edges, textBytes: textBytes)
+    }
+
+    // MARK: - Statistics
+
+    /// Number of unique nodes interned so far.
+    public var nodeCount: Int { nodes.count }
+
+    // MARK: - Interning
+
+    private mutating func internRecursively(_ node: Node, visitedIndices: inout [ObjectIdentifier: UInt32]) -> UInt32 {
+        let identifier = ObjectIdentifier(node)
+        if let existingIndex = visitedIndices[identifier] {
+            return existingIndex
+        }
+
+        let children = node.children
+        let internedIndex: UInt32
+        if children.isEmpty {
+            internedIndex = internLeaf(kind: node.kind, contents: node.contents)
+        } else {
+            var childIndices = [UInt32]()
+            childIndices.reserveCapacity(children.count)
+            for child in children {
+                childIndices.append(internRecursively(child, visitedIndices: &visitedIndices))
+            }
+            internedIndex = internInterior(kind: node.kind, childIndices: childIndices)
+        }
+
+        visitedIndices[identifier] = internedIndex
+        return internedIndex
+    }
+
+    private mutating func internLeaf(kind: Node.Kind, contents: Node.Contents) -> UInt32 {
+        let compact: CompactNode
+        switch contents {
+        case .none:
+            compact = CompactNode(kind: kind, payloadKind: .none, payloadWord0: 0, payloadWord1: 0)
+        case .index(let indexValue):
+            compact = CompactNode(
+                kind: kind,
+                payloadKind: .index,
+                payloadWord0: UInt32(truncatingIfNeeded: indexValue),
+                payloadWord1: UInt32(truncatingIfNeeded: indexValue >> 32)
+            )
+        case .text(let textValue):
+            let location = internText(textValue)
+            compact = CompactNode(
+                kind: kind,
+                payloadKind: .text,
+                payloadWord0: location.offset,
+                payloadWord1: location.length
+            )
+        }
+        return internCanonicalCompact(compact)
+    }
+
+    private mutating func internInterior(kind: Node.Kind, childIndices: [UInt32]) -> UInt32 {
+        switch childIndices.count {
+        case 1:
+            return internCanonicalCompact(CompactNode(
+                kind: kind,
+                payloadKind: .oneChild,
+                payloadWord0: childIndices[0],
+                payloadWord1: 0
+            ))
+        case 2:
+            return internCanonicalCompact(CompactNode(
+                kind: kind,
+                payloadKind: .twoChildren,
+                payloadWord0: childIndices[0],
+                payloadWord1: childIndices[1]
+            ))
+        default:
+            return internManyChildren(kind: kind, childIndices: childIndices)
+        }
+    }
+
+    private mutating func appendNode(_ compact: CompactNode) -> UInt32 {
+        precondition(nodes.count < Int(UInt32.max), "NodeStore node buffer exceeded UInt32 index space")
+        let newIndex = UInt32(nodes.count)
+        nodes.append(compact)
+        return newIndex
+    }
+
+    // MARK: - Open-Addressing Interning Tables
+
+    private static func mix(_ currentHash: Int, _ value: Int) -> Int {
+        (currentHash &* 0x9E3779B1) &+ value
+    }
+
+    private static func hash(of compact: CompactNode) -> Int {
+        var combined = Int(compact.kindAndPayloadKind)
+        combined = mix(combined, Int(compact.payloadWord0))
+        combined = mix(combined, Int(compact.payloadWord1))
+        return mix(combined, 0)
+    }
+
+    private mutating func internCanonicalCompact(_ compact: CompactNode) -> UInt32 {
+        if (compactCount &+ 1) &* 4 >= compactSlots.count &* 3 {
+            growCompactSlots()
+        }
+        let mask = compactSlots.count - 1
+        var slot = Self.hash(of: compact) & mask
+        while true {
+            let existing = compactSlots[slot]
+            if existing == Self.emptySlot {
+                let newIndex = appendNode(compact)
+                compactSlots[slot] = newIndex
+                compactCount += 1
+                return newIndex
+            }
+            if nodes[Int(existing)] == compact {
+                return existing
+            }
+            slot = (slot + 1) & mask
+        }
+    }
+
+    private mutating func growCompactSlots() {
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: compactSlots.count * 2)
+        let mask = grownSlots.count - 1
+        for existing in compactSlots where existing != Self.emptySlot {
+            var slot = Self.hash(of: nodes[Int(existing)]) & mask
+            while grownSlots[slot] != Self.emptySlot {
+                slot = (slot + 1) & mask
+            }
+            grownSlots[slot] = existing
+        }
+        compactSlots = grownSlots
+    }
+
+    private static func hashOfManyChildren(kindAndPayloadKind: UInt16, childIndices: some Sequence<UInt32>) -> Int {
+        var combined = Int(kindAndPayloadKind)
+        for childIndex in childIndices {
+            combined = Self.mix(combined, Int(childIndex))
+        }
+        return Self.mix(combined, 0)
+    }
+
+    private func manyChildrenNodeMatches(_ existingIndex: UInt32, kindAndPayloadKind: UInt16, childIndices: [UInt32]) -> Bool {
+        let existing = nodes[Int(existingIndex)]
+        guard existing.kindAndPayloadKind == kindAndPayloadKind,
+              Int(existing.payloadWord1) == childIndices.count else {
+            return false
+        }
+        let edgesStart = Int(existing.payloadWord0)
+        return edges[edgesStart ..< edgesStart + childIndices.count].elementsEqual(childIndices)
+    }
+
+    private mutating func internManyChildren(kind: Node.Kind, childIndices: [UInt32]) -> UInt32 {
+        if (manyChildrenCount &+ 1) &* 4 >= manyChildrenSlots.count &* 3 {
+            growManyChildrenSlots()
+        }
+        let kindAndPayloadKind = CompactNode(kind: kind, payloadKind: .manyChildren, payloadWord0: 0, payloadWord1: 0).kindAndPayloadKind
+        let mask = manyChildrenSlots.count - 1
+        var slot = Self.hashOfManyChildren(kindAndPayloadKind: kindAndPayloadKind, childIndices: childIndices) & mask
+        while true {
+            let existing = manyChildrenSlots[slot]
+            if existing == Self.emptySlot {
+                precondition(edges.count + childIndices.count <= Int(UInt32.max), "NodeStore edges buffer exceeded UInt32 index space")
+                let edgesOffset = UInt32(edges.count)
+                edges.append(contentsOf: childIndices)
+                let newIndex = appendNode(CompactNode(
+                    kind: kind,
+                    payloadKind: .manyChildren,
+                    payloadWord0: edgesOffset,
+                    payloadWord1: UInt32(childIndices.count)
+                ))
+                manyChildrenSlots[slot] = newIndex
+                manyChildrenCount += 1
+                return newIndex
+            }
+            if manyChildrenNodeMatches(existing, kindAndPayloadKind: kindAndPayloadKind, childIndices: childIndices) {
+                return existing
+            }
+            slot = (slot + 1) & mask
+        }
+    }
+
+    private mutating func growManyChildrenSlots() {
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: manyChildrenSlots.count * 2)
+        let mask = grownSlots.count - 1
+        for existing in manyChildrenSlots where existing != Self.emptySlot {
+            let compact = nodes[Int(existing)]
+            let edgesStart = Int(compact.payloadWord0)
+            let childCount = Int(compact.payloadWord1)
+            var slot = Self.hashOfManyChildren(
+                kindAndPayloadKind: compact.kindAndPayloadKind,
+                childIndices: edges[edgesStart ..< edgesStart + childCount]
+            ) & mask
+            while grownSlots[slot] != Self.emptySlot {
+                slot = (slot + 1) & mask
+            }
+            grownSlots[slot] = existing
+        }
+        manyChildrenSlots = grownSlots
+    }
+
+    private static func hashOfTextBytes(_ bytes: some Sequence<UInt8>) -> Int {
+        // FNV-1a
+        var combined = Int(bitPattern: 0xCBF2_9CE4_8422_2325 as UInt)
+        for byte in bytes {
+            combined = (combined ^ Int(byte)) &* 0x100_0000_01B3
+        }
+        return combined
+    }
+
+    private func textLocationMatches(_ location: TextLocation, utf8Bytes: [UInt8]) -> Bool {
+        guard Int(location.length) == utf8Bytes.count else { return false }
+        let start = Int(location.offset)
+        return textBytes[start ..< start + utf8Bytes.count].elementsEqual(utf8Bytes)
+    }
+
+    private mutating func internText(_ textValue: String) -> TextLocation {
+        if (uniqueTexts.count &+ 1) &* 4 >= textSlots.count &* 3 {
+            growTextSlots()
+        }
+        let utf8Bytes = Array(textValue.utf8)
+        let mask = textSlots.count - 1
+        var slot = Self.hashOfTextBytes(utf8Bytes) & mask
+        while true {
+            let existing = textSlots[slot]
+            if existing == Self.emptySlot {
+                precondition(textBytes.count + utf8Bytes.count <= Int(UInt32.max), "NodeStore text buffer exceeded UInt32 offset space")
+                let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Bytes.count))
+                textBytes.append(contentsOf: utf8Bytes)
+                textSlots[slot] = UInt32(uniqueTexts.count)
+                uniqueTexts.append(location)
+                return location
+            }
+            let existingLocation = uniqueTexts[Int(existing)]
+            if textLocationMatches(existingLocation, utf8Bytes: utf8Bytes) {
+                return existingLocation
+            }
+            slot = (slot + 1) & mask
+        }
+    }
+
+    private mutating func growTextSlots() {
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: textSlots.count * 2)
+        let mask = grownSlots.count - 1
+        for existing in textSlots where existing != Self.emptySlot {
+            let location = uniqueTexts[Int(existing)]
+            let start = Int(location.offset)
+            var slot = Self.hashOfTextBytes(textBytes[start ..< start + Int(location.length)]) & mask
+            while grownSlots[slot] != Self.emptySlot {
+                slot = (slot + 1) & mask
+            }
+            grownSlots[slot] = existing
+        }
+        textSlots = grownSlots
+    }
+}

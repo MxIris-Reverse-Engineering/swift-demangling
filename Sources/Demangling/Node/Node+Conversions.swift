@@ -73,13 +73,9 @@ extension Node {
         }
     }
 
-    @inlinable
-    public var hasChildren: Bool {
-        switch payload {
-        case .none, .index, .text: return false
-        default: return true
-        }
-    }
+    // `hasChildren` and `subscript(throwChild:)` live in the `DemanglingNode`
+    // extension (DemanglingNode.swift) as the single implementation for both
+    // `Node` and `NodeReference`.
 
     @inlinable
     public var firstChild: Node? {
@@ -113,90 +109,11 @@ extension Node {
         }
     }
 
-    public var isSimpleType: Bool {
-        switch kind {
-        case .associatedType: fallthrough
-        case .associatedTypeRef: fallthrough
-        case .boundGenericClass: fallthrough
-        case .boundGenericEnum: fallthrough
-        case .boundGenericFunction: fallthrough
-        case .boundGenericOtherNominalType: fallthrough
-        case .boundGenericProtocol: fallthrough
-        case .boundGenericStructure: fallthrough
-        case .boundGenericTypeAlias: fallthrough
-        case .builtinBorrow: fallthrough
-        case .builtinTypeName: fallthrough
-        case .builtinTupleType: fallthrough
-        case .builtinFixedArray: fallthrough
-        case .class: fallthrough
-        case .dependentGenericType: fallthrough
-        case .dependentMemberType: fallthrough
-        case .dependentGenericParamType: fallthrough
-        case .dynamicSelf: fallthrough
-        case .enum: fallthrough
-        case .errorType: fallthrough
-        case .existentialMetatype: fallthrough
-        case .integer: fallthrough
-        case .labelList: fallthrough
-        case .metatype: fallthrough
-        case .metatypeRepresentation: fallthrough
-        case .module: fallthrough
-        case .negativeInteger: fallthrough
-        case .otherNominalType: fallthrough
-        case .pack: fallthrough
-        case .protocol: fallthrough
-        case .protocolSymbolicReference: fallthrough
-        case .returnType: fallthrough
-        case .silBoxType: fallthrough
-        case .silBoxTypeWithLayout: fallthrough
-        case .structure: fallthrough
-        case .sugaredArray: fallthrough
-        case .sugaredDictionary: fallthrough
-        case .sugaredOptional: fallthrough
-        case .sugaredInlineArray: fallthrough
-        case .sugaredParen: return true
-        case .tuple: fallthrough
-        case .tupleElementName: fallthrough
-        case .typeAlias: fallthrough
-        case .typeList: fallthrough
-        case .typeSymbolicReference: return true
-        case .type:
-            return children.first.map { $0.isSimpleType } ?? false
-        case .protocolList:
-            return children.first.map { $0.children.count <= 1 } ?? false
-        case .protocolListWithAnyObject:
-            return (children.first?.children.first).map { $0.children.count == 0 } ?? false
-        default: return false
-        }
-    }
-
-    public var needSpaceBeforeType: Bool {
-        switch kind {
-        case .type: return children.first?.needSpaceBeforeType ?? false
-        case .functionType,
-             .noEscapeFunctionType,
-             .uncurriedFunctionType,
-             .dependentGenericType: return false
-        default: return true
-        }
-    }
-
-    @inlinable
-    public func isIdentifier(desired: String) -> Bool {
-        return kind == .identifier && text == desired
-    }
-
-    @inlinable
-    public var isSwiftModule: Bool {
-        return kind == .module && text == stdlibName
-    }
-}
-
-extension Node {
-    @inlinable
-    public func isKind(of kinds: Node.Kind...) -> Bool {
-        return kinds.contains(kind)
-    }
+    // `isSimpleType`, `needSpaceBeforeType`, `isIdentifier(desired:)`, and
+    // `isSwiftModule` live in the `DemanglingNode` protocol extension
+    // (DemanglingNode.swift) as the single implementation for both `Node`
+    // and `NodeReference` — a parallel copy here would drift, since the
+    // generic printer engine statically dispatches to the extension.
 }
 
 extension Node {
@@ -208,17 +125,6 @@ extension Node {
     @inlinable
     public subscript(safeChild childIndex: Int) -> Node? {
         children.at(childIndex)
-    }
-
-    @inlinable
-    public subscript(throwChild childIndex: Int) -> Node {
-        get throws(IndexOutOfBoundError) {
-            if let child = children.at(childIndex) {
-                return child
-            } else {
-                throw .default
-            }
-        }
     }
 
     public struct IndexOutOfBoundError: Error {
@@ -247,19 +153,6 @@ extension Node {
         return depths
     }
 
-    public var identifier: String? {
-        if let node = children.at(1), node.kind == .identifier {
-            return node.text
-        } else if let node = children.at(1), node.kind == .privateDeclName {
-            return node.children.at(1)?.text
-        } else if let node = first(of: .prefixOperator, .postfixOperator, .infixOperator) {
-            return node.text
-        } else if let node = first(of: .identifier) {
-            return node.text
-        } else if let node = first(of: .privateDeclName) {
-            return node.children.at(1)?.text
-        } else {
-            return nil
-        }
-    }
+    // `identifier` lives in DemanglingNode+Sequence.swift as the single
+    // implementation shared with `NodeReference`.
 }
