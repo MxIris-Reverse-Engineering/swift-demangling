@@ -18,7 +18,7 @@ extension Demangler {
     func createNode(kind: Node.Kind, contents: Node.Contents = .none, inlineChildren: Node.Children) -> Node {
         internsLeaves
             ? Node.create(kind: kind, contents: contents, inlineChildren: inlineChildren)
-            : Node(kind: kind, contents: contents, children: Array(inlineChildren))
+            : Node(kind: kind, contents: contents, inlineChildren: inlineChildren)
     }
 
     @inline(__always)
