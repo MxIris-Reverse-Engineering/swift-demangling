@@ -78,6 +78,30 @@ if stackFloorAddress != 0 {
 
 放弃时整个 printer 值被丢弃、在大栈上重跑，因此中途写入 `target` 和 `printCache` 的残缺片段不会外泄。
 
+### 保护归位：从调用方约定改为引擎内建
+
+第二层刚落地时，每个打印入口都要自己写一遍 `executeWithinStackBudget` 的两个闭包。这是**约定式**保护：调用方得记得包，漏一个就是静默失去保护。而这个坑已经踩过一次——MachOSwiftSection 的 `printSemantic` 直接驱动 `DemanglingPrinter`，历史上就没包 `StackSafeExecutor`，深嵌套泛型符号能把它打爆；这次第二层落地时它又一次没跟上，白付跨线程开销。同一个位置栽两回，说明责任放错了地方。
+
+于是把保护挪进引擎，成为 `DemanglingPrinter.print(_:options:)`：
+
+```swift
+public static func print(_ root: SomeNode, options: DemangleOptions = .default) -> Target {
+    StackSafeExecutor.executeWithinStackBudget { stackFloorAddress in
+        var printer = DemanglingPrinter(options: options)
+        return printer.printRootWithinStackBudget(root, stackFloorAddress: stackFloorAddress)
+    } unbudgetedFallback: {
+        var printer = DemanglingPrinter(options: options)
+        return printer.printRoot(root)
+    }
+}
+```
+
+它**必须是 static**：回退要用一个全新的 printer 重跑，而 `printRoot` 是 `mutating`，放弃那次已经污染了实例状态，没法自己重来。
+
+`printRoot` / `printRootWithinStackBudget` 保留为低层入口，供已知有栈余量、想自己管理 printer 生命周期的调用方使用；库内四个打印入口全部塌缩成一行转发。`Node.description` 是例外，它走的是私有的 `printNode` 树 dump（debug 用途）而非打印引擎，继续用第一层。
+
+### Remangler
+
 `Remangler` 用完全相同的形状接入（`mangleWithinStackBudget(_:stackFloorAddress:)`），检查点放在它已有的收敛点 `mangle(_:depth:)` 上——那里原本就在做 `maxDepth`（1024，对齐上游 `Remangler.cpp`）判断。放弃时丢弃整个 remangler 值，残缺的 `buffer` 同样不会外泄。因为 remangle 是 `throws(ManglingError)`，`StackSafeExecutor` 相应多一个 typed-throws 重载；其中「抛错」与「预算耗尽」是两回事：抛错说明树本身有问题，直接向上传播而不去 worker 上重跑（重跑只会复现同一个错误），预算耗尽才走回退。
 
 ## 效果

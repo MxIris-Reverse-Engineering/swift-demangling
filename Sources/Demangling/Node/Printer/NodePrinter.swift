@@ -10,8 +10,8 @@
 /// paths, but only the `Node` path delivers a canonical instance: store-backed
 /// printing materializes a fresh subtree per evaluation, so scopes must be
 /// keyed by structure (e.g. the remangled string) rather than by
-/// `===`/`ObjectIdentifier`. Wrap calls in `StackSafeExecutor.execute` for
-/// deeply nested symbols.
+/// `===`/`ObjectIdentifier`. Stack safety is built into ``print(_:options:)`` —
+/// use it rather than wrapping ``printRoot(_:)`` at the call site.
 @_spi(Internals)
 public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: Sendable {
     /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth`` from
@@ -51,6 +51,33 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         self.options = options
     }
 
+    /// Prints `root` with stack safety built in — the entry point callers
+    /// should reach for.
+    ///
+    /// Runs inline on the calling thread while the recursion stays clear of the
+    /// stack end, and re-runs on a large-stack worker only for a tree that
+    /// genuinely needs one. Stack safety belongs here rather than at each call
+    /// site: it used to be the caller's job to wrap `printRoot` in
+    /// `StackSafeExecutor`, and a call site that forgot (MachOSwiftSection's
+    /// `printSemantic` did) silently lost the protection entirely.
+    ///
+    /// This is `static` by necessity — the fallback needs a pristine printer,
+    /// and an instance that already gave up mid-walk cannot re-run itself.
+    public static func print(_ root: SomeNode, options: DemangleOptions = .default) -> Target {
+        StackSafeExecutor.executeWithinStackBudget { stackFloorAddress in
+            var printer = DemanglingPrinter(options: options)
+            return printer.printRootWithinStackBudget(root, stackFloorAddress: stackFloorAddress)
+        } unbudgetedFallback: {
+            var printer = DemanglingPrinter(options: options)
+            return printer.printRoot(root)
+        }
+    }
+
+    /// Prints `root` on the current thread with no stack guard.
+    ///
+    /// Prefer ``print(_:options:)``; reach for this only when the caller
+    /// already knows it has stack headroom (for example inside a large-stack
+    /// worker) and wants to manage the printer instance itself.
     public mutating func printRoot(_ root: SomeNode) -> Target {
         _ = printName(root)
         return target
@@ -2266,6 +2293,11 @@ public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
 
     public init(options: DemangleOptions = .default) {
         self.engine = DemanglingPrinter(options: options)
+    }
+
+    /// See ``DemanglingPrinter/print(_:options:)`` — stack-safe entry point.
+    public static func print(_ root: Node, options: DemangleOptions = .default) -> Target {
+        DemanglingPrinter<Target, Node>.print(root, options: options)
     }
 
     public mutating func printRoot(_ root: Node) -> Target {
