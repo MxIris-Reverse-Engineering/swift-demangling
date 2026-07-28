@@ -120,6 +120,30 @@ public enum StackSafeExecutor {
         #endif
     }
 
+    /// Throwing variant of
+    /// ``executeWithinStackBudget(budgetedAttempt:unbudgetedFallback:)``.
+    ///
+    /// An error thrown by `budgetedAttempt` is a genuine failure of the work
+    /// itself (a malformed tree), not a budget signal — budget exhaustion is
+    /// reported by returning `nil` — so it propagates instead of retrying on a
+    /// worker, which would only reproduce it.
+    public static func executeWithinStackBudget<Success: Sendable, Failure: Error>(
+        budgetedAttempt: (_ stackFloorAddress: UInt) throws(Failure) -> Success?,
+        unbudgetedFallback: @escaping @Sendable () throws(Failure) -> Success
+    ) throws(Failure) -> Success {
+        #if canImport(Darwin)
+        if currentThreadHasSufficientStack {
+            return try unbudgetedFallback()
+        }
+        if let result = try budgetedAttempt(stackFloorAddressForCurrentThread) {
+            return result
+        }
+        return try executeOnLargeStackThreadThrowing(unbudgetedFallback)
+        #else
+        return try unbudgetedFallback()
+        #endif
+    }
+
     #if canImport(Darwin)
     private static var stackFloorAddressForCurrentThread: UInt {
         let stackAddress = pthread_get_stackaddr_np(pthread_self())

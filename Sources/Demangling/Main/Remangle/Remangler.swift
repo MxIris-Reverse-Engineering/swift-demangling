@@ -46,6 +46,14 @@ struct Remangler {
     /// Overflow storage for substitutions beyond inline capacity
     private var overflowSubstitutions: [SubstitutionEntry: UInt64] = [:]
 
+    /// Address the stack must not grow past, or 0 when this remangler may
+    /// recurse freely. See ``mangleWithinStackBudget(_:stackFloorAddress:)``.
+    private var stackFloorAddress: UInt = 0
+
+    /// Set once the walk stopped early because it reached ``stackFloorAddress``;
+    /// the partial ``buffer`` is then unusable.
+    private var didExhaustStackBudget: Bool = false
+
     // MARK: - Initialization
 
     init(usePunycode: Bool, flavor: ManglingFlavor = .default) {
@@ -349,10 +357,37 @@ struct Remangler {
         return buffer
     }
 
+    /// Remangles `node` only as long as the walk stays clear of
+    /// `stackFloorAddress`, returning `nil` the moment it would not.
+    ///
+    /// Mirrors ``DemanglingPrinter/printRootWithinStackBudget(_:stackFloorAddress:)``:
+    /// it lets a caller on a small stack run the common shallow tree inline and
+    /// pay for a large-stack thread only for the rare tree that needs one.
+    mutating func mangleWithinStackBudget(_ node: Node, stackFloorAddress: UInt) throws(ManglingError) -> String? {
+        self.stackFloorAddress = stackFloorAddress
+        clearBuffer()
+        try mangle(node, depth: 0)
+        return didExhaustStackBudget ? nil : buffer
+    }
+
     // MARK: - Core Mangling
 
     /// Main entry point for mangling a single node
     private mutating func mangle(_ node: Node, depth: Int) throws(ManglingError) {
+        // Unwind the whole walk once any frame ran out of budget: the result is
+        // discarded, so continuing would only risk the overflow the budget
+        // exists to avoid.
+        if didExhaustStackBudget {
+            return
+        }
+        if stackFloorAddress != 0 {
+            var stackProbe = 0
+            let currentAddress = withUnsafeMutablePointer(to: &stackProbe) { UInt(bitPattern: $0) }
+            if currentAddress <= stackFloorAddress {
+                didExhaustStackBudget = true
+                return
+            }
+        }
         // Check recursion depth
         if depth > Self.maxDepth {
             throw .tooComplex(node)

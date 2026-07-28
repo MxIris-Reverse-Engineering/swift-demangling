@@ -11,11 +11,18 @@
 ///   - flavor: The mangling flavor (default Swift, or embedded Swift)
 /// - Returns: The mangled string, or nil if remangling failed
 public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: ManglingFlavor = .default) throws(ManglingError) -> String {
+    let budgetedMangleBlock: (UInt) throws(ManglingError) -> String? = { stackFloorAddress throws(ManglingError) in
+        var remangler = Remangler(usePunycode: usePunycode, flavor: flavor)
+        return try remangler.mangleWithinStackBudget(node, stackFloorAddress: stackFloorAddress)
+    }
     let mangleBlock: @Sendable () throws(ManglingError) -> String = {
         var remangler = Remangler(usePunycode: usePunycode, flavor: flavor)
         return try remangler.mangle(node)
     }
-    return try StackSafeExecutor.execute(mangleBlock)
+    return try StackSafeExecutor.executeWithinStackBudget(
+        budgetedAttempt: budgetedMangleBlock,
+        unbudgetedFallback: mangleBlock
+    )
 }
 
 /// Asynchronous variant of ``mangleAsString(_:usePunycode:flavor:)``.

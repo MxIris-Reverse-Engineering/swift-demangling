@@ -78,6 +78,8 @@ if stackFloorAddress != 0 {
 
 放弃时整个 printer 值被丢弃、在大栈上重跑，因此中途写入 `target` 和 `printCache` 的残缺片段不会外泄。
 
+`Remangler` 用完全相同的形状接入（`mangleWithinStackBudget(_:stackFloorAddress:)`），检查点放在它已有的收敛点 `mangle(_:depth:)` 上——那里原本就在做 `maxDepth`（1024，对齐上游 `Remangler.cpp`）判断。放弃时丢弃整个 remangler 值，残缺的 `buffer` 同样不会外泄。因为 remangle 是 `throws(ManglingError)`，`StackSafeExecutor` 相应多一个 typed-throws 重载；其中「抛错」与「预算耗尽」是两回事：抛错说明树本身有问题，直接向上传播而不去 worker 上重跑（重跑只会复现同一个错误），预算耗尽才走回退。
+
 ## 效果
 
 同一台机器、同一符号、2000 次：
@@ -85,14 +87,17 @@ if stackFloorAddress != 0 {
 | 场景 | 改动前 | 仅线程池 | 线程池 + 栈预算 |
 |---|---|---|---|
 | `print` @512 KB 栈线程 | 127.5 ms | 42.4 ms | **17.5 ms** |
+| `remangle` @512 KB 栈线程 | — | 160.0 ms | **130.1 ms** |
 | `demangle` @512 KB 栈线程 | 162.5 ms | 78.0 ms | 74.8 ms |
 | 32 任务并发 6400 次 demangle | 162.7 ms | 101.1 ms | 99.6 ms |
 
-打印路径提速 **7.3 倍**，且在 512 KB 栈线程上的耗时已低于主线程 —— 跨线程成本完全消失。
+打印路径提速 **7.3 倍**，且在 512 KB 栈线程上的耗时已低于主线程；remangle 从 1.24 倍主线程耗时回落到 1.00 倍 —— 两条路径的跨线程成本都完全消失。
+
+提升幅度的差异完全由「本体耗时」决定：print 本体约 10 µs，线程开销占 84%，所以收益最大；remangle 本体约 65 µs，开销占比小，收益相应就是约 20%。
 
 ## 影响面与限制
 
-- **行为不变**：深递归仍然受保护，只是保护方式从「无条件换线程」变成「先试，不够再换」。`maxPrintDepth`（768 帧，对齐上游 C++ `NodePrinter`）与 `<<too complex>>` 语义保持原样。
-- **只有打印路径接入了第二层**。`Demangler` 没有单一递归收敛点（`demangleType` / `demangleOperator` 等多个方法互递归），`Remangler` 虽有收敛点 `mangle(_:depth:)` 但暂未接入。两者目前只享受第一层的线程复用收益。若后续要给 demangler 加栈预算，前提是先为它建立一个真正覆盖全部递归路径的收敛点 —— 保护不完整反而比现状危险。
+- **行为不变**：深递归仍然受保护，只是保护方式从「无条件换线程」变成「先试，不够再换」。`maxPrintDepth`（768 帧，对齐上游 C++ `NodePrinter`）、`Remangler.maxDepth`（1024，对齐上游 `Remangler.cpp`）与 `<<too complex>>` / `.tooComplex` 语义都保持原样。
+- **`Demangler` 只享受第一层的线程复用**，这是刻意的，且与上游一致：它的主解析路径**根本不是递归下降**——`parseAndPushNames()` 是 `while !scanner.isAtEnd` 配合 `nameStack` 显式栈，嵌套结构靠弹栈拼装而非调用栈，所以上游 `Demangler.cpp` 同样没有任何递归深度限制（有 `depth` 的是 `Remangler` 和 `NodePrinter`，本库两者都已对齐）。对 160 个方法做过调用图分析，真正参与递归的只有 21 个，且都不在主循环上：`demangleBoundGenericArgs`（深度 = 嵌套泛型上下文层数）、`setParentForOpaqueReturnTypeNodesImpl` ↔ `getParentId`（树遍历），以及 19 个 `demangleSwift3*` 组成的互递归团（Swift 3 老 mangling 才是真正的递归下降）。前两类深度很浅；Swift 3 那条路径理论上可被构造的深嵌套老符号打爆栈，但今天 `_T` 前缀符号已基本绝迹。若将来要给它加保护，正确做法是只覆盖这 21 个方法，而不是给全部方法塞一个恒为常数的参数。
 - **非 Darwin 平台**行为不变（整套机制都在 `#if canImport(Darwin)` 内，其他平台一律直接执行）。
 - **回归验证**：MachOSwiftSection 的 `MachOSwiftSectionTests` + `SwiftLayoutTests` 全量对比，改动前后失败集合逐条一致（157 项，均为该分支既有失败）；`SwiftDumpTests` / `SwiftPrintingTests` / `MachOSymbolsTests` 共 100 项中除一项既有的快照失败外全部通过。
