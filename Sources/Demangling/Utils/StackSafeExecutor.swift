@@ -54,7 +54,7 @@ public enum StackSafeExecutor {
         _ body: @escaping @Sendable () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         #if canImport(Darwin)
-        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
+        if currentThreadHasSufficientStack || LargeStackThreadPool.isRunningOnPoolWorker {
             return try body()
         }
         return try runOnPoolWorker(body)
@@ -67,7 +67,7 @@ public enum StackSafeExecutor {
     /// current thread's remaining stack space is insufficient.
     public static func execute(_ block: @escaping @Sendable () -> String) -> String {
         #if canImport(Darwin)
-        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
+        if currentThreadHasSufficientStack || LargeStackThreadPool.isRunningOnPoolWorker {
             return block()
         }
         return runOnPoolWorker(block)
@@ -82,7 +82,7 @@ public enum StackSafeExecutor {
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         #if canImport(Darwin)
-        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
+        if currentThreadHasSufficientStack || LargeStackThreadPool.isRunningOnPoolWorker {
             return try block()
         }
         return try runOnPoolWorker(block)
@@ -97,7 +97,7 @@ public enum StackSafeExecutor {
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) async throws(Failure) -> Success {
         #if canImport(Darwin)
-        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
+        if currentThreadHasSufficientStack || LargeStackThreadPool.isRunningOnPoolWorker {
             return try block()
         }
         let outcome: Result<Success, Failure> = await withCheckedContinuation { continuation in
@@ -180,14 +180,31 @@ public enum StackSafeExecutor {
 ///   nested mangled names, so work submitted from a worker would block on a
 ///   capped pool. ``isRunningOnPoolWorker`` makes those calls run inline
 ///   instead — they are already on a large stack, which is the whole point.
-private final class LargeStackThreadPool: @unchecked Sendable {
+final class LargeStackThreadPool: @unchecked Sendable {
     static let shared = LargeStackThreadPool()
 
-    private static let threadDictionaryKey = "swift-demangling.largeStackPoolWorker"
+    /// Thread-local marker key.
+    ///
+    /// `Thread.current.threadDictionary` would be the obvious place for this,
+    /// but reading it materializes an `NSThread` wrapper and lazily allocates —
+    /// and permanently retains — an `NSMutableDictionary` on every thread that
+    /// ever demangles. This check sits on all four entry points, so it has to
+    /// be a bare `pthread_getspecific`.
+    private static let workerMarkerKey: pthread_key_t = {
+        var key = pthread_key_t()
+        pthread_key_create(&key, nil)
+        return key
+    }()
 
     /// Whether the calling thread is one of this pool's workers.
     static var isRunningOnPoolWorker: Bool {
-        Thread.current.threadDictionary[threadDictionaryKey] != nil
+        pthread_getspecific(workerMarkerKey) != nil
+    }
+
+    static func markCurrentThreadAsPoolWorker() {
+        // Any non-null value marks the thread; the key has no destructor, so
+        // nothing is ever dereferenced.
+        pthread_setspecific(workerMarkerKey, UnsafeMutableRawPointer(bitPattern: 1))
     }
 
     private let maximumWorkerCount = max(2, ProcessInfo.processInfo.activeProcessorCount)
@@ -199,6 +216,17 @@ private final class LargeStackThreadPool: @unchecked Sendable {
     private var nextWorkItemIndex = 0
     private var idleWorkerCount = 0
     private var workerCount = 0
+
+    /// Number of workers this pool has created. Exposed for tests, which need
+    /// to assert on the pool's own ceiling rather than on a process-wide thread
+    /// count that other suites also move.
+    var currentWorkerCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return workerCount
+    }
+
+    var maximumWorkerCountForTesting: Int { maximumWorkerCount }
 
     func submit(_ workItem: @escaping @Sendable () -> Void) {
         condition.lock()
@@ -221,7 +249,7 @@ private final class LargeStackThreadPool: @unchecked Sendable {
     }
 
     private func runWorkerLoop() {
-        Thread.current.threadDictionary[Self.threadDictionaryKey] = true
+        Self.markCurrentThreadAsPoolWorker()
 
         while true {
             condition.lock()
@@ -238,9 +266,11 @@ private final class LargeStackThreadPool: @unchecked Sendable {
             }
             condition.unlock()
 
-            // Workers outlive every individual call, so without a pool an
-            // autoreleased object's release point would move from "end of the
-            // call" to "end of the process".
+            // The predecessor created a `Thread` per call, and a thread drains
+            // its own pool when it exits — so no explicit pool was needed. Long-
+            // lived workers remove that drain point: without this, an
+            // autoreleased object's release would move from "end of the call" to
+            // "end of the process". The pool created the hazard; this closes it.
             autoreleasepool {
                 workItem()
             }

@@ -24,7 +24,11 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// the stack directly instead. Kept only so existing callers that read it
     /// still compile.
     @available(*, deprecated, message: "The print recursion is bounded by remaining stack, not by a frame count. See StackBudget.")
-    public static var maxPrintDepth: Int { 768 }
+    public static var maxPrintDepth: Int { classicPrintDepthLimit }
+
+    /// The frame count this engine used before ``StackBudget`` existed, kept as
+    /// the fallback where a platform cannot report thread stack bounds.
+    static var classicPrintDepthLimit: Int { 768 }
 
     /// Bound for ``findSugar(_:depth:)``, the only print recursion that does
     /// not converge on ``printName(_:asPrefixContext:)``. Sugar wrappers are a
@@ -40,7 +44,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// Bounds the recursion by remaining stack rather than by frame count.
     /// Re-derived at every ``printRoot(_:)`` so a reused printer instance never
     /// inherits an exhausted budget from a previous walk.
-    private var stackBudget: StackBudget = .unlimited
+    private var stackBudget: StackBudget = .countingFrames(upTo: classicPrintDepthLimit)
+    /// Number of times the walk gave up for want of stack. Used to detect that
+    /// a subtree's rendering is a truncation and must not enter ``printCache``.
+    private var stackBailCount: Int = 0
     /// Memoizes the rendered fragment for each shared substitution node.
     /// The demangler returns the same ``SomeNode`` instance for every
     /// back-reference (``A23_`` etc.), so one mangling can produce a DAG
@@ -60,7 +67,8 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     public mutating func printRoot(_ root: SomeNode) -> Target {
-        stackBudget = .forCurrentThread()
+        stackBudget = .forCurrentThread(fallbackDepthLimit: Self.classicPrintDepthLimit)
+        stackBailCount = 0
         _ = printName(root)
         return target
     }
@@ -73,6 +81,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             // so on a large-stack worker a legitimately deep generic prints in
             // full.
             target.write("<<too complex>>")
+            stackBailCount += 1
             return nil
         }
         // Only memoize prints that don't depend on caller-side state. A
@@ -92,9 +101,17 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             // live target and remember it for later reuse.
             var subTarget = Target()
             swap(&target, &subTarget)
+            let bailCountBefore = stackBailCount
             let result = dispatchPrintName(name, asPrefixContext: asPrefixContext)
             swap(&target, &subTarget)
-            printCache[name.printCacheIdentity] = subTarget
+            // Only memoize a complete rendering. If any descendant gave up for
+            // want of stack, this fragment ends in `<<too complex>>`; caching it
+            // would replay that truncation at shallower positions that had
+            // plenty of headroom, turning a one-path degradation into a
+            // permanent one.
+            if stackBailCount == bailCountBefore {
+                printCache[name.printCacheIdentity] = subTarget
+            }
             target.append(subTarget)
             return result
         }
@@ -2253,7 +2270,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 /// a class tree (see `NodeReference.print(using:)`).
 public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
     @available(*, deprecated, message: "The print recursion is bounded by remaining stack, not by a frame count. See StackBudget.")
-    public static var maxPrintDepth: Int { 768 }
+    public static var maxPrintDepth: Int { DemanglingPrinter<Target, Node>.classicPrintDepthLimit }
 
     private var engine: DemanglingPrinter<Target, Node>
 

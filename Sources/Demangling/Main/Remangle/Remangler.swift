@@ -23,11 +23,9 @@ struct Remangler {
     /// stack.
     private static let maxDepth = StackBudget.absoluteDepthLimit
 
-    /// Bound for ``getUnspecialized(_:depth:)``, which walks parent contexts
-    /// and rebuilds nodes as it unwinds, so it cannot be a loop and is not
-    /// covered by the stack guard on ``mangle(_:depth:)``. Declaration nesting
-    /// never approaches this.
-    static let maxContextChainDepth = 4096
+    /// The frame count this engine used before ``StackBudget`` existed, kept as
+    /// the fallback where a platform cannot report thread stack bounds.
+    static let classicMangleDepthLimit = 1024
 
     /// Maximum number of words to track (matches C++ MaxNumWords = 26)
     private static let maxNumWords = 26
@@ -41,7 +39,7 @@ struct Remangler {
     /// Bounds the walk by remaining stack rather than by frame count.
     /// Re-derived at every ``mangle(_:)`` so a reused remangler never
     /// inherits a spent budget.
-    private var stackBudget: StackBudget = .unlimited
+    private var stackBudget: StackBudget = .countingFrames(upTo: Remangler.classicMangleDepthLimit)
 
     private var substMerging: SubstitutionMerging = .init()
 
@@ -440,7 +438,7 @@ struct Remangler {
 
     /// Remangle a node tree into a mangled string
     mutating func mangle(_ node: Node) throws(ManglingError) -> String {
-        stackBudget = .forCurrentThread()
+        stackBudget = .forCurrentThread(fallbackDepthLimit: Self.classicMangleDepthLimit)
         clearBuffer()
         try mangle(node, depth: 0)
         return buffer
@@ -454,7 +452,7 @@ struct Remangler {
     /// Called from every recursion in this engine that is reachable without
     /// passing back through ``mangle(_:depth:)`` — a call-graph audit found six
     /// such cycles, which is why a single check on `mangle` was never enough.
-    private mutating func checkStackBudget(_ node: Node, depth: Int) throws(ManglingError) {
+    private func checkStackBudget(_ node: Node, depth: Int) throws(ManglingError) {
         if !stackBudget.hasHeadroom(atDepth: depth) {
             throw .tooComplex(node)
         }
@@ -2450,7 +2448,7 @@ extension Remangler {
             }
 
             // Get unspecialized version
-            guard let unboundType = getUnspecialized(node) else {
+            guard let unboundType = getUnspecialized(node, stackBudget: stackBudget) else {
                 throw .invalidNodeStructure(node, message: "Cannot get unspecialized type")
             }
 
@@ -2532,7 +2530,7 @@ extension Remangler {
         }
 
         // Get unspecialized function
-        guard let unboundFunction = getUnspecialized(node) else {
+        guard let unboundFunction = getUnspecialized(node, stackBudget: stackBudget) else {
             throw .invalidNodeStructure(node, message: "Cannot get unspecialized function")
         }
 
@@ -5926,9 +5924,19 @@ extension Remangler {
         /// recursive version; the result does not, because every pair must
         /// match for the answer to be `true`.
         private static func deepEquals(_ lhs: Node, _ rhs: Node) -> Bool {
-            var pendingPairs: [(left: Node, right: Node)] = [(lhs, rhs)]
+            // `SubstitutionEntry.==` calls this on every hash match, so the
+            // shallow cases must not allocate.
+            if lhs === rhs { return true }
+            guard lhs.isSimilar(to: rhs) else { return false }
+            let rootLeftChildren = lhs.children
+            let rootRightChildren = rhs.children
+            guard rootLeftChildren.count == rootRightChildren.count else { return false }
+            if rootLeftChildren.isEmpty { return true }
+
+            var pendingPairs: [(left: Node, right: Node)] = Array(zip(rootLeftChildren, rootRightChildren).map { ($0, $1) })
 
             while let pair = pendingPairs.popLast() {
+                if pair.left === pair.right { continue }
                 // Nodes must be similar (same kind, same text/index)
                 guard pair.left.isSimilar(to: pair.right) else {
                     return false
@@ -6005,12 +6013,12 @@ extension Node {
 /// Strips the generic arguments off a nominal/context chain.
 ///
 /// Unlike ``isSpecialized(_:)`` this rebuilds nodes as it unwinds, so it cannot
-/// be a loop. It carries its own depth cap instead: the walk follows parent
-/// contexts, which nest as deeply as declarations nest, and it is reached from
-/// `mangleAnyNominalType` without passing back through `mangle(_:depth:)`, so
-/// the remangler's stack guard does not cover it.
-func getUnspecialized(_ node: Node, depth: Int = 0) -> Node? {
-    guard depth <= Remangler.maxContextChainDepth else { return nil }
+/// be a loop. It is reached from `mangleAnyNominalType` without passing back
+/// through `mangle(_:depth:)`, so it probes the stack itself rather than
+/// trusting a frame count — the walk follows parent contexts and allocates an
+/// array per level, and a frame count cannot say how much stack that costs.
+func getUnspecialized(_ node: Node, depth: Int = 0, stackBudget: StackBudget) -> Node? {
+    guard stackBudget.hasHeadroom(atDepth: depth) else { return nil }
     var numToCopy = 2
 
     switch node.kind {
@@ -6048,7 +6056,7 @@ func getUnspecialized(_ node: Node, depth: Int = 0) -> Node? {
         var resultChildren: [Node] = []
         var parentOrModule = node.children[0]
         if isSpecialized(parentOrModule) {
-            guard let unspec = getUnspecialized(parentOrModule, depth: depth + 1) else { return nil }
+            guard let unspec = getUnspecialized(parentOrModule, depth: depth + 1, stackBudget: stackBudget) else { return nil }
             parentOrModule = unspec
         }
         resultChildren.append(parentOrModule)
@@ -6070,7 +6078,7 @@ func getUnspecialized(_ node: Node, depth: Int = 0) -> Node? {
         guard unboundType.kind == .type, unboundType.children.count > 0 else { return nil }
         let nominalType = unboundType.children[0]
         if isSpecialized(nominalType) {
-            return getUnspecialized(nominalType, depth: depth + 1)
+            return getUnspecialized(nominalType, depth: depth + 1, stackBudget: stackBudget)
         }
         return nominalType
 
@@ -6087,7 +6095,7 @@ func getUnspecialized(_ node: Node, depth: Int = 0) -> Node? {
             return nil
         }
         if isSpecialized(unboundFunction) {
-            return getUnspecialized(unboundFunction, depth: depth + 1)
+            return getUnspecialized(unboundFunction, depth: depth + 1, stackBudget: stackBudget)
         }
         return unboundFunction
 
@@ -6097,7 +6105,7 @@ func getUnspecialized(_ node: Node, depth: Int = 0) -> Node? {
         if !isSpecialized(parent) {
             return node
         }
-        guard let unspec = getUnspecialized(parent, depth: depth + 1) else { return nil }
+        guard let unspec = getUnspecialized(parent, depth: depth + 1, stackBudget: stackBudget) else { return nil }
         var resultChildren: [Node] = [node.children[0], unspec]
         if node.children.count == 3 {
             resultChildren.append(node.children[2])
@@ -6118,53 +6126,53 @@ func getUnspecialized(_ node: Node, depth: Int = 0) -> Node? {
 func isSpecialized(_ node: Node) -> Bool {
     var currentNode = node
     while true {
-    switch currentNode.kind {
-    case .boundGenericStructure,
-         .boundGenericEnum,
-         .boundGenericClass,
-         .boundGenericOtherNominalType,
-         .boundGenericTypeAlias,
-         .boundGenericProtocol,
-         .boundGenericFunction,
-         .constrainedExistential:
-        return true
+        switch currentNode.kind {
+        case .boundGenericStructure,
+             .boundGenericEnum,
+             .boundGenericClass,
+             .boundGenericOtherNominalType,
+             .boundGenericTypeAlias,
+             .boundGenericProtocol,
+             .boundGenericFunction,
+             .constrainedExistential:
+            return true
 
-    case .structure,
-         .enum,
-         .class,
-         .typeAlias,
-         .otherNominalType,
-         .protocol,
-         .function,
-         .allocator,
-         .constructor,
-         .destructor,
-         .variable,
-         .subscript,
-         .explicitClosure,
-         .implicitClosure,
-         .initializer,
-         .propertyWrapperBackingInitializer,
-         .propertyWrapperInitFromProjectedValue,
-         .defaultArgumentInitializer,
-         .getter,
-         .setter,
-         .willSet,
-         .didSet,
-         .readAccessor,
-         .modifyAccessor,
-         .unsafeAddressor,
-         .unsafeMutableAddressor,
-         .static:
-        guard currentNode.children.count > 0 else { return false }
-        currentNode = currentNode.children[0]
+        case .structure,
+             .enum,
+             .class,
+             .typeAlias,
+             .otherNominalType,
+             .protocol,
+             .function,
+             .allocator,
+             .constructor,
+             .destructor,
+             .variable,
+             .subscript,
+             .explicitClosure,
+             .implicitClosure,
+             .initializer,
+             .propertyWrapperBackingInitializer,
+             .propertyWrapperInitFromProjectedValue,
+             .defaultArgumentInitializer,
+             .getter,
+             .setter,
+             .willSet,
+             .didSet,
+             .readAccessor,
+             .modifyAccessor,
+             .unsafeAddressor,
+             .unsafeMutableAddressor,
+             .static:
+            guard currentNode.children.count > 0 else { return false }
+            currentNode = currentNode.children[0]
 
-    case .extension:
-        guard currentNode.children.count > 1 else { return false }
-        currentNode = currentNode.children[1]
+        case .extension:
+            guard currentNode.children.count > 1 else { return false }
+            currentNode = currentNode.children[1]
 
-    default:
-        return false
-    }
+        default:
+            return false
+        }
     }
 }

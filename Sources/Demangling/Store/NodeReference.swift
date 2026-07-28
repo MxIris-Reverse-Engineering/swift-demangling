@@ -182,9 +182,13 @@ public struct NodeReference: Sendable {
     /// fall back to `String` equality so Unicode canonical equivalence
     /// matches `Node.==`.
     /// Walked with an explicit work list rather than by recursion, for the same
-    /// reason as the `Node` overload. The same-store shortcut now applies at
-    /// every level, not only at the root: a shared subtree cuts the walk short
-    /// as soon as it is reached.
+    /// reason as the `Node` overload.
+    ///
+    /// The same-store test sits inside the loop, but it can only ever fire on
+    /// the first pair: a reference's children always come from its own store, so
+    /// a cross-store comparison has store A on the left and store B on the right
+    /// at every level. It is kept in the loop only so the root case reads as one
+    /// rule rather than two.
     public func structurallyEquals(_ other: NodeReference) -> Bool {
         var pendingPairs: [(left: NodeReference, right: NodeReference)] = [(self, other)]
 

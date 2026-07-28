@@ -23,17 +23,23 @@ struct TypeDecoderEngine<Builder: TypeBuilder, SomeNode: DemanglingNode> {
     /// only — see ``StackBudget`` for why the real limit is remaining stack.
     private static var maxDepth: Int { StackBudget.absoluteDepthLimit }
 
-    /// Captured once per decode, on the thread that runs it.
-    private let stackBudget: StackBudget
+    /// The frame count this engine used before ``StackBudget`` existed, kept as
+    /// the fallback where a platform cannot report thread stack bounds.
+    private static var classicDecodeDepthLimit: Int { 1024 }
+
+    /// Captured at the start of each walk rather than at construction: a stack
+    /// floor is only meaningful on the thread that produced it, and the engine
+    /// is reusable.
+    private var stackBudget: StackBudget = .countingFrames(upTo: classicDecodeDepthLimit)
 
     init(builder: Builder) {
         self.builder = builder
-        self.stackBudget = .forCurrentThread()
     }
 
     /// Given a demangle tree, attempt to turn it into a type.
-    func decodeMangledType(node: SomeNode, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        try decodeMangledType(node: node, depth: 0, forRequirement: forRequirement)
+    mutating func decodeMangledType(node: SomeNode, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
+        stackBudget = .forCurrentThread(fallbackDepthLimit: Self.classicDecodeDepthLimit)
+        return try decodeMangledType(node: node, depth: 0, forRequirement: forRequirement)
     }
 }
 
@@ -1189,7 +1195,7 @@ extension TypeDecoderEngine {
 
                 // Remove any generic arguments from the context node, producing a
                 // node that references the nominal type declaration.
-                if let unspecNode = getUnspecialized(declNode) {
+                if let unspecNode = getUnspecialized(declNode, stackBudget: stackBudget) {
                     declNode = unspecNode
                 } else {
                     throw TypeLookupError("Failed to unspecialize type")
@@ -1511,14 +1517,14 @@ public final class TypeDecoder<Builder: TypeBuilder> {
 
     /// Given a demangle tree, attempt to turn it into a type.
     public func decodeMangledType(node: Node, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        try TypeDecoderEngine<Builder, Node>(builder: builder)
-            .decodeMangledType(node: node, forRequirement: forRequirement)
+        var engine = TypeDecoderEngine<Builder, Node>(builder: builder)
+        return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
     }
 
     /// Store-backed variant: decodes straight from a `NodeStore` without
     /// materializing a `Node` tree (proposal 0001, Phase 2).
     public func decodeMangledType(node: NodeReference, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        try TypeDecoderEngine<Builder, NodeReference>(builder: builder)
-            .decodeMangledType(node: node, forRequirement: forRequirement)
+        var engine = TypeDecoderEngine<Builder, NodeReference>(builder: builder)
+        return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
     }
 }

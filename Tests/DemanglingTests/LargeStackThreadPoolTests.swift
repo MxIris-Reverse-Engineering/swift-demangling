@@ -9,7 +9,7 @@ import Testing
 /// are the ones a pool makes easy to get wrong: work must never be dropped, the
 /// thread count must stay bounded, and a worker must never wait on the pool it
 /// is running on.
-@Suite("LargeStackThreadPool")
+@Suite("LargeStackThreadPool", .serialized)
 struct LargeStackThreadPoolTests {
     static let cooperativeWorkerStackSize = 512 * 1024
 
@@ -76,12 +76,13 @@ struct LargeStackThreadPoolTests {
         #expect(completionCounter.current == taskCount)
     }
 
-    /// A burst must not spawn a thread per item. The predecessor created one
+    /// A burst must not spawn a worker per item. The predecessor created one
     /// 64MB-stack `Thread` per concurrent call with no ceiling at all.
-    @Test func threadCountStaysBoundedUnderBurst() async {
-        let processorCount = ProcessInfo.processInfo.activeProcessorCount
-        let threadCountBefore = Self.liveThreadCount()
-
+    ///
+    /// Asserts on the pool's own worker count, not on a process-wide thread
+    /// count: other suites create threads concurrently, and a warm pool would
+    /// make a process-wide delta vacuously small.
+    @Test func workerCountStaysBoundedUnderBurst() async {
         await withTaskGroup(of: Void.self) { group in
             for _ in 0 ..< 500 {
                 group.addTask {
@@ -92,10 +93,10 @@ struct LargeStackThreadPoolTests {
             }
         }
 
-        let threadsCreated = Self.liveThreadCount() - threadCountBefore
-        // The pool is capped at `activeProcessorCount`; allow slack for threads
-        // the test harness itself creates.
-        #expect(threadsCreated <= processorCount + 8, "created \(threadsCreated) threads for a 500-item burst")
+        let workerCount = LargeStackThreadPool.shared.currentWorkerCount
+        let maximumWorkerCount = LargeStackThreadPool.shared.maximumWorkerCountForTesting
+        #expect(workerCount <= maximumWorkerCount, "pool grew to \(workerCount) workers, cap is \(maximumWorkerCount)")
+        #expect(workerCount > 0, "a 500-item burst should have created at least one worker")
     }
 
     /// Printing re-enters demangling for nested mangled names. On a capped pool
@@ -147,20 +148,4 @@ struct LargeStackThreadPoolTests {
         #expect(box.observedThreads.first != box.callerThread)
     }
 
-    private static func liveThreadCount() -> Int {
-        var threadList: thread_act_array_t?
-        var threadCount: mach_msg_type_number_t = 0
-        guard task_threads(mach_task_self_, &threadList, &threadCount) == KERN_SUCCESS, let threadList else {
-            return 0
-        }
-        for index in 0 ..< Int(threadCount) {
-            mach_port_deallocate(mach_task_self_, threadList[index])
-        }
-        vm_deallocate(
-            mach_task_self_,
-            vm_address_t(UInt(bitPattern: threadList)),
-            vm_size_t(Int(threadCount) * MemoryLayout<thread_t>.stride)
-        )
-        return Int(threadCount)
-    }
 }

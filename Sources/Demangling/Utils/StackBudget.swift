@@ -48,42 +48,68 @@ struct StackBudget: Sendable {
     /// leaf helper that does not itself probe.
     private static let preferredReservedBytes: UInt = 1 << 20 // 1MB
 
-    /// Backstop against a node graph that is cyclic rather than merely shared:
-    /// a cycle never approaches the stack floor in the iterative helpers, so a
-    /// frame count is still needed to break it. Set far above any depth a real
-    /// symbol can reach.
+    /// Backstop against a node graph that is cyclic rather than merely shared.
+    /// A cycle keeps the recursion at a bounded depth while growing the output
+    /// without end, so the stack floor alone would never stop it. Set far above
+    /// any depth a real symbol can reach.
+    ///
+    /// Note this bounds the *recursive* engines only. The iterative helpers
+    /// (`hashForNode`, `deepEquals`, `Node.==` / `hash(into:)`,
+    /// `internTreeUnsafe`, `internTree`, `materializeNode`,
+    /// `structurallyEquals`, `structuralHash`) grow a work list instead of a
+    /// stack and consult no limit; a genuinely cyclic graph would exhaust
+    /// memory there. Nothing in this library produces one — the demangler emits
+    /// DAGs, never cycles — but a hand-built `Node` graph could.
     static let absoluteDepthLimit = 1_000_000
 
-    /// Address the stack must not grow past, or `0` for an unlimited budget.
+    /// Address the stack must not grow past, or `0` when this budget has no
+    /// stack measurement available and falls back to counting frames.
     private let floorAddress: UInt
 
-    private init(floorAddress: UInt) {
+    /// Frame count used in place of a stack measurement when `floorAddress` is
+    /// `0`. Each engine passes the limit it used before this type existed, so a
+    /// platform without stack introspection keeps exactly its old behaviour
+    /// rather than losing its guard.
+    private let fallbackDepthLimit: Int
+
+    private init(floorAddress: UInt, fallbackDepthLimit: Int) {
         self.floorAddress = floorAddress
+        self.fallbackDepthLimit = fallbackDepthLimit
     }
 
-    /// A budget that never trips, for platforms without stack introspection.
-    static var unlimited: StackBudget {
-        StackBudget(floorAddress: 0)
+    /// A budget with no stack measurement, bounded only by `fallbackDepthLimit`.
+    ///
+    /// Used on platforms without stack introspection and when the running
+    /// thread's bounds cannot be read.
+    static func countingFrames(upTo fallbackDepthLimit: Int) -> StackBudget {
+        StackBudget(floorAddress: 0, fallbackDepthLimit: fallbackDepthLimit)
     }
 
     /// A budget derived from the calling thread's stack bounds.
     ///
     /// Call this at the top of a recursive operation, on the thread that will
-    /// run it — the bounds are per-thread, so a budget captured on one thread
-    /// is meaningless on another.
-    static func forCurrentThread() -> StackBudget {
+    /// run it — the bounds are per-thread, so a budget captured on one thread is
+    /// meaningless on another.
+    ///
+    /// - Parameter fallbackDepthLimit: frame count to fall back to where the
+    ///   thread's stack bounds cannot be read. Pass the limit the caller used
+    ///   before this type existed.
+    static func forCurrentThread(fallbackDepthLimit: Int) -> StackBudget {
         #if canImport(Darwin)
         let stackTopAddress = UInt(bitPattern: pthread_get_stackaddr_np(pthread_self()))
         let stackSize = UInt(pthread_get_stacksize_np(pthread_self()))
-        guard stackSize > 0, stackTopAddress > stackSize else { return .unlimited }
+        guard stackSize > 0, stackTopAddress > stackSize else {
+            return .countingFrames(upTo: fallbackDepthLimit)
+        }
         let stackBaseAddress = stackTopAddress - stackSize
 
-        // On a small stack a 1MB reserve would consume the whole budget, so the
-        // reserve scales down with the stack and never exceeds an eighth of it.
+        // A flat 1MB reserve would swallow a small stack whole, so it scales
+        // with the stack; the 32KB floor keeps enough room for the unwinding
+        // work even on a stack so small that an eighth of it is less than that.
         let reservedBytes = min(preferredReservedBytes, max(stackSize / 8, 32 * 1024))
-        return StackBudget(floorAddress: stackBaseAddress + reservedBytes)
+        return StackBudget(floorAddress: stackBaseAddress + reservedBytes, fallbackDepthLimit: fallbackDepthLimit)
         #else
-        return .unlimited
+        return .countingFrames(upTo: fallbackDepthLimit)
         #endif
     }
 
@@ -99,11 +125,13 @@ struct StackBudget: Sendable {
     /// keeps this callable from the type decoder's non-mutating walk.
     @inline(__always)
     func hasHeadroom(atDepth depth: Int) -> Bool {
+        guard floorAddress != 0 else {
+            // No stack measurement on this platform: behave exactly as the
+            // frame-count guard this type replaced.
+            return depth <= fallbackDepthLimit
+        }
         if depth > Self.absoluteDepthLimit {
             return false
-        }
-        guard floorAddress != 0 else {
-            return true
         }
         return Self.currentStackPointerAddress() > floorAddress
     }
