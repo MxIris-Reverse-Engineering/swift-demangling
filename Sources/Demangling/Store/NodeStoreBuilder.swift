@@ -52,7 +52,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// Interns an existing `Node` tree, returning the canonical index of its root.
     public mutating func intern(_ node: Node) -> NodeStore.NodeIndex {
         var visitedIndices = [ObjectIdentifier: UInt32]()
-        return NodeStore.NodeIndex(rawValue: internRecursively(node, visitedIndices: &visitedIndices))
+        return NodeStore.NodeIndex(rawValue: internTree(node, visitedIndices: &visitedIndices))
     }
 
     /// Demangles a mangled symbol and interns the resulting tree in one step.
@@ -117,27 +117,82 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
 
     // MARK: - Interning
 
-    private mutating func internRecursively(_ node: Node, visitedIndices: inout [ObjectIdentifier: UInt32]) -> UInt32 {
-        let identifier = ObjectIdentifier(node)
-        if let existingIndex = visitedIndices[identifier] {
+    /// One suspended level of ``internTree(_:visitedIndices:)``'s walk.
+    private struct InternFrame {
+        let node: Node
+        let identifier: ObjectIdentifier
+        var nextChildIndex: Int
+        var childIndices: [UInt32]
+    }
+
+    /// Interns a `Node` tree into the arena bottom-up.
+    ///
+    /// Walked with an explicit stack. ``demangle(_:isType:)`` runs the transient
+    /// demangle through ``StackSafeExecutor`` but calls this afterwards, on
+    /// whatever thread the caller is on — typically a 512KB cooperative worker
+    /// during bulk indexing, which is exactly where the deepest generic types
+    /// arrive. Recursion here would therefore sit outside every stack guard the
+    /// library has; measured before this was made iterative, it took the process
+    /// down at 500 levels of nesting in debug and 1200 in release.
+    private mutating func internTree(_ node: Node, visitedIndices: inout [ObjectIdentifier: UInt32]) -> UInt32 {
+        var frames: [InternFrame] = []
+        var completedChildIndex: UInt32?
+
+        func makeFrame(for node: Node) -> InternFrame {
+            var frame = InternFrame(
+                node: node,
+                identifier: ObjectIdentifier(node),
+                nextChildIndex: 0,
+                childIndices: []
+            )
+            frame.childIndices.reserveCapacity(node.children.count)
+            return frame
+        }
+
+        if let existingIndex = visitedIndices[ObjectIdentifier(node)] {
             return existingIndex
         }
+        if node.children.isEmpty {
+            let leafIndex = internLeaf(kind: node.kind, contents: node.contents)
+            visitedIndices[ObjectIdentifier(node)] = leafIndex
+            return leafIndex
+        }
+        frames.append(makeFrame(for: node))
 
-        let children = node.children
-        let internedIndex: UInt32
-        if children.isEmpty {
-            internedIndex = internLeaf(kind: node.kind, contents: node.contents)
-        } else {
-            var childIndices = [UInt32]()
-            childIndices.reserveCapacity(children.count)
-            for child in children {
-                childIndices.append(internRecursively(child, visitedIndices: &visitedIndices))
+        while var frame = frames.popLast() {
+            if let childIndex = completedChildIndex {
+                frame.childIndices.append(childIndex)
+                completedChildIndex = nil
             }
-            internedIndex = internInterior(kind: node.kind, childIndices: childIndices)
+
+            if frame.nextChildIndex < frame.node.children.count {
+                let child = frame.node.children[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                frames.append(frame)
+
+                let childIdentifier = ObjectIdentifier(child)
+                if let existingIndex = visitedIndices[childIdentifier] {
+                    completedChildIndex = existingIndex
+                } else if child.children.isEmpty {
+                    let leafIndex = internLeaf(kind: child.kind, contents: child.contents)
+                    visitedIndices[childIdentifier] = leafIndex
+                    completedChildIndex = leafIndex
+                } else {
+                    frames.append(makeFrame(for: child))
+                }
+                continue
+            }
+
+            let internedIndex = internInterior(kind: frame.node.kind, childIndices: frame.childIndices)
+            visitedIndices[frame.identifier] = internedIndex
+            if frames.isEmpty {
+                return internedIndex
+            }
+            completedChildIndex = internedIndex
         }
 
-        visitedIndices[identifier] = internedIndex
-        return internedIndex
+        // Unreachable: the loop returns as soon as the root frame completes.
+        return internLeaf(kind: node.kind, contents: node.contents)
     }
 
     private mutating func internLeaf(kind: Node.Kind, contents: Node.Contents) -> UInt32 {

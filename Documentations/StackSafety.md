@@ -90,13 +90,15 @@ Remangler 那 6 条的处理：
 
 Printer 的 `findSugar` 只沿单子 `.type` 链下降，给了一个独立的小上限。TypeDecoder 的 6 处检查全部接上护栏。
 
-### 四、顺带堵掉三条既有的全树递归
+### 四、顺带堵掉既有的全树递归
 
 它们不属于任何引擎，因此从来不在任何护栏覆盖范围内：
 
 - **`NodeCache.internTreeUnsafe`** —— 自底向上 hash-consing。`demangleAsNode` 默认 `internsSubtrees: true`，所以**每次 demangle 都会跑这趟**。改成迭代。
 - **`Node.==` / `Node.hash(into:)`** —— 公开 API，深树上无界递归。改成迭代。（哈希的访问顺序变了，但相等的树仍产生完全相同的 `combine` 序列，契约只要求这个。）
-- **store 侧四条**：`NodeStore.materializeNode`、`NodeReference.structurallyEquals` 两个重载、`NodeReference.structuralHash`。全部改成迭代。其中 `structurallyEquals(_ other: NodeReference)` 的同 store 短路现在在**每一层**生效，不只根节点。
+- **store 侧五条**：`NodeStoreBuilder.internTree`（原 `internRecursively`）、`NodeStore.materializeNode`、`NodeReference.structurallyEquals` 两个重载、`NodeReference.structuralHash`。全部改成迭代。其中 `structurallyEquals(_ other: NodeReference)` 的同 store 短路现在在**每一层**生效，不只根节点。
+
+`NodeStoreBuilder` 那条值得单独说：`demangle(_:isType:)` 把 transient demangle 交给 `StackSafeExecutor`，但**返回之后才 intern**，而 intern 跑在调用方自己的线程上。批量索引场景下那就是一条 512KB 的协作线程——恰恰是最深的泛型类型到达的地方。改成迭代之前实测：debug 下 **500 层**崩、release 下 **1200 层**崩。这个形状是 `NodeStoreBuilder.demangle` 本来就有的（不是本次改动引入），但本次把「支持深嵌套」立为目标之后，它就从边缘风险变成了必须堵的口子。
 
 ### 五、`Node` 改成迭代式析构
 

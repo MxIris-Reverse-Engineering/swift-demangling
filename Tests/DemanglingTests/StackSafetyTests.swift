@@ -149,6 +149,34 @@ struct StackSafetyTests {
         #expect(box.trees.isEmpty)
     }
 
+    /// `NodeStoreBuilder.demangle` runs the transient demangle through
+    /// `StackSafeExecutor` but interns the resulting tree afterwards, on the
+    /// caller's own thread — during bulk indexing that is a 512KB cooperative
+    /// worker, and it is precisely where the deepest generic types arrive. The
+    /// interning walk therefore has to be iterative; recursion there took the
+    /// process down at 500 levels in debug and 1200 in release.
+    @Test func storeInterningDeepTreeOnCooperativeWorkerStackNeverCrashes() {
+        final class ResultBox: @unchecked Sendable {
+            var internedNodeCounts: [Int] = []
+        }
+        let box = ResultBox()
+
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize) {
+            for nestingDepth in [200, 600, 1200, 2400] {
+                var builder = NodeStoreBuilder()
+                guard let rootIndex = try? builder.demangle(Self.deeplyNestedOptionalSymbol(nestingDepth: nestingDepth)) else {
+                    continue
+                }
+                let store = builder.freeze()
+                _ = store.reference(at: rootIndex)
+                box.internedNodeCounts.append(store.nodeCount)
+            }
+        }
+
+        #expect(box.internedNodeCounts.count == 4)
+        #expect(box.internedNodeCounts == box.internedNodeCounts.sorted(), "deeper symbols should intern more nodes")
+    }
+
     // MARK: - Deallocation
 
     /// Releasing a tree recurses once per level in the runtime, not in this

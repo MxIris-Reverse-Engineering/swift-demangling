@@ -62,7 +62,9 @@ Remangler 那 6 条的处理：`hashForNode` ↔ `entryForNode` 与 `deepEquals`
 
 ### 3. 引擎之外的全树递归
 
-不属于任何引擎、因此从不在护栏范围内的：`NodeCache.internTreeUnsafe`（每次 demangle 都跑）、`Node.==` / `hash(into:)`（公开 API）、`NodeStore.materializeNode`、`NodeReference.structurallyEquals` ×2、`NodeReference.structuralHash`。全部改成迭代。
+不属于任何引擎、因此从不在护栏范围内的：`NodeCache.internTreeUnsafe`（每次 demangle 都跑）、`NodeStoreBuilder.internTree`、`Node.==` / `hash(into:)`（公开 API）、`NodeStore.materializeNode`、`NodeReference.structurallyEquals` ×2、`NodeReference.structuralHash`。全部改成迭代。
+
+`NodeStoreBuilder` 那条是审计的盲点：`demangle(_:isType:)` 把 transient demangle 交给 `StackSafeExecutor`，intern 却在返回后跑在调用方线程上（批量索引即 512KB 协作线程）。这是该方法本来就有的形状，但在「支持深嵌套」成为目标后必须堵——改动前实测 debug 500 层崩、release 1200 层崩。
 
 ### 4. `Node` 迭代式析构
 
