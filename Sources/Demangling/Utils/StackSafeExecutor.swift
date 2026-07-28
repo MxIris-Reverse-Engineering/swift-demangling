@@ -1,83 +1,113 @@
 import Foundation
 
-/// SPI note: exposed as `@_spi(Internals)` so deep consumers driving
-/// `DemanglingPrinter` directly can reuse the same stack-safety wrapper the
-/// library uses for its own print/remangle entry points.
-/// Executes blocks with automatic stack-size safety.
+/// Runs the recursive demangling engines on a stack large enough for real
+/// symbols.
 ///
-/// On Darwin, non-main threads (including Swift Concurrency cooperative workers)
-/// default to 512KB stacks, which can cause stack overflows during deep recursion
-/// inside the demangler/remangler. This type detects insufficient remaining stack
-/// space and transparently re-dispatches the block to a dedicated 8MB-stack
-/// `Thread`. On non-Darwin platforms, the block runs directly.
+/// On Darwin every thread except the main one gets a 512KB stack — Swift
+/// Concurrency cooperative workers and libdispatch workers alike — which is
+/// enough for a few dozen levels of generic nesting. ``StackBudget`` makes
+/// running out of it a clean `<<too complex>>` / `.tooComplex` instead of a
+/// crash; this type is what makes running out of it *rare*, by moving the work
+/// onto a pooled worker with a large stack.
+///
+/// This mirrors what the Swift compiler does. `lib/Demangling` contains no
+/// stack handling at all; its callers arrange a big stack once at a task
+/// boundary — SourceKit dispatches semantic requests onto an 8MB
+/// `llvm::thread` (`Concurrency-libdispatch.cpp`), IRGen creates its worker
+/// threads with `pthread_attr_setstacksize(8MB)` — and the engines carry depth
+/// limits. The difference here is granularity: a library cannot hoist the
+/// decision to the caller's task boundary, so ``withLargeStack(_:)`` exists for
+/// callers who *can*.
+///
+/// SPI note: exposed as `@_spi(Internals)` so deep consumers driving
+/// ``DemanglingPrinter`` directly get the same treatment as the library's own
+/// entry points.
 @_spi(Internals)
 public enum StackSafeExecutor {
     #if canImport(Darwin)
-    /// Minimum stack space (in bytes) required for safe recursive operations.
+    /// Remaining stack below which work is moved to a pooled worker.
+    ///
+    /// Deliberately far above what a shallow symbol needs: the point is not to
+    /// predict whether *this* input will fit — ``StackBudget`` handles the case
+    /// where it does not — but to keep the common path off the 512KB threads
+    /// where depth would be capped at a few dozen levels.
     private static let minimumRequiredStackSize = 2 * 1024 * 1024 // 2MB
 
-    /// Stack size allocated for the dedicated large-stack thread.
-    private static let largeStackThreadSize = 8 * 1024 * 1024 // 8MB
+    /// Stack size for the pooled workers.
+    ///
+    /// A thread stack is a *virtual* reservation: only the pages the thread
+    /// actually writes to are backed by physical memory, so raising this costs
+    /// address space (abundant on 64-bit) rather than resident memory. Sized to
+    /// hold the deepest generic nesting a real symbol reaches even in an
+    /// unoptimized build, where one nesting level of the printer costs roughly
+    /// 20KB: 8MB ran out at about 400 levels, 64MB carries past 3000.
+    static let largeStackThreadSize = 64 * 1024 * 1024 // 64MB
     #endif
 
-    /// Executes the given block, switching to a large-stack thread if the
+    /// Runs `body` on a large-stack worker and returns its result.
+    ///
+    /// Use this at a batch boundary — indexing every symbol of a binary, say —
+    /// so the whole batch pays for one thread hop instead of one per call.
+    /// Every nested demangle / print / remangle inside `body` then sees a stack
+    /// with room to spare and runs inline.
+    public static func withLargeStack<Success: Sendable, Failure: Error>(
+        _ body: @escaping @Sendable () throws(Failure) -> Success
+    ) throws(Failure) -> Success {
+        #if canImport(Darwin)
+        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
+            return try body()
+        }
+        return try runOnPoolWorker(body)
+        #else
+        return try body()
+        #endif
+    }
+
+    /// Executes the given block, switching to a large-stack worker if the
     /// current thread's remaining stack space is insufficient.
     public static func execute(_ block: @escaping @Sendable () -> String) -> String {
         #if canImport(Darwin)
-        if currentThreadHasSufficientStack {
+        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
             return block()
         }
-        return executeOnLargeStackThread(block)
+        return runOnPoolWorker(block)
         #else
         return block()
         #endif
     }
 
-    /// Throwing, generic variant of ``execute(_:)``.
-    ///
-    /// Re-dispatches to a dedicated 8MB-stack `Thread` when the current thread
-    /// is about to run out of room, and propagates typed errors across the
-    /// thread boundary.
+    /// Throwing, generic variant of ``execute(_:)``, propagating typed errors
+    /// across the thread boundary.
     public static func execute<Success: Sendable, Failure: Error>(
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         #if canImport(Darwin)
-        if currentThreadHasSufficientStack {
+        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
             return try block()
         }
-        return try executeOnLargeStackThreadThrowing(block)
+        return try runOnPoolWorker(block)
         #else
         return try block()
         #endif
     }
 
-    /// Async variant that suspends the current task on a dedicated 8MB-stack
-    /// `Thread` when the current thread's remaining stack space is insufficient,
-    /// so Swift Concurrency's cooperative pool worker stays free to serve other
-    /// tasks during the wait.
-    ///
-    /// When the current thread (e.g. the main thread or an already-large stack)
-    /// has enough room, the block runs inline without spawning a thread or
-    /// suspending. Use this from async contexts when you want to avoid blocking
-    /// a cooperative worker on an OS-level semaphore.
+    /// Async variant that suspends the calling task instead of blocking a
+    /// cooperative worker on an OS-level semaphore.
     public static func executeAsync<Success: Sendable, Failure: Error & Sendable>(
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) async throws(Failure) -> Success {
         #if canImport(Darwin)
-        if currentThreadHasSufficientStack {
+        if LargeStackThreadPool.isRunningOnPoolWorker || currentThreadHasSufficientStack {
             return try block()
         }
         let outcome: Result<Success, Failure> = await withCheckedContinuation { continuation in
-            let thread = Thread {
+            LargeStackThreadPool.shared.submit {
                 do throws(Failure) {
                     continuation.resume(returning: .success(try block()))
                 } catch {
                     continuation.resume(returning: .failure(error))
                 }
             }
-            thread.stackSize = largeStackThreadSize
-            thread.qualityOfService = .userInitiated
-            thread.start()
         }
         return try outcome.get()
         #else
@@ -96,26 +126,23 @@ public enum StackSafeExecutor {
         return remainingStackSpace >= minimumRequiredStackSize
     }
 
-    private static func executeOnLargeStackThread(_ block: @escaping @Sendable () -> String) -> String {
-        nonisolated(unsafe) var result: String = ""
+    private static func runOnPoolWorker<Success: Sendable>(_ block: @escaping @Sendable () -> Success) -> Success {
+        nonisolated(unsafe) var result: Success!
         let semaphore = DispatchSemaphore(value: 0)
-        let thread = Thread {
+        LargeStackThreadPool.shared.submit {
             result = block()
             semaphore.signal()
         }
-        thread.stackSize = largeStackThreadSize
-        thread.qualityOfService = .userInitiated
-        thread.start()
         semaphore.wait()
         return result
     }
 
-    private static func executeOnLargeStackThreadThrowing<Success: Sendable, Failure: Error>(
+    private static func runOnPoolWorker<Success: Sendable, Failure: Error>(
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         nonisolated(unsafe) var outcome: Result<Success, Failure>!
         let semaphore = DispatchSemaphore(value: 0)
-        let thread = Thread {
+        LargeStackThreadPool.shared.submit {
             do throws(Failure) {
                 outcome = .success(try block())
             } catch {
@@ -123,11 +150,101 @@ public enum StackSafeExecutor {
             }
             semaphore.signal()
         }
-        thread.stackSize = largeStackThreadSize
-        thread.qualityOfService = .userInitiated
-        thread.start()
         semaphore.wait()
         return try outcome.get()
     }
     #endif
 }
+
+#if canImport(Darwin)
+/// A bounded pool of long-lived large-stack workers.
+///
+/// Creating and joining a `Thread` per call costs roughly 41µs measured on this
+/// package — five to eighteen times the work itself for a typical symbol, and
+/// seconds of pure overhead when indexing a framework. Workers are therefore
+/// created on demand and kept.
+///
+/// Three properties are load-bearing and easy to lose:
+///
+/// - **Workers never retire.** An idle-timeout retirement has a window between
+///   the timeout firing and the worker reacquiring the lock in which a
+///   submission counts it as available, creates no replacement, and signals
+///   nobody — the work item is then never run and the caller blocks forever.
+///   Keeping workers alive removes the window rather than trying to close it.
+///   Idle workers cost a kernel thread structure each; their 64MB stacks are
+///   untouched address space.
+/// - **The pool is capped**, so a burst of concurrent submissions cannot spawn
+///   an unbounded number of threads. `executeAsync` in particular returns
+///   immediately and applies no back-pressure of its own.
+/// - **A worker never waits on the pool.** Printing re-enters demangling for
+///   nested mangled names, so work submitted from a worker would block on a
+///   capped pool. ``isRunningOnPoolWorker`` makes those calls run inline
+///   instead — they are already on a large stack, which is the whole point.
+private final class LargeStackThreadPool: @unchecked Sendable {
+    static let shared = LargeStackThreadPool()
+
+    private static let threadDictionaryKey = "swift-demangling.largeStackPoolWorker"
+
+    /// Whether the calling thread is one of this pool's workers.
+    static var isRunningOnPoolWorker: Bool {
+        Thread.current.threadDictionary[threadDictionaryKey] != nil
+    }
+
+    private let maximumWorkerCount = max(2, ProcessInfo.processInfo.activeProcessorCount)
+
+    private let condition = NSCondition()
+    private var pendingWorkItems: [@Sendable () -> Void] = []
+    /// Index of the next item to run. Removing from the front of the array
+    /// instead would memmove the whole queue while holding the lock.
+    private var nextWorkItemIndex = 0
+    private var idleWorkerCount = 0
+    private var workerCount = 0
+
+    func submit(_ workItem: @escaping @Sendable () -> Void) {
+        condition.lock()
+        pendingWorkItems.append(workItem)
+        let queuedCount = pendingWorkItems.count - nextWorkItemIndex
+        let needsAdditionalWorker = queuedCount > idleWorkerCount && workerCount < maximumWorkerCount
+        if needsAdditionalWorker {
+            workerCount += 1
+        }
+        condition.signal()
+        condition.unlock()
+
+        guard needsAdditionalWorker else { return }
+
+        let thread = Thread { [self] in runWorkerLoop() }
+        thread.stackSize = StackSafeExecutor.largeStackThreadSize
+        thread.qualityOfService = .userInitiated
+        thread.name = "swift-demangling.large-stack-worker"
+        thread.start()
+    }
+
+    private func runWorkerLoop() {
+        Thread.current.threadDictionary[Self.threadDictionaryKey] = true
+
+        while true {
+            condition.lock()
+            idleWorkerCount += 1
+            while nextWorkItemIndex == pendingWorkItems.count {
+                condition.wait()
+            }
+            idleWorkerCount -= 1
+            let workItem = pendingWorkItems[nextWorkItemIndex]
+            nextWorkItemIndex += 1
+            if nextWorkItemIndex == pendingWorkItems.count {
+                pendingWorkItems.removeAll(keepingCapacity: true)
+                nextWorkItemIndex = 0
+            }
+            condition.unlock()
+
+            // Workers outlive every individual call, so without a pool an
+            // autoreleased object's release point would move from "end of the
+            // call" to "end of the process".
+            autoreleasepool {
+                workItem()
+            }
+        }
+    }
+}
+#endif

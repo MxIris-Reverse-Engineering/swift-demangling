@@ -92,42 +92,103 @@ public final class NodeStore: Sendable {
     /// once and reuses the instance, preserving the store's DAG shape.
     /// Expanding instead would multiply node count for symbols with heavy
     /// substitution sharing and defeat the printer's per-instance memoization.
-    func materializeNode(at rawIndex: UInt32) -> Node {
-        var materializedByIndex: [UInt32: Node] = [:]
-        return materializeNode(at: rawIndex, materializedByIndex: &materializedByIndex)
-    }
-
-    private func materializeNode(at rawIndex: UInt32, materializedByIndex: inout [UInt32: Node]) -> Node {
-        if let shared = materializedByIndex[rawIndex] {
-            return shared
-        }
-        let compact = compactNode(at: rawIndex)
-        let node: Node
+    /// Child indices of the node at `rawIndex`, in order.
+    private func childIndices(of compact: CompactNode) -> [UInt32] {
         switch compact.payloadKind {
-        case .none:
-            node = Node(kind: compact.kind)
-        case .index:
-            node = Node(kind: compact.kind, index: UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
-        case .text:
-            node = Node(kind: compact.kind, text: text(offset: compact.payloadWord0, length: compact.payloadWord1))
+        case .none, .index, .text:
+            return []
         case .oneChild:
-            node = Node(kind: compact.kind, children: [materializeNode(at: compact.payloadWord0, materializedByIndex: &materializedByIndex)])
+            return [compact.payloadWord0]
         case .twoChildren:
-            node = Node(kind: compact.kind, children: [
-                materializeNode(at: compact.payloadWord0, materializedByIndex: &materializedByIndex),
-                materializeNode(at: compact.payloadWord1, materializedByIndex: &materializedByIndex),
-            ])
+            return [compact.payloadWord0, compact.payloadWord1]
         case .manyChildren:
             let edgesStart = Int(compact.payloadWord0)
             let childCount = Int(compact.payloadWord1)
-            var children = [Node]()
-            children.reserveCapacity(childCount)
-            for edgeOffset in edgesStart ..< (edgesStart + childCount) {
-                children.append(materializeNode(at: edges[edgeOffset], materializedByIndex: &materializedByIndex))
-            }
-            node = Node(kind: compact.kind, children: children)
+            return (edgesStart ..< (edgesStart + childCount)).map { edges[$0] }
         }
-        materializedByIndex[rawIndex] = node
-        return node
+    }
+
+    /// Builds the `Node` for one store index from already-materialized children.
+    private func makeNode(from compact: CompactNode, children: [Node]) -> Node {
+        switch compact.payloadKind {
+        case .none:
+            return Node(kind: compact.kind)
+        case .index:
+            return Node(kind: compact.kind, index: UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
+        case .text:
+            return Node(kind: compact.kind, text: text(offset: compact.payloadWord0, length: compact.payloadWord1))
+        case .oneChild, .twoChildren, .manyChildren:
+            return Node(kind: compact.kind, children: children)
+        }
+    }
+
+    /// One suspended level of ``materializeNode(at:)``'s walk.
+    private struct MaterializeFrame {
+        let rawIndex: UInt32
+        let compact: CompactNode
+        let childIndices: [UInt32]
+        var nextChildPosition: Int
+        var materializedChildren: [Node]
+    }
+
+    /// Rebuilds a standalone `Node` tree for one store index.
+    ///
+    /// Walked with an explicit stack. This is reached from the remangling
+    /// bridge and from rich printer targets, both of which hand the result
+    /// straight to another whole-tree walk, so a recursive version would stack
+    /// two full-depth traversals of the deepest trees the store holds.
+    func materializeNode(at rawIndex: UInt32) -> Node {
+        var materializedByIndex: [UInt32: Node] = [:]
+        var frames: [MaterializeFrame] = []
+        var completedChild: Node?
+
+        func pushFrame(for index: UInt32) {
+            let compact = compactNode(at: index)
+            let indices = childIndices(of: compact)
+            var frame = MaterializeFrame(
+                rawIndex: index,
+                compact: compact,
+                childIndices: indices,
+                nextChildPosition: 0,
+                materializedChildren: []
+            )
+            frame.materializedChildren.reserveCapacity(indices.count)
+            frames.append(frame)
+        }
+
+        pushFrame(for: rawIndex)
+
+        while var frame = frames.popLast() {
+            if let child = completedChild {
+                frame.materializedChildren.append(child)
+                completedChild = nil
+            }
+
+            if frame.nextChildPosition < frame.childIndices.count {
+                let childIndex = frame.childIndices[frame.nextChildPosition]
+                frame.nextChildPosition += 1
+                frames.append(frame)
+
+                // The store is hash-consed, so a subtree referenced from several
+                // parents is one index; the memo rebuilds it once and reuses the
+                // instance, preserving the store's DAG shape.
+                if let shared = materializedByIndex[childIndex] {
+                    completedChild = shared
+                } else {
+                    pushFrame(for: childIndex)
+                }
+                continue
+            }
+
+            let node = makeNode(from: frame.compact, children: frame.materializedChildren)
+            materializedByIndex[frame.rawIndex] = node
+            if frames.isEmpty {
+                return node
+            }
+            completedChild = node
+        }
+
+        // Unreachable: the loop returns as soon as the root frame completes.
+        return Node(kind: compactNode(at: rawIndex).kind)
     }
 }

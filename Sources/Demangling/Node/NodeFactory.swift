@@ -258,39 +258,83 @@ public final class NodeCache: @unchecked Sendable {
         return internTreeUnsafe(Node(kind: kind, contents: .none, children: children))
     }
 
-    /// Recursively interns a tree bottom-up without locking (full hash-consing).
+    /// One suspended level of ``internTreeUnsafe(_:)``'s bottom-up walk.
+    private struct InternFrame {
+        let node: Node
+        var nextChildIndex: Int
+        var internedChildren: [Node]
+        var childrenChanged: Bool
+    }
+
+    /// Interns a tree bottom-up without locking (full hash-consing).
+    ///
+    /// Walked with an explicit stack rather than by recursion. This runs on
+    /// every `demangleAsNode` call that leaves `internsSubtrees` at its default,
+    /// so it is on the hot path for the deepest trees the library ever sees, and
+    /// as a whole-tree walk it sits outside every engine's stack guard.
     public func internTreeUnsafe(_ node: Node) -> Node {
-        // Leaf node: intern it
-        if node.children.isEmpty {
-            return internLeafUnsafe(kind: node.kind, contents: node.contents)
-        }
+        var frames: [InternFrame] = []
+        var completedChild: Node?
 
-        // Fast path: a stored entry can only match by identity of children if those
-        // children are already canonical, so a hit is authoritative without descending.
-        // This also makes re-interning an already-canonical subtree O(children).
-        if let existingIndex = subtreeStorage.firstIndex(of: SubtreeKey(node: node)) {
-            return subtreeStorage[existingIndex].node
-        }
-
-        // Canonicalize children bottom-up
-        var childrenChanged = false
-        var internedChildren = [Node]()
-        internedChildren.reserveCapacity(node.children.count)
-
-        for child in node.children {
-            let interned = internTreeUnsafe(child)
-            internedChildren.append(interned)
-            if interned !== child {
-                childrenChanged = true
+        func canonicalizeWithoutDescending(_ candidate: Node) -> Node? {
+            // Leaf node: intern it
+            if candidate.children.isEmpty {
+                return internLeafUnsafe(kind: candidate.kind, contents: candidate.contents)
             }
+            // Fast path: a stored entry can only match by identity of children if those
+            // children are already canonical, so a hit is authoritative without descending.
+            // This also makes re-interning an already-canonical subtree O(children).
+            if let existingIndex = subtreeStorage.firstIndex(of: SubtreeKey(node: candidate)) {
+                return subtreeStorage[existingIndex].node
+            }
+            return nil
         }
 
-        // Only reconstruct if a child was replaced by its canonical instance; the
-        // candidate is dropped again if an equivalent subtree is already stored.
-        let candidate = childrenChanged
-            ? Node(kind: node.kind, contents: node.contents, children: internedChildren)
-            : node
-        return subtreeStorage.insert(SubtreeKey(node: candidate)).memberAfterInsert.node
+        if let canonical = canonicalizeWithoutDescending(node) {
+            return canonical
+        }
+        frames.append(InternFrame(node: node, nextChildIndex: 0, internedChildren: [], childrenChanged: false))
+        frames[0].internedChildren.reserveCapacity(node.children.count)
+
+        while var frame = frames.popLast() {
+            if let interned = completedChild {
+                frame.internedChildren.append(interned)
+                if interned !== frame.node.children[frame.nextChildIndex - 1] {
+                    frame.childrenChanged = true
+                }
+                completedChild = nil
+            }
+
+            if frame.nextChildIndex < frame.node.children.count {
+                let child = frame.node.children[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                frames.append(frame)
+
+                if let canonical = canonicalizeWithoutDescending(child) {
+                    completedChild = canonical
+                } else {
+                    var childFrame = InternFrame(node: child, nextChildIndex: 0, internedChildren: [], childrenChanged: false)
+                    childFrame.internedChildren.reserveCapacity(child.children.count)
+                    frames.append(childFrame)
+                }
+                continue
+            }
+
+            // Only reconstruct if a child was replaced by its canonical instance; the
+            // candidate is dropped again if an equivalent subtree is already stored.
+            let candidate = frame.childrenChanged
+                ? Node(kind: frame.node.kind, contents: frame.node.contents, children: frame.internedChildren)
+                : frame.node
+            let canonical = subtreeStorage.insert(SubtreeKey(node: candidate)).memberAfterInsert.node
+
+            if frames.isEmpty {
+                return canonical
+            }
+            completedChild = canonical
+        }
+
+        // Unreachable: the loop returns as soon as the root frame completes.
+        return node
     }
 
     // MARK: - Cache Management

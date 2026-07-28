@@ -135,33 +135,40 @@ public struct NodeReference: Sendable {
     /// O(1) via hash-consing, while reference-to-`Node` equality walks both
     /// trees. Text payloads compare by string-table bytes first and fall back
     /// to `String` equality so Unicode canonical equivalence matches `Node.==`.
+    /// Walked with an explicit work list rather than by recursion: this is
+    /// public API over trees of arbitrary depth, called from whatever thread
+    /// the consumer's dictionary lookup happens to be on.
     public func structurallyEquals(_ node: Node) -> Bool {
-        let compact = compactNode
-        guard compact.kind == node.kind else { return false }
+        var pendingPairs: [(reference: NodeReference, node: Node)] = [(self, node)]
 
-        switch node.contents {
-        case .none:
-            switch compact.payloadKind {
-            case .index, .text:
-                return false
-            case .none, .oneChild, .twoChildren, .manyChildren:
-                break
-            }
-        case .index(let indexValue):
-            guard index == indexValue else { return false }
-        case .text(let textValue):
-            guard case .text = compact.payloadKind else { return false }
-            guard let bytes = textUTF8 else { return false }
-            if !bytes.elementsEqual(textValue.utf8) {
-                guard text == textValue else { return false }
-            }
-        }
+        while let pair = pendingPairs.popLast() {
+            let compact = pair.reference.compactNode
+            guard compact.kind == pair.node.kind else { return false }
 
-        let referenceChildren = children
-        let nodeChildren = node.children
-        guard referenceChildren.count == nodeChildren.count else { return false }
-        for (referenceChild, nodeChild) in zip(referenceChildren, nodeChildren) {
-            guard referenceChild.structurallyEquals(nodeChild) else { return false }
+            switch pair.node.contents {
+            case .none:
+                switch compact.payloadKind {
+                case .index, .text:
+                    return false
+                case .none, .oneChild, .twoChildren, .manyChildren:
+                    break
+                }
+            case .index(let indexValue):
+                guard pair.reference.index == indexValue else { return false }
+            case .text(let textValue):
+                guard case .text = compact.payloadKind else { return false }
+                guard let bytes = pair.reference.textUTF8 else { return false }
+                if !bytes.elementsEqual(textValue.utf8) {
+                    guard pair.reference.text == textValue else { return false }
+                }
+            }
+
+            let referenceChildren = pair.reference.children
+            let nodeChildren = pair.node.children
+            guard referenceChildren.count == nodeChildren.count else { return false }
+            for (referenceChild, nodeChild) in zip(referenceChildren, nodeChildren) {
+                pendingPairs.append((referenceChild, nodeChild))
+            }
         }
         return true
     }
@@ -174,33 +181,42 @@ public struct NodeReference: Sendable {
     /// subtrees. Text payloads compare by string-table bytes first and
     /// fall back to `String` equality so Unicode canonical equivalence
     /// matches `Node.==`.
+    /// Walked with an explicit work list rather than by recursion, for the same
+    /// reason as the `Node` overload. The same-store shortcut now applies at
+    /// every level, not only at the root: a shared subtree cuts the walk short
+    /// as soon as it is reached.
     public func structurallyEquals(_ other: NodeReference) -> Bool {
-        if store === other.store {
-            return nodeIndex == other.nodeIndex
-        }
-        let compact = compactNode
-        let otherCompact = other.compactNode
-        guard compact.kind == otherCompact.kind else { return false }
+        var pendingPairs: [(left: NodeReference, right: NodeReference)] = [(self, other)]
 
-        switch (compact.payloadKind, otherCompact.payloadKind) {
-        case (.text, .text):
-            guard let bytes = textUTF8, let otherBytes = other.textUTF8 else { return false }
-            if !bytes.elementsEqual(otherBytes) {
-                guard text == other.text else { return false }
+        while let pair = pendingPairs.popLast() {
+            if pair.left.store === pair.right.store {
+                guard pair.left.nodeIndex == pair.right.nodeIndex else { return false }
+                continue
             }
-        case (.index, .index):
-            guard index == other.index else { return false }
-        case (.text, _), (_, .text), (.index, _), (_, .index):
-            return false
-        default:
-            break
-        }
+            let compact = pair.left.compactNode
+            let otherCompact = pair.right.compactNode
+            guard compact.kind == otherCompact.kind else { return false }
 
-        let selfChildren = children
-        let otherChildren = other.children
-        guard selfChildren.count == otherChildren.count else { return false }
-        for (selfChild, otherChild) in zip(selfChildren, otherChildren) {
-            guard selfChild.structurallyEquals(otherChild) else { return false }
+            switch (compact.payloadKind, otherCompact.payloadKind) {
+            case (.text, .text):
+                guard let bytes = pair.left.textUTF8, let otherBytes = pair.right.textUTF8 else { return false }
+                if !bytes.elementsEqual(otherBytes) {
+                    guard pair.left.text == pair.right.text else { return false }
+                }
+            case (.index, .index):
+                guard pair.left.index == pair.right.index else { return false }
+            case (.text, _), (_, .text), (.index, _), (_, .index):
+                return false
+            default:
+                break
+            }
+
+            let selfChildren = pair.left.children
+            let otherChildren = pair.right.children
+            guard selfChildren.count == otherChildren.count else { return false }
+            for (selfChild, otherChild) in zip(selfChildren, otherChildren) {
+                pendingPairs.append((selfChild, otherChild))
+            }
         }
         return true
     }
@@ -237,23 +253,31 @@ extension NodeReference: Hashable {
     /// a node's structure while storing a `NodeReference` (whose intrinsic
     /// `Hashable` is store-identity based and would split structurally
     /// equal keys from different stores).
+    /// Walked with an explicit stack, mirroring ``Node/hash(into:)``. The visit
+    /// order differs from a recursive implementation, but structurally equal
+    /// subtrees still produce an identical sequence of `combine` calls, which
+    /// is all the hash/equality contract requires.
     public func structuralHash(into hasher: inout Hasher) {
-        let compact = compactNode
-        hasher.combine(compact.kind)
-        switch compact.payloadKind {
-        case .text:
-            hasher.combine(1)
-            hasher.combine(text)
-        case .index:
-            hasher.combine(2)
-            hasher.combine(index)
-        case .none, .oneChild, .twoChildren, .manyChildren:
-            hasher.combine(0)
-        }
-        let childrenView = children
-        hasher.combine(childrenView.count)
-        for child in childrenView {
-            child.structuralHash(into: &hasher)
+        var pendingReferences: [NodeReference] = [self]
+
+        while let reference = pendingReferences.popLast() {
+            let compact = reference.compactNode
+            hasher.combine(compact.kind)
+            switch compact.payloadKind {
+            case .text:
+                hasher.combine(1)
+                hasher.combine(reference.text)
+            case .index:
+                hasher.combine(2)
+                hasher.combine(reference.index)
+            case .none, .oneChild, .twoChildren, .manyChildren:
+                hasher.combine(0)
+            }
+            let childrenView = reference.children
+            hasher.combine(childrenView.count)
+            for child in childrenView {
+                pendingReferences.append(child)
+            }
         }
     }
 }

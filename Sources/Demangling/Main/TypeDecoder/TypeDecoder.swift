@@ -18,10 +18,17 @@ struct TypeDecoderEngine<Builder: TypeBuilder, SomeNode: DemanglingNode> {
 
     private let builder: Builder
 
-    private static var maxDepth: Int { 1024 }
+    /// The frame count that used to bound the decode recursion, mirroring
+    /// ``swift::Demangle::TypeDecoder::MaxDepth``. Retained as a cycle backstop
+    /// only — see ``StackBudget`` for why the real limit is remaining stack.
+    private static var maxDepth: Int { StackBudget.absoluteDepthLimit }
+
+    /// Captured once per decode, on the thread that runs it.
+    private let stackBudget: StackBudget
 
     init(builder: Builder) {
         self.builder = builder
+        self.stackBudget = .forCurrentThread()
     }
 
     /// Given a demangle tree, attempt to turn it into a type.
@@ -38,7 +45,7 @@ extension TypeDecoderEngine {
         depth: Int,
         forRequirement: Bool = true
     ) throws(TypeLookupError) -> BuiltType {
-        guard depth <= Self.maxDepth else {
+        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
             throw TypeLookupError("Mangled type is too complex")
         }
 
@@ -1012,7 +1019,7 @@ extension TypeDecoderEngine {
         depth: Int,
         results: inout [T]
     ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
-        guard depth <= Self.maxDepth else {
+        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
             throw TypeLookupError("Depth exceeded")
         }
 
@@ -1063,7 +1070,7 @@ extension TypeDecoderEngine {
         depth: Int,
         results: inout [T]
     ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
-        guard depth <= Self.maxDepth else {
+        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
             throw TypeLookupError("Depth exceeded")
         }
 
@@ -1128,7 +1135,7 @@ extension TypeDecoderEngine {
         parent: inout BuiltType?,
         typeAlias: inout Bool
     ) throws(TypeLookupError) {
-        guard depth <= Self.maxDepth else {
+        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
             throw TypeLookupError("Mangled type is too complex")
         }
 
@@ -1197,7 +1204,7 @@ extension TypeDecoderEngine {
     }
 
     private func decodeMangledProtocolType(node: SomeNode, depth: Int) -> BuiltProtocolDecl? {
-        guard depth <= Self.maxDepth else {
+        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
             return nil
         }
 
@@ -1231,7 +1238,7 @@ extension TypeDecoderEngine {
         params: inout [FunctionParam<BuiltType>],
         hasParamFlags: inout Bool
     ) throws(TypeLookupError) {
-        guard depth <= Self.maxDepth else {
+        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
             return
         }
 

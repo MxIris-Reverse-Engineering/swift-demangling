@@ -14,12 +14,22 @@
 /// deeply nested symbols.
 @_spi(Internals)
 public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: Sendable {
-    /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth`` from
-    /// ``swift/include/swift/Demangling/Demangle.h``. Bails the print
-    /// recursion with ``<<too complex>>`` once a single root-to-leaf path
-    /// would exceed this many ``printName`` frames, matching the C++ guard
-    /// at ``swift/lib/Demangling/NodePrinter.cpp:1416``.
+    /// The frame count that used to bound the print recursion, mirroring
+    /// ``swift::Demangle::NodePrinter::MaxDepth``.
+    ///
+    /// No longer the guard: a frame count cannot be right for a debug build, a
+    /// release build and both `DemanglingNode` specializations at once, and
+    /// calibrated for release it rejected legitimate deeply nested generics
+    /// long before the stack was anywhere near full. ``StackBudget`` measures
+    /// the stack directly instead. Kept only so existing callers that read it
+    /// still compile.
+    @available(*, deprecated, message: "The print recursion is bounded by remaining stack, not by a frame count. See StackBudget.")
     public static var maxPrintDepth: Int { 768 }
+
+    /// Bound for ``findSugar(_:depth:)``, the only print recursion that does
+    /// not converge on ``printName(_:asPrefixContext:)``. Sugar wrappers are a
+    /// handful of nodes deep in any tree the demangler produces.
+    static var maxSugarWrapperDepth: Int { 64 }
 
     private var target: Target
     private var specializationPrefixPrinted: Bool
@@ -27,6 +37,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     private var hidingCurrentModule: String = ""
     private var dependentMemberTypeDepth: Int = 0
     private var printDepth: Int = 0
+    /// Bounds the recursion by remaining stack rather than by frame count.
+    /// Re-derived at every ``printRoot(_:)`` so a reused printer instance never
+    /// inherits an exhausted budget from a previous walk.
+    private var stackBudget: StackBudget = .unlimited
     /// Memoizes the rendered fragment for each shared substitution node.
     /// The demangler returns the same ``SomeNode`` instance for every
     /// back-reference (``A23_`` etc.), so one mangling can produce a DAG
@@ -46,12 +60,18 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     public mutating func printRoot(_ root: SomeNode) -> Target {
+        stackBudget = .forCurrentThread()
         _ = printName(root)
         return target
     }
 
     private mutating func printName(_ name: SomeNode, asPrefixContext: Bool = false) -> SomeNode? {
-        if printDepth > Self.maxPrintDepth {
+        guard stackBudget.hasHeadroom(atDepth: printDepth) else {
+            // Matches the C++ printer's behaviour when it hits `MaxDepth`: emit
+            // the marker in place and unwind this path only. Unlike a frame
+            // count this fires only when the stack really is about to run out,
+            // so on a large-stack worker a legitimately deep generic prints in
+            // full.
             target.write("<<too complex>>")
             return nil
         }
@@ -2070,9 +2090,14 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         printChildren(typeList, prefix: "<", suffix: ">", separator: ", ")
     }
 
-    private func findSugar(_ name: SomeNode) -> SugarType {
+    /// The one recursion in this engine that does not pass back through
+    /// ``printName(_:asPrefixContext:)``, so it carries its own bound: it walks
+    /// single-child `.type` wrappers, which a well-formed tree never nests
+    /// deeply, but a malformed one could.
+    private func findSugar(_ name: SomeNode, depth: Int = 0) -> SugarType {
+        guard depth <= Self.maxSugarWrapperDepth else { return .none }
         guard let firstChild = name.children.at(0) else { return .none }
-        if name.children.count == 1, firstChild.kind == .type { return findSugar(firstChild) }
+        if name.children.count == 1, firstChild.kind == .type { return findSugar(firstChild, depth: depth + 1) }
 
         guard name.kind == .boundGenericEnum || name.kind == .boundGenericStructure else { return .none }
         guard let secondChild = name.children.at(1) else { return .none }
@@ -2227,7 +2252,8 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 /// `NodeReference` trees straight from a `NodeStore` without materializing
 /// a class tree (see `NodeReference.print(using:)`).
 public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
-    public static var maxPrintDepth: Int { DemanglingPrinter<Target, Node>.maxPrintDepth }
+    @available(*, deprecated, message: "The print recursion is bounded by remaining stack, not by a frame count. See StackBudget.")
+    public static var maxPrintDepth: Int { 768 }
 
     private var engine: DemanglingPrinter<Target, Node>
 

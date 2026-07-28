@@ -241,6 +241,21 @@ For one-off demangling where the cache should not grow, opt out per call:
 let node = try demangleAsNode(symbol, internsSubtrees: false)
 ```
 
+### Deep Generic Nesting and Thread Stacks
+
+Recursion in the printer, remangler, and type decoder is bounded by **remaining stack space**, not by a fixed frame count. Deeply nested generic types — the concrete type behind a `some View` body, for example — print and remangle in full rather than degrading to `<<too complex>>` at an arbitrary depth, and running out of stack produces that marker (or a `.tooComplex` error) instead of crashing the process, in every build configuration.
+
+On Darwin every thread except the main one gets a 512KB stack, which only covers a few dozen levels of nesting. Calls made from such a thread are automatically moved onto a pooled worker with a large stack. When you are about to make many calls, wrap the batch so it pays for that hop once:
+
+```swift
+// One thread hop for the whole batch; every call inside runs inline.
+let results = StackSafeExecutor.withLargeStack {
+    symbols.map { try? demangleAsNode($0) }
+}
+```
+
+`withLargeStack` requires `@_spi(Internals) import Demangling`. If you drive the demangler from threads you create yourself, setting `stackSize` to 64MB has the same effect — the library detects the headroom and never hops.
+
 ### Bulk Demangling with NodeStore
 
 When demangling a whole binary and keeping every result, `NodeStore` stores nodes in a flat arena instead of as individual class instances: 12 bytes per node, no object header, no reference counting, no per-node allocation. Build with `NodeStoreBuilder`, then `freeze()` into an immutable, `Sendable` store:

@@ -37,6 +37,56 @@ public final class Node: Sendable, Codable {
     @usableFromInline
     nonisolated(unsafe) var payload: Payload
 
+    /// Releases the subtree without recursing.
+    ///
+    /// Deallocating a tree of reference-typed nodes normally recurses: releasing
+    /// the root releases its children, whose deinit releases theirs, one frame
+    /// per level. That happens wherever the last reference dies — typically a
+    /// 512KB cooperative-pool thread, which was measured to overflow at around
+    /// 620 levels — and no amount of stack budgeting inside the engines can
+    /// cover it, because it is the runtime doing the releasing, not this
+    /// library.
+    ///
+    /// Instead the root moves its children into an explicit work list and drains
+    /// it. A node is only dismantled when this is the last reference to it;
+    /// otherwise it stays alive and must keep its children. Because every
+    /// uniquely-referenced node has had its children moved out before it is
+    /// released, its own `deinit` finds nothing to descend into.
+    deinit {
+        switch payload {
+        case .none, .index, .text:
+            return
+        case .oneChild, .twoChildren, .manyChildren:
+            break
+        }
+
+        var pendingNodes = ContiguousArray<Node>()
+        moveChildrenOut(into: &pendingNodes)
+        while var node = pendingNodes.popLast() {
+            if isKnownUniquelyReferenced(&node) {
+                node.moveChildrenOut(into: &pendingNodes)
+            }
+        }
+    }
+
+    /// Detaches this node's children, appending them to `collected`.
+    private func moveChildrenOut(into collected: inout ContiguousArray<Node>) {
+        switch payload {
+        case .none, .index, .text:
+            return
+        case .oneChild(let onlyChild):
+            payload = .none
+            collected.append(onlyChild)
+        case .twoChildren(let firstChild, let secondChild):
+            payload = .none
+            collected.append(firstChild)
+            collected.append(secondChild)
+        case .manyChildren(let allChildren):
+            payload = .none
+            collected.append(contentsOf: allChildren)
+        }
+    }
+
     /// The contents of this node (text, index, or none).
     @inlinable
     public var contents: Contents {
