@@ -95,6 +95,31 @@ public struct NodeReference: Sendable {
         return bytes.elementsEqual(expectedUTF8)
     }
 
+    /// The contents in exactly the form ``Node/contents`` reports them.
+    ///
+    /// Sharing `Node.Contents` rather than re-encoding the payload by hand is
+    /// what keeps ``structuralHash(into:)`` in step with ``Node/hash(into:)``:
+    /// the two hand-written encodings disagreed on the discriminator values, so
+    /// structurally equal trees hashed differently and the documented
+    /// dictionary-lookup use of ``structurallyEquals(_:)-(Node)`` could never
+    /// find anything.
+    ///
+    /// Note this deliberately does not use ``text``, which synthesizes a name
+    /// for `.dependentGenericParamType`; that node stores its depth and index
+    /// as children, so `Node` reports `.none` for it and so must this.
+    @usableFromInline
+    var nodeContents: Node.Contents {
+        let compact = compactNode
+        switch compact.payloadKind {
+        case .text:
+            return .text(store.text(offset: compact.payloadWord0, length: compact.payloadWord1))
+        case .index:
+            return .index(UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
+        case .none, .oneChild, .twoChildren, .manyChildren:
+            return .none
+        }
+    }
+
     /// The index contents, if this node carries an index.
     public var index: UInt64? {
         let compact = compactNode
@@ -253,10 +278,13 @@ extension NodeReference: Hashable {
     /// stores: structurally equal references — even from different stores —
     /// produce the same hash.
     ///
-    /// This is the building block for value types that key dictionaries by
-    /// a node's structure while storing a `NodeReference` (whose intrinsic
-    /// `Hashable` is store-identity based and would split structurally
-    /// equal keys from different stores).
+    /// It agrees with ``Node/hash(into:)`` as well, which is what the
+    /// documented use requires: a value type keying a dictionary by node
+    /// structure while storing a `NodeReference` (whose intrinsic `Hashable` is
+    /// store-identity based) has to be findable with a `Node` demangled
+    /// elsewhere. Both sides feed the hasher a `Node.Contents`, so the two can
+    /// no longer drift apart the way two hand-written payload encodings did.
+    ///
     /// Walked with an explicit stack, mirroring ``Node/hash(into:)``. The visit
     /// order differs from a recursive implementation, but structurally equal
     /// subtrees still produce an identical sequence of `combine` calls, which
@@ -265,18 +293,8 @@ extension NodeReference: Hashable {
         var pendingReferences: [NodeReference] = [self]
 
         while let reference = pendingReferences.popLast() {
-            let compact = reference.compactNode
-            hasher.combine(compact.kind)
-            switch compact.payloadKind {
-            case .text:
-                hasher.combine(1)
-                hasher.combine(reference.text)
-            case .index:
-                hasher.combine(2)
-                hasher.combine(reference.index)
-            case .none, .oneChild, .twoChildren, .manyChildren:
-                hasher.combine(0)
-            }
+            hasher.combine(reference.kind)
+            hasher.combine(reference.nodeContents)
             let childrenView = reference.children
             hasher.combine(childrenView.count)
             for child in childrenView {

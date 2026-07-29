@@ -66,7 +66,22 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         self.options = options
     }
 
+    /// Prints `root` and returns the finished target.
+    ///
+    /// Every piece of walk state is reset here, not just the stack budget.
+    /// A printer is a reusable value, and each of these carried the previous
+    /// walk into the next one: the target appended the second symbol to the
+    /// first, the fragment cache replayed the first symbol's output for a
+    /// colliding key, and the "specialized " latch stayed set so the second
+    /// symbol silently lost its prefix. The cache key is where it bit hardest
+    /// — on the store path it is a per-store node index, and index 0 of one
+    /// store means nothing in another.
     public mutating func printRoot(_ root: SomeNode) -> Target {
+        target = Target()
+        printCache.removeAll(keepingCapacity: true)
+        specializationPrefixPrinted = false
+        dependentMemberTypeDepth = 0
+        printDepth = 0
         stackBudget = .forCurrentThread(fallbackDepthLimit: Self.classicPrintDepthLimit)
         stackBailCount = 0
         _ = printName(root)
@@ -328,7 +343,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .functionSignatureSpecializationParamKind: printFunctionSignatureSpecializationParamKind(name)
         case .functionSignatureSpecializationParamPayload:
             if let text = name.text {
-                let demangledName = (try? demangleAsNode(text))?.print(using: options) ?? ""
+                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: options) ?? ""
                 if demangledName.isEmpty {
                     target.write(text)
                 } else {
@@ -824,7 +839,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             switch kind {
             case .constantPropInteger, .constantPropFloat:
                 guard let text = child.text else { return }
-                let demangledName = (try? demangleAsNode(text))?.print(using: options) ?? ""
+                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: options) ?? ""
                 if demangledName.isEmpty {
                     target.write(text)
                 } else {
@@ -838,7 +853,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                 _ = printName(child)
             case .constantPropFunction, .constantPropGlobal:
                 let text = child.text ?? ""
-                let demangledName = (try? demangleAsNode(text))?.print(using: options) ?? ""
+                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: options) ?? ""
                 if demangledName.isEmpty {
                     target.write(text)
                 } else {
@@ -1442,10 +1457,17 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         _ = printOptional(name.children.at(idx + 3), prefix: " with ")
     }
 
+    // The two force unwraps these replaced were the only ones left in the
+    // printer. The demangler always gives these nodes a child, but a tree built
+    // through `Node.createTransient`, `NodeStoreBuilder.intern(kind:)` or a
+    // `Node.Rewriter` need not — and `.showAsyncResumePartial`, which is what
+    // reaches them, is part of `.default`.
     private mutating func printAsyncAwaitResumePartialFunction(_ name: SomeNode) {
         if options.contains(.showAsyncResumePartial) {
             target.write("(")
-            _ = printName(name.children.first!)
+            if let child = name.children.first {
+                _ = printName(child)
+            }
             target.write(")")
             target.write(" await resume partial function for ")
         }
@@ -1454,7 +1476,9 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     private mutating func printAsyncSuspendResumePartialFunction(_ name: SomeNode) {
         if options.contains(.showAsyncResumePartial) {
             target.write("(")
-            _ = printName(name.children.first!)
+            if let child = name.children.first {
+                _ = printName(child)
+            }
             target.write(")")
             target.write(" suspend resume partial function for ")
         }
@@ -1463,22 +1487,28 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     private mutating func printExtendedExistentialTypeShape(_ name: SomeNode) {
         let savedDisplayWhereClauses = options.contains(.displayWhereClauses)
         options.insert(.displayWhereClauses)
-        var genSig: SomeNode?
-        var type: SomeNode?
+        // Children live at 0 and 1 — that is where `demangleExtendedExistentialShape`
+        // puts them, and where `createWithChildren` puts them in the C++
+        // demangler. The C++ printer reads 1 and 2, which prints the requirement
+        // signature in the type position and leaves the type itself null; this
+        // port deliberately diverges from it, because `<null node pointer>` is
+        // not usable output for a tool that displays symbols.
+        var genericSignature: SomeNode?
+        var shapeType: SomeNode?
         if name.children.count == 2 {
-            genSig = name.children.at(1)
-            type = name.children.at(2)
+            genericSignature = name.children.at(0)
+            shapeType = name.children.at(1)
         } else {
-            type = name.children.at(1)
+            shapeType = name.children.at(0)
         }
         target.write("existential shape for ")
-        if let genSig {
-            _ = printName(genSig)
+        if let genericSignature {
+            _ = printName(genericSignature)
             target.write(" ")
         }
         target.write("any ")
-        if let type {
-            _ = printName(type)
+        if let shapeType {
+            _ = printName(shapeType)
         } else {
             target.write("<null node pointer>")
         }

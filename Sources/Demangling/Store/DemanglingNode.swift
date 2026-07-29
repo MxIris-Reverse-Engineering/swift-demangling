@@ -11,8 +11,9 @@ public protocol DemanglingNode: Sendable {
 
     /// A per-tree-node identity used to memoize shared subtrees while printing.
     /// For `Node` this is `ObjectIdentifier`; for `NodeReference` it is the
-    /// store index. It must be equal exactly when two handles denote the same
-    /// shared node within a single traversal.
+    /// reference itself, which hashes as store identity plus index — the store
+    /// half matters, because every store numbers its nodes from zero. It must
+    /// be equal exactly when two handles denote the same shared node.
     associatedtype PrintCacheIdentity: Hashable & Sendable
 
     var kind: Node.Kind { get }
@@ -26,6 +27,14 @@ public protocol DemanglingNode: Sendable {
     /// that still require `Node` (`TypeBuilder` handoffs, remangling until the
     /// `Remangler` is genericized). `Node` returns itself; `NodeReference`
     /// materializes with subtree sharing preserved.
+    ///
+    /// - Important: the result is canonical only on the `Node` path.
+    ///   `NodeReference` builds a fresh, non-interned tree on every access, so
+    ///   two reads of the *same* store index are equal but not `===`. Anything
+    ///   downstream that memoizes what it receives — a `TypeBuilder` caching
+    ///   declarations, a rich `NodePrinterTarget` grouping scopes — must key on
+    ///   structure, never on `ObjectIdentifier` or `===`, or it will treat one
+    ///   declaration as many.
     var materializedNode: Node { get }
 
     /// Requirements (with derived defaults) so representations can provide
@@ -83,7 +92,22 @@ extension DemanglingNode {
         kind == .module && text == stdlibName
     }
 
+    /// Whether this type prints without needing parentheses around it.
+    ///
+    /// `.type` wrappers are unwrapped with a loop rather than by recursing.
+    /// They nest only once or twice in anything the demangler builds, but this
+    /// is public API reachable from a caller-assembled tree, and it sits
+    /// outside every engine's stack guard.
     public var isSimpleType: Bool {
+        var currentNode = self
+        while currentNode.kind == .type {
+            guard let onlyChild = currentNode.children.first else { return false }
+            currentNode = onlyChild
+        }
+        return currentNode.isSimpleTypeIgnoringTypeWrappers
+    }
+
+    private var isSimpleTypeIgnoringTypeWrappers: Bool {
         switch kind {
         case .associatedType,
              .associatedTypeRef,
@@ -131,8 +155,6 @@ extension DemanglingNode {
              .typeList,
              .typeSymbolicReference:
             return true
-        case .type:
-            return children.first.map(\.isSimpleType) ?? false
         case .protocolList:
             return children.first.map { $0.children.count <= 1 } ?? false
         case .protocolListWithAnyObject:
@@ -142,10 +164,20 @@ extension DemanglingNode {
         }
     }
 
+    /// Whether a space belongs between a preceding keyword and this type.
+    ///
+    /// Unwraps `.type` with a loop, for the same reason as ``isSimpleType``.
     public var needSpaceBeforeType: Bool {
+        var currentNode = self
+        while currentNode.kind == .type {
+            guard let onlyChild = currentNode.children.first else { return false }
+            currentNode = onlyChild
+        }
+        return currentNode.needSpaceBeforeTypeIgnoringTypeWrappers
+    }
+
+    private var needSpaceBeforeTypeIgnoringTypeWrappers: Bool {
         switch kind {
-        case .type:
-            return children.first?.needSpaceBeforeType ?? false
         case .functionType,
              .noEscapeFunctionType,
              .uncurriedFunctionType,
@@ -208,8 +240,12 @@ extension NodeReference: DemanglingNode {
         return false
     }
 
+    /// The whole reference, not just the index: an index is only meaningful
+    /// relative to its store, and every store numbers from zero. `NodeReference`
+    /// already hashes as store identity plus index, which is exactly the
+    /// identity a cache key needs.
     @inlinable
-    public var printCacheIdentity: NodeStore.NodeIndex { nodeIndex }
+    public var printCacheIdentity: NodeReference { self }
 
     @inlinable
     public var materializedNode: Node { materialize() }

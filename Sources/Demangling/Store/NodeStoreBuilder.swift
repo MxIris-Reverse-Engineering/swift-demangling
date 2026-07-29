@@ -90,9 +90,13 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// Hash-consing is shared with every other insertion route: constructing
     /// a node directly and interning a structurally equal `Node` tree yield
     /// the same index.
+    /// - Precondition: every child index is within this builder's bounds. As
+    ///   with ``NodeStore/reference(at:)`` a `NodeIndex` carries no record of
+    ///   which builder minted it, so an in-range index from another builder
+    ///   resolves silently to a different node; only the bound can be checked.
     public mutating func intern(kind: Node.Kind, children: [NodeStore.NodeIndex]) -> NodeStore.NodeIndex {
         let childIndices = children.map { childIndex in
-            precondition(Int(childIndex.rawValue) < nodes.count, "Child index does not belong to this builder")
+            precondition(Int(childIndex.rawValue) < nodes.count, "Child index out of range for this builder")
             return childIndex.rawValue
         }
         if childIndices.isEmpty {

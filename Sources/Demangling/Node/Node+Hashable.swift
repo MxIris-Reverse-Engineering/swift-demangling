@@ -31,6 +31,18 @@ extension Node: Hashable {
         }
     }
 
+    /// Hashes this subtree by structure, the `Node` half of the pair whose
+    /// other half is ``NodeReference/structuralHash(into:)``.
+    ///
+    /// `Node`'s own `hash(into:)` is already structural, so this is a spelling
+    /// that makes the symmetry visible at the call site: a dictionary keyed by
+    /// node structure can hash `Node` and `NodeReference` keys the same way and
+    /// look one up with the other.
+    @inlinable
+    public func structuralHash(into hasher: inout Hasher) {
+        hash(into: &hasher)
+    }
+
     /// Structural equality over the whole subtree.
     ///
     /// Walked with an explicit work list for the same reason as

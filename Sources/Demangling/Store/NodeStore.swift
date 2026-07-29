@@ -65,6 +65,12 @@ public final class NodeStore: Sendable {
     // MARK: - Access
 
     /// Returns a reference to the node at the given index.
+    ///
+    /// - Precondition: `nodeIndex` is within this store's bounds. A
+    ///   `NodeIndex` is a bare offset with no record of which store minted it,
+    ///   so an index from a *different* store that happens to be in range
+    ///   resolves silently to whatever node lives there. Only the bound can be
+    ///   checked; keeping indices with their store is the caller's job.
     public func reference(at nodeIndex: NodeIndex) -> NodeReference {
         precondition(Int(nodeIndex.rawValue) < nodes.count, "NodeIndex out of range for this store")
         return NodeReference(store: self, nodeIndex: nodeIndex)

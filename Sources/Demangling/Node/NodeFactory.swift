@@ -339,6 +339,19 @@ public final class NodeCache: @unchecked Sendable {
 
     // MARK: - Cache Management
 
+    /// Whether a leaf with this kind and contents is already canonical here,
+    /// without making it so.
+    ///
+    /// Every other way of asking is a mutation: `intern` builds and stores the
+    /// leaf on a miss, and `count` is a shared counter that concurrent work
+    /// moves. Tests that assert a code path left the global cache alone need a
+    /// question that is both read-only and specific to one leaf.
+    func containsCanonicalLeaf(kind: Node.Kind, contents: Node.Contents) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return leafStorage[LeafKey(kind: kind, contents: contents)] != nil
+    }
+
     /// Clears all cached nodes.
     /// Call this when you're done processing a binary to free memory.
     public func clear() {

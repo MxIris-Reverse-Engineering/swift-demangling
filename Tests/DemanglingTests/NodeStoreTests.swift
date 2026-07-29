@@ -460,4 +460,65 @@ struct NodeReferenceInterningConvenienceTests {
         #expect(firstIndex == secondIndex)
         #expect(store.reference(at: firstIndex).structurallyEquals(store.reference(at: secondIndex)))
     }
+
+    /// The documented use for `structurallyEquals(_ node: Node)` is finding an
+    /// externally demangled `Node` among `NodeReference` dictionary keys. That
+    /// only works if the two representations also *hash* alike: a key whose
+    /// hash comes from `structuralHash` and whose equality comes from
+    /// `structurallyEquals` lands in a different bucket than the `Node` looking
+    /// for it if the two encode their payloads differently.
+    @Test func structuralHashAgreesWithNodeHash() throws {
+        let mangledStrings = [
+            "$sSiD",
+            "$sSaySiGD",
+            "$sS2iIegyd_D",
+            "$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC",
+            "$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc",
+        ]
+
+        for mangled in mangledStrings {
+            let tree = try demangleAsNodeTransient(mangled)
+            let reference = NodeReference(interning: tree)
+            #expect(reference.structurallyEquals(tree), "structural equality broke for \(mangled)")
+
+            var referenceHasher = Hasher()
+            reference.structuralHash(into: &referenceHasher)
+            var nodeHasher = Hasher()
+            tree.hash(into: &nodeHasher)
+            #expect(referenceHasher.finalize() == nodeHasher.finalize(), "structural hash diverged for \(mangled)")
+        }
+    }
+
+    /// Store-backed printing is documented as touching no global state, and
+    /// bulk indexers rely on it: a whole binary printed through
+    /// `NodeReference.print` must not grow `NodeCache.shared` without bound.
+    /// The nested-mangled-name path went through the *public* `demangleAsNode`,
+    /// which interns by default.
+    @Test func storeBackedPrintingDoesNotPopulateTheGlobalCache() throws {
+        // A payload whose text is itself a mangled name is what sends the
+        // printer back through the demangler mid-walk. The module name is
+        // deliberately unique to this test so the probe below cannot collide
+        // with a symbol another suite demangles concurrently — asserting on
+        // `NodeCache.shared.count` would be a race, asserting on one specific
+        // leaf is not.
+        let probeModuleName = "ZzStorePrintProbe"
+        let payloadNode = Node.createTransient(
+            kind: .functionSignatureSpecializationParamPayload,
+            text: "$s\(probeModuleName.count)\(probeModuleName)1TVD"
+        )
+        let reference = NodeReference(interning: payloadNode)
+
+        #expect(
+            !NodeCache.shared.containsCanonicalLeaf(kind: .module, contents: .text(probeModuleName)),
+            "the probe module name must not already be canonical, or this test proves nothing"
+        )
+
+        let printed = reference.print(using: .default)
+        #expect(printed == "\(probeModuleName).T", "the nested mangled name should still be demangled for display")
+
+        #expect(
+            !NodeCache.shared.containsCanonicalLeaf(kind: .module, contents: .text(probeModuleName)),
+            "store-backed printing interned its nested mangled name into NodeCache.shared"
+        )
+    }
 }

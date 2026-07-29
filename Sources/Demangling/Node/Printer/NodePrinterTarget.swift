@@ -20,6 +20,15 @@ public protocol NodePrinterTarget: Sendable {
     /// scope identity (rich targets) should pay that cost. Targets that
     /// ignore scopes (`String`, the default implementation) never evaluate
     /// the autoclosure, keeping the plain-text store path allocation-free.
+    ///
+    /// - Important: the parameter is `@autoclosure () -> Node?`, **not**
+    ///   `Node?`. An implementation written against the earlier `Node?`
+    ///   signature does not satisfy this requirement, so the no-op default
+    ///   below silently takes its place: the printed text stays byte-identical
+    ///   and every scope event disappears. Nothing warns about this — Swift has
+    ///   no diagnostic for a near-miss witness when a default exists — and a
+    ///   text-comparison snapshot test cannot see it either. If a rich target
+    ///   stops receiving scopes, check this signature first.
     mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?)
     mutating func popTypeReferenceScope()
 }
