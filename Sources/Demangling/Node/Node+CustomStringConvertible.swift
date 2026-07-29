@@ -3,8 +3,10 @@ extension Node: CustomStringConvertible {
     public var description: String {
         StackSafeExecutor.execute {
             var string = ""
-            self.printNode(output: &string, node: self)
-            string.removeLast() // Remove the last newline
+            self.appendDebugDescription(to: &string)
+            if !string.isEmpty {
+                string.removeLast() // Remove the last newline
+            }
             return string
         }
     }
@@ -32,20 +34,30 @@ extension Node: CustomStringConvertible {
         }
     }
 
-    private func printNode(output: inout String, node: Node, depth: Int = 0) {
-        (0 ..< (depth * 2)).forEach { _ in output.append(" ") }
-        output.append("kind=\(node.kind)")
-        switch node.contents {
-        case .none:
-            break
-        case .index(let index):
-            output.append(", index=\(index)")
-        case .text(let name):
-            output.append(", text=\"\(name)\"")
-        }
-        output.append("\n")
-        for child in node.children {
-            printNode(output: &output, node: child, depth: depth + 1)
+    /// Depth-first preorder dump, one line per node, indented by depth.
+    ///
+    /// Walked with an explicit stack: `description` is reachable from a
+    /// debugger, a log statement or an assertion message on any tree from any
+    /// thread, which is the one place a per-level frame is least affordable.
+    private func appendDebugDescription(to output: inout String) {
+        var pendingNodes: [(node: Node, depth: Int)] = [(self, 0)]
+
+        while let pending = pendingNodes.popLast() {
+            output.append(String(repeating: " ", count: pending.depth * 2))
+            output.append("kind=\(pending.node.kind)")
+            switch pending.node.contents {
+            case .none:
+                break
+            case .index(let index):
+                output.append(", index=\(index)")
+            case .text(let name):
+                output.append(", text=\"\(name)\"")
+            }
+            output.append("\n")
+            // Reversed so the stack pops them back into source order.
+            for child in pending.node.children.reversed() {
+                pendingNodes.append((child, pending.depth + 1))
+            }
         }
     }
 }

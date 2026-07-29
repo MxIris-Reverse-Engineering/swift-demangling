@@ -14,15 +14,6 @@ struct Remangler {
     /// Capacity of inline substitution array (avoids heap allocation for common case)
     private static let inlineSubstCapacity = 16
 
-    /// The frame count that used to bound the mangling recursion, mirroring
-    /// ``swift::Demangle::Remangler::MaxDepth``.
-    ///
-    /// No longer the guard — see ``StackBudget`` for why a frame count cannot
-    /// be right for every build configuration at once. Retained as a cycle
-    /// backstop only, and raised accordingly: the real limit is remaining
-    /// stack.
-    private static let maxDepth = StackBudget.absoluteDepthLimit
-
     /// The frame count this engine used before ``StackBudget`` existed, kept as
     /// the fallback where a platform cannot report thread stack bounds.
     static let classicMangleDepthLimit = 1024
@@ -2448,7 +2439,7 @@ extension Remangler {
             }
 
             // Get unspecialized version
-            guard let unboundType = getUnspecialized(node, stackBudget: stackBudget) else {
+            guard let unboundType = getUnspecialized(node) else {
                 throw .invalidNodeStructure(node, message: "Cannot get unspecialized type")
             }
 
@@ -2530,7 +2521,7 @@ extension Remangler {
         }
 
         // Get unspecialized function
-        guard let unboundFunction = getUnspecialized(node, stackBudget: stackBudget) else {
+        guard let unboundFunction = getUnspecialized(node) else {
             throw .invalidNodeStructure(node, message: "Cannot get unspecialized function")
         }
 
@@ -6013,108 +6004,151 @@ extension Node {
 /// Strips the generic arguments off a nominal/context chain.
 ///
 /// Unlike ``isSpecialized(_:)`` this rebuilds nodes as it unwinds, so it cannot
-/// be a loop. It is reached from `mangleAnyNominalType` without passing back
-/// through `mangle(_:depth:)`, so it probes the stack itself rather than
-/// trusting a frame count — the walk follows parent contexts and allocates an
-/// array per level, and a frame count cannot say how much stack that costs.
-func getUnspecialized(_ node: Node, depth: Int = 0, stackBudget: StackBudget) -> Node? {
-    guard stackBudget.hasHeadroom(atDepth: depth) else { return nil }
-    var numToCopy = 2
+/// be a plain loop; it carries its own stack of pending reconstructions
+/// instead. Written recursively it was reached from `mangleAnyNominalType`
+/// without passing back through `mangle(_:depth:)`, which put it outside every
+/// guard the remangler had — and adding a stack probe made things worse rather
+/// than better, because the resulting `nil` was indistinguishable from "this
+/// node cannot be unspecialized". Callers turn that `nil` into
+/// `.invalidNodeStructure`, so a depth problem was reported as a malformed
+/// tree and `.tooComplex` was unreachable on this path. With no recursion there
+/// is no depth to run out of, and `nil` means exactly one thing again.
+func getUnspecialized(_ node: Node) -> Node? {
+    /// A node whose unspecialized form can only be built once its parent
+    /// context has been unspecialized.
+    enum PendingRebuild {
+        case context(node: Node, childrenToCopy: Int)
+        case extensionNode(Node)
+    }
 
-    switch node.kind {
-    case .function,
-         .getter,
-         .setter,
-         .willSet,
-         .didSet,
-         .readAccessor,
-         .modifyAccessor,
-         .unsafeAddressor,
-         .unsafeMutableAddressor,
-         .allocator,
-         .constructor,
-         .destructor,
-         .variable,
-         .subscript,
-         .explicitClosure,
-         .implicitClosure,
-         .initializer,
-         .propertyWrapperBackingInitializer,
-         .propertyWrapperInitFromProjectedValue,
-         .defaultArgumentInitializer,
-         .static:
-        numToCopy = node.children.count
-        fallthrough
-
-    case .structure,
-         .enum,
-         .class,
-         .typeAlias,
-         .otherNominalType:
-        guard node.children.count > 0 else { return nil }
-
-        var resultChildren: [Node] = []
-        var parentOrModule = node.children[0]
-        if isSpecialized(parentOrModule) {
-            guard let unspec = getUnspecialized(parentOrModule, depth: depth + 1, stackBudget: stackBudget) else { return nil }
-            parentOrModule = unspec
-        }
-        resultChildren.append(parentOrModule)
-        for idx in 1 ..< numToCopy {
-            if idx < node.children.count {
-                resultChildren.append(node.children[idx])
-            }
-        }
-        return Node(kind: node.kind, children: resultChildren)
-
-    case .boundGenericStructure,
-         .boundGenericEnum,
-         .boundGenericClass,
-         .boundGenericProtocol,
-         .boundGenericOtherNominalType,
-         .boundGenericTypeAlias:
-        guard node.children.count > 0 else { return nil }
-        let unboundType = node.children[0]
-        guard unboundType.kind == .type, unboundType.children.count > 0 else { return nil }
-        let nominalType = unboundType.children[0]
-        if isSpecialized(nominalType) {
-            return getUnspecialized(nominalType, depth: depth + 1, stackBudget: stackBudget)
-        }
-        return nominalType
-
-    case .constrainedExistential:
-        guard node.children.count > 0 else { return nil }
-        let unboundType = node.children[0]
-        guard unboundType.kind == .type else { return nil }
-        return unboundType
-
-    case .boundGenericFunction:
-        guard node.children.count > 0 else { return nil }
-        let unboundFunction = node.children[0]
-        guard unboundFunction.kind == .function || unboundFunction.kind == .constructor else {
+    /// How many of a context node's children survive unspecialization, or
+    /// `nil` if this kind is not a context chain at all.
+    func contextChildrenToCopy(_ contextNode: Node) -> Int? {
+        switch contextNode.kind {
+        case .function,
+             .getter,
+             .setter,
+             .willSet,
+             .didSet,
+             .readAccessor,
+             .modifyAccessor,
+             .unsafeAddressor,
+             .unsafeMutableAddressor,
+             .allocator,
+             .constructor,
+             .destructor,
+             .variable,
+             .subscript,
+             .explicitClosure,
+             .implicitClosure,
+             .initializer,
+             .propertyWrapperBackingInitializer,
+             .propertyWrapperInitFromProjectedValue,
+             .defaultArgumentInitializer,
+             .static:
+            return contextNode.children.count
+        case .structure,
+             .enum,
+             .class,
+             .typeAlias,
+             .otherNominalType:
+            return 2
+        default:
             return nil
         }
-        if isSpecialized(unboundFunction) {
-            return getUnspecialized(unboundFunction, depth: depth + 1, stackBudget: stackBudget)
-        }
-        return unboundFunction
-
-    case .extension:
-        guard node.children.count >= 2 else { return nil }
-        let parent = node.children[1]
-        if !isSpecialized(parent) {
-            return node
-        }
-        guard let unspec = getUnspecialized(parent, depth: depth + 1, stackBudget: stackBudget) else { return nil }
-        var resultChildren: [Node] = [node.children[0], unspec]
-        if node.children.count == 3 {
-            resultChildren.append(node.children[2])
-        }
-        return Node(kind: .extension, children: resultChildren)
-
-    default:
-        return nil
     }
+
+    func rebuiltContext(_ contextNode: Node, parentOrModule: Node, childrenToCopy: Int) -> Node {
+        var resultChildren: [Node] = [parentOrModule]
+        for childIndex in 1 ..< max(childrenToCopy, 1) where childIndex < contextNode.children.count {
+            resultChildren.append(contextNode.children[childIndex])
+        }
+        return Node(kind: contextNode.kind, children: resultChildren)
+    }
+
+    var pendingRebuilds: [PendingRebuild] = []
+    var currentNode = node
+    var unspecializedNode: Node
+
+    descend: while true {
+        if let childrenToCopy = contextChildrenToCopy(currentNode) {
+            guard let parentOrModule = currentNode.children.first else { return nil }
+            if isSpecialized(parentOrModule) {
+                pendingRebuilds.append(.context(node: currentNode, childrenToCopy: childrenToCopy))
+                currentNode = parentOrModule
+                continue descend
+            }
+            unspecializedNode = rebuiltContext(currentNode, parentOrModule: parentOrModule, childrenToCopy: childrenToCopy)
+            break descend
+        }
+
+        switch currentNode.kind {
+        case .boundGenericStructure,
+             .boundGenericEnum,
+             .boundGenericClass,
+             .boundGenericProtocol,
+             .boundGenericOtherNominalType,
+             .boundGenericTypeAlias:
+            guard let unboundType = currentNode.children.first,
+                  unboundType.kind == .type,
+                  let nominalType = unboundType.children.first
+            else {
+                return nil
+            }
+            if isSpecialized(nominalType) {
+                currentNode = nominalType
+                continue descend
+            }
+            unspecializedNode = nominalType
+            break descend
+
+        case .constrainedExistential:
+            guard let unboundType = currentNode.children.first, unboundType.kind == .type else { return nil }
+            unspecializedNode = unboundType
+            break descend
+
+        case .boundGenericFunction:
+            guard let unboundFunction = currentNode.children.first,
+                  unboundFunction.kind == .function || unboundFunction.kind == .constructor
+            else {
+                return nil
+            }
+            if isSpecialized(unboundFunction) {
+                currentNode = unboundFunction
+                continue descend
+            }
+            unspecializedNode = unboundFunction
+            break descend
+
+        case .extension:
+            guard currentNode.children.count >= 2 else { return nil }
+            let parent = currentNode.children[1]
+            if !isSpecialized(parent) {
+                unspecializedNode = currentNode
+                break descend
+            }
+            pendingRebuilds.append(.extensionNode(currentNode))
+            currentNode = parent
+            continue descend
+
+        default:
+            return nil
+        }
+    }
+
+    while let pendingRebuild = pendingRebuilds.popLast() {
+        switch pendingRebuild {
+        case .context(let contextNode, let childrenToCopy):
+            unspecializedNode = rebuiltContext(contextNode, parentOrModule: unspecializedNode, childrenToCopy: childrenToCopy)
+        case .extensionNode(let extensionNode):
+            var resultChildren: [Node] = [extensionNode.children[0], unspecializedNode]
+            if extensionNode.children.count == 3 {
+                resultChildren.append(extensionNode.children[2])
+            }
+            unspecializedNode = Node(kind: .extension, children: resultChildren)
+        }
+    }
+    return unspecializedNode
 }
 
 /// Whether `node` — or the context chain it hangs off — is a specialized

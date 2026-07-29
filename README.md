@@ -245,7 +245,7 @@ let node = try demangleAsNode(symbol, internsSubtrees: false)
 
 Recursion in the printer, remangler, and type decoder is bounded by **remaining stack space**, not by a fixed frame count. Deeply nested generic types — the concrete type behind a `some View` body, for example — print and remangle in full rather than degrading to `<<too complex>>` at an arbitrary depth, and running out of stack produces that marker (or a `.tooComplex` error) instead of crashing the process, in every build configuration.
 
-On Darwin every thread except the main one gets a 512KB stack, which only covers a few dozen levels of nesting. Calls made from such a thread are automatically moved onto a pooled worker with a large stack. When you are about to make many calls, wrap the batch so it pays for that hop once:
+On Darwin every thread except the main one gets a 512KB stack, which only covers a few dozen levels of nesting — and the main thread's 8MB is not much better in an unoptimized build. Calls are therefore moved onto a pooled worker with a large stack unless the calling thread already has one, so the result does not depend on which thread produced it. When you are about to make many calls, wrap the batch so it pays for that hop once:
 
 ```swift
 // One thread hop for the whole batch; every call inside runs inline.
@@ -286,7 +286,9 @@ The builder hash-conses on insert, so structurally equal subtrees collapse to on
 Interop with the `Node` API stays available in both directions — `builder.intern(existingNode)` imports a tree, and `reference.materialize()` rebuilds a standalone one:
 
 ```swift
+var builder = NodeStoreBuilder()
 let index = builder.intern(try demangleAsNode(symbol))
+let store = builder.freeze()          // `freeze()` consumes the builder
 let node = store.reference(at: index).materialize()
 ```
 

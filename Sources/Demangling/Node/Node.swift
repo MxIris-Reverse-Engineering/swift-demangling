@@ -148,10 +148,44 @@ public final class Node: Sendable, Codable {
         self.payload = Self.mergedPayload(contents: contents, children: inlineChildren)
     }
 
+    /// A deep copy of this subtree: every node is rebuilt, nothing is shared
+    /// with the original.
+    ///
+    /// Walked with an explicit stack. This is public API over trees of
+    /// arbitrary depth, `NodeBuilder` runs it while holding its lock, and it
+    /// sits outside every engine, so no depth parameter can ever reach it — the
+    /// same reason ``Node/deinit`` tears trees down iteratively.
     public func copy() -> Node {
-        let copiedChildren = Children(children.map { $0.copy() })
-        return Node(kind: kind, contents: contents, inlineChildren: copiedChildren)
+        var frames: [RebuildFrame] = [RebuildFrame(source: self)]
+        var completedNode: Node?
+
+        while var frame = frames.popLast() {
+            if let finishedChild = completedNode {
+                frame.rebuiltChildren.append(finishedChild)
+                completedNode = nil
+            }
+            let sourceChildren = frame.source.children
+            if frame.nextChildIndex < sourceChildren.count {
+                let nextChild = sourceChildren[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                frames.append(frame)
+                frames.append(RebuildFrame(source: nextChild))
+                continue
+            }
+            completedNode = Node(kind: frame.source.kind, contents: frame.source.contents, inlineChildren: frame.rebuiltChildren)
+        }
+
+        // The loop only ends once the root frame has been completed.
+        return completedNode ?? self
     }
+}
+
+/// One node's in-progress reconstruction, for the iterative whole-tree
+/// rebuilds (``Node/copy()`` and ``Node/replacingDescendant(_:with:)``).
+private struct RebuildFrame {
+    let source: Node
+    var nextChildIndex: Int = 0
+    var rebuiltChildren = Node.Children()
 }
 
 extension Node {
@@ -315,12 +349,36 @@ extension Node {
 
     /// Returns a new tree with the descendant node replaced.
     /// If `old` is not found in the tree, returns a copy of self.
+    ///
+    /// Walked with an explicit stack for the same reason as ``copy()``.
     func replacingDescendant(_ old: Node, with new: Node) -> Node {
         if self === old {
             return new
         }
-        let newChildren = children.map { $0.replacingDescendant(old, with: new) }
-        return Node(kind: kind, contents: contents, children: newChildren)
+        var frames: [RebuildFrame] = [RebuildFrame(source: self)]
+        var completedNode: Node?
+
+        while var frame = frames.popLast() {
+            if let finishedChild = completedNode {
+                frame.rebuiltChildren.append(finishedChild)
+                completedNode = nil
+            }
+            let sourceChildren = frame.source.children
+            if frame.nextChildIndex < sourceChildren.count {
+                let nextChild = sourceChildren[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                frames.append(frame)
+                if nextChild === old {
+                    completedNode = new
+                } else {
+                    frames.append(RebuildFrame(source: nextChild))
+                }
+                continue
+            }
+            completedNode = Node(kind: frame.source.kind, contents: frame.source.contents, inlineChildren: frame.rebuiltChildren)
+        }
+
+        return completedNode ?? self
     }
 }
 

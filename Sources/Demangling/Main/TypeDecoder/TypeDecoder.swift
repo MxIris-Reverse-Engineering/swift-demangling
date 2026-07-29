@@ -1195,7 +1195,7 @@ extension TypeDecoderEngine {
 
                 // Remove any generic arguments from the context node, producing a
                 // node that references the nominal type declaration.
-                if let unspecNode = getUnspecialized(declNode, stackBudget: stackBudget) {
+                if let unspecNode = getUnspecialized(declNode) {
                     declNode = unspecNode
                 } else {
                     throw TypeLookupError("Failed to unspecialize type")

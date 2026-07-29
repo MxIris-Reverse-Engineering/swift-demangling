@@ -200,20 +200,113 @@ struct StackSafetyTests {
     /// `internsSubtrees` at its default, and it is a whole-tree walk that no
     /// engine guard covers.
     @Test func interningDeepTreeOnCooperativeWorkerStackNeverCrashes() {
-        let box = TreeBox()
+        final class ResultBox: @unchecked Sendable {
+            var trees: [Node] = []
+            var internedDepthCount = 0
+            var everyRepeatDemangleWasCanonical = true
+        }
+        let box = ResultBox()
+        let nestingDepths = [200, 600, 1200]
 
         Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize) {
-            for nestingDepth in [200, 600, 1200] {
-                if let tree = try? demangleAsNode(Self.deeplyNestedOptionalSymbol(nestingDepth: nestingDepth), internsSubtrees: true) {
-                    box.trees.append(tree)
+            for nestingDepth in nestingDepths {
+                let mangled = Self.deeplyNestedOptionalSymbol(nestingDepth: nestingDepth)
+                guard let firstTree = try? demangleAsNode(mangled, internsSubtrees: true),
+                      let secondTree = try? demangleAsNode(mangled, internsSubtrees: true)
+                else {
+                    continue
                 }
+                // Surviving the walk is only half of it: the walk exists to
+                // canonicalize, so the same symbol has to come back as the same
+                // instance. An iterative rewrite that silently stopped
+                // canonicalizing would pass a bare "did not crash" assertion.
+                box.everyRepeatDemangleWasCanonical = box.everyRepeatDemangleWasCanonical && (firstTree === secondTree)
+                box.internedDepthCount += 1
+                box.trees.append(firstTree)
             }
-            box.completed = true
         }
         Self.runOnThread(stackSize: Self.hostStackSize) { box.trees.removeAll() }
 
+        #expect(box.internedDepthCount == nestingDepths.count, "every depth should have interned")
+        #expect(box.everyRepeatDemangleWasCanonical, "interning must return the canonical instance")
+    }
+
+    /// `Node.copy()` and `Node.replacingDescendant(_:with:)` are public
+    /// whole-tree recursions outside every engine, and `NodeBuilder` runs both
+    /// while holding its lock. Nothing about them is reachable from a depth
+    /// parameter, so they have to be iterative for the same reason
+    /// `Node.deinit` is.
+    @Test func copyingAndRewritingDeepTreeOnCooperativeWorkerStackNeverCrashes() {
+        final class ResultBox: @unchecked Sendable {
+            var copyMatchedOriginal = false
+            var replacementTookEffect = false
+            var completed = false
+        }
+        let box = ResultBox()
+        let treeBox = TreeBox()
+
+        Self.runOnThread(stackSize: Self.hostStackSize) {
+            treeBox.trees.append(try! demangleAsNode(Self.deeplyNestedOptionalSymbol(nestingDepth: 2400), internsSubtrees: false))
+        }
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize) {
+            let tree = treeBox.trees[0]
+
+            let copiedTree = tree.copy()
+            box.copyMatchedOriginal = copiedTree == tree && copiedTree !== tree
+
+            var deepestInteriorNode = tree
+            while let firstChild = deepestInteriorNode.children.first, !firstChild.children.isEmpty {
+                deepestInteriorNode = firstChild
+            }
+            let rewrittenTree = tree.replacingDescendant(deepestInteriorNode, with: NodeFactory.emptyList)
+            box.replacementTookEffect = rewrittenTree != tree
+
+            treeBox.trees.append(copiedTree)
+            treeBox.trees.append(rewrittenTree)
+            box.completed = true
+        }
+        Self.runOnThread(stackSize: Self.hostStackSize) { treeBox.trees.removeAll() }
+
         #expect(box.completed)
-        #expect(box.trees.isEmpty)
+        #expect(box.copyMatchedOriginal, "copy() must produce a structurally equal, distinct tree")
+        #expect(box.replacementTookEffect, "replacingDescendant must actually replace")
+    }
+
+    /// `Node.Rewriter` is public, is not routed through a large-stack worker,
+    /// and carries no depth parameter — the same position `Node.copy()` was in.
+    @Test func rewritingDeepTreeOnCooperativeWorkerStackNeverCrashes() {
+        /// Renames every identifier, so the rewrite rebuilds the whole spine
+        /// rather than short-circuiting on unchanged children.
+        final class IdentifierRenamingRewriter: Node.Rewriter, @unchecked Sendable {
+            var visitCount = 0
+            override func visit(_ node: Node) -> Node {
+                visitCount += 1
+                guard node.kind == .identifier, let text = node.text else { return node }
+                return Node.createTransient(kind: .identifier, text: text + "_renamed")
+            }
+        }
+
+        final class ResultBox: @unchecked Sendable {
+            var visitCount = 0
+            var rewrittenRootKind: Node.Kind?
+        }
+        let box = ResultBox()
+        let treeBox = TreeBox()
+
+        Self.runOnThread(stackSize: Self.hostStackSize) {
+            treeBox.trees.append(try! demangleAsNode(Self.deeplyNestedOptionalSymbol(nestingDepth: 2400), internsSubtrees: false))
+        }
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize) {
+            let rewriter = IdentifierRenamingRewriter()
+            let rewrittenTree = rewriter.rewrite(treeBox.trees[0])
+            box.visitCount = rewriter.visitCount
+            box.rewrittenRootKind = rewrittenTree.kind
+            treeBox.trees.append(rewrittenTree)
+        }
+        Self.runOnThread(stackSize: Self.hostStackSize) { treeBox.trees.removeAll() }
+
+        #expect(box.rewrittenRootKind == .global)
+        #expect(box.visitCount > 2400, "every node should have been visited")
     }
 
     /// `NodeStoreBuilder.demangle` runs the transient demangle through

@@ -1,36 +1,66 @@
+/// One node's in-progress rewrite.
+private struct RewriteFrame {
+    let originalNode: Node
+    var nextChildIndex: Int = 0
+    var rewrittenChildren: [Node] = []
+    var hasChildrenChanged: Bool = false
+}
+
 extension Node {
     open class Rewriter {
         public init() {}
 
+        /// Rewrites the subtree bottom-up, calling ``visit(_:)`` on each node
+        /// after its children have been rewritten.
+        ///
+        /// Walked with an explicit stack. This is public API over a tree of
+        /// arbitrary depth, it is not routed through a large-stack worker, and
+        /// no engine budget covers it — recursion here took the process down at
+        /// around 600 levels on the 512KB stack a `Task` runs on. Making it
+        /// iterative changes nothing a subclass can observe: `rewrite` is
+        /// `final`, only ``visit(_:)`` is `open`, and the visit order is the
+        /// same post-order it always was.
         public final func rewrite(_ node: Node) -> Node {
-            let originalChildren = node.children
-            var newChildren: [Node] = []
-            newChildren.reserveCapacity(originalChildren.count)
+            var frames: [RewriteFrame] = [RewriteFrame(originalNode: node)]
+            frames[0].rewrittenChildren.reserveCapacity(node.children.count)
+            var completedNode: Node?
 
-            var hasChildrenChanged = false
-
-            for child in originalChildren {
-                let rewrittenChild = rewrite(child)
-                newChildren.append(rewrittenChild)
-
-                if rewrittenChild !== child {
-                    hasChildrenChanged = true
+            while var frame = frames.popLast() {
+                if let rewrittenChild = completedNode {
+                    let originalChild = frame.originalNode.children[frame.nextChildIndex - 1]
+                    frame.rewrittenChildren.append(rewrittenChild)
+                    if rewrittenChild !== originalChild {
+                        frame.hasChildrenChanged = true
+                    }
+                    completedNode = nil
                 }
+
+                let originalChildren = frame.originalNode.children
+                if frame.nextChildIndex < originalChildren.count {
+                    let nextChild = originalChildren[frame.nextChildIndex]
+                    frame.nextChildIndex += 1
+                    frames.append(frame)
+                    var childFrame = RewriteFrame(originalNode: nextChild)
+                    childFrame.rewrittenChildren.reserveCapacity(nextChild.children.count)
+                    frames.append(childFrame)
+                    continue
+                }
+
+                let nodeToVisit: Node
+                if frame.hasChildrenChanged {
+                    nodeToVisit = Node(
+                        kind: frame.originalNode.kind,
+                        contents: frame.originalNode.contents,
+                        children: frame.rewrittenChildren
+                    )
+                } else {
+                    nodeToVisit = frame.originalNode
+                }
+                completedNode = visit(nodeToVisit)
             }
 
-            let nodeToVisit: Node
-
-            if hasChildrenChanged {
-                nodeToVisit = Node(
-                    kind: node.kind,
-                    contents: node.contents,
-                    children: newChildren
-                )
-            } else {
-                nodeToVisit = node
-            }
-
-            return visit(nodeToVisit)
+            // The loop only ends once the root frame has been visited.
+            return completedNode ?? node
         }
 
         open func visit(_ node: Node) -> Node {

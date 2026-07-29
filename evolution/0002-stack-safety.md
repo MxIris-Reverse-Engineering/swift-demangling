@@ -62,7 +62,7 @@ Remangler 那 6 条的处理：`hashForNode` ↔ `entryForNode` 与 `deepEquals`
 
 ### 3. 引擎之外的全树递归
 
-不属于任何引擎、因此从不在护栏范围内的：`NodeCache.internTreeUnsafe`（每次 demangle 都跑）、`NodeStoreBuilder.internTree`、`Node.==` / `hash(into:)`（公开 API）、`NodeStore.materializeNode`、`NodeReference.structurallyEquals` ×2、`NodeReference.structuralHash`。全部改成迭代。
+不属于任何引擎、因此从不在护栏范围内的：`NodeCache.internTreeUnsafe`（每次 demangle 都跑）、`NodeStoreBuilder.internTree`、`Node.==` / `hash(into:)`（公开 API）、`Node.copy()` / `replacingDescendant(_:with:)`（公开，且经 `NodeBuilder` 进入时在持锁期间递归）、`Node.Rewriter.rewrite`、`Node.description` 的树转储、`NodeStore.materializeNode`、`NodeReference.structurallyEquals` ×2、`NodeReference.structuralHash`、`getUnspecialized`、`DemanglingNode.isSimpleType` / `needSpaceBeforeType`。全部改成迭代。
 
 `NodeStoreBuilder` 那条是审计的盲点：`demangle(_:isType:)` 把 transient demangle 交给 `StackSafeExecutor`，intern 却在返回后跑在调用方线程上（批量索引即 512KB 协作线程）。这是该方法本来就有的形状，但在「支持深嵌套」成为目标后必须堵——改动前实测 debug 500 层崩、release 1200 层崩。
 
@@ -78,18 +78,36 @@ Remangler 那 6 条的处理：`hashForNode` ↔ `entryForNode` 与 `deepEquals`
 
 ### 6. 线程池重做
 
-原来每次调用新建 `Thread` 再 join，实测每次约 41 µs。新池子三条承重性质：worker 不退休（消除「空闲超时退休窗口丢任务」）；池子有上限（`activeProcessorCount`）；worker 绝不等待池子（线程本地标记，嵌套调用内联跑，避免有上限的池子死锁）。队列头指针出队；每个 work item 包 `autoreleasepool`。
+原来每次调用新建 `Thread` 再 join，实测每次约 41 µs。新池子四条承重性质：
+
+1. **worker 不退休** —— 消除「空闲超时退休窗口丢任务」。
+2. **先建线程再排队，且检查建线程是否成功** —— 用 `pthread_create`（有返回码）而不是 `Thread.start()`（无返回码）。原来的顺序在 `pthread_create` 失败时会留下永久占名额的幽灵 worker，任务无人认领、调用方永久阻塞，而且因为名额已占，之后所有提交都不再补线程——进程级单例被一次失败永久毒化。
+3. **提交可以被拒绝** —— 被拒的任务由调用方自己跑，`StackBudget` 兜底。这是所有失败模式「降级而不是挂死」的落点。
+4. **worker 绝不等待池子** —— 线程本地 `pthread_key_t` 标记（`pthread_key_create` 的返回值同样检查；拿不到 key 就整体禁用池子），嵌套调用内联跑。
+
+上限：常规增长到 `max(2, activeProcessorCount)`；**阻塞式**提交额外获得到 `max(32, 4 ×)` 的额度，用于打破「worker 扇出到别的线程、内外互等」的环（异步提交挂起时不占线程，不可能参与这种环，守在常规上限内）。队列头指针出队，**出队时清空槽位**（否则持续突发下已执行完的闭包全部存活，而它们捕获着整棵 `Node` 树）；每个 work item 包 `autoreleasepool`。
 
 ### 7. `StackSafeExecutor.withLargeStack(_:)`
 
 对应上游 SourceKit 的 `isStackDeep`：批量场景在最外层包一次，内部全部内联，往返开销归零。
 
+### 8. 内联判据改成 worker 栈大小
+
+原来的判据是「当前线程剩余栈 ≥ 2MB 就内联跑」。这让主线程的 8MB 永远内联、保留自己那个低得多的深度上限，而 512KB 协作线程反而被搬到 64MB worker 上——**栈越大能力越差**，同一棵 1000 层的树在 debug 下从 `Task` 里完整输出、从主线程返回 `<<too complex>>`；新加的 `withLargeStack` 从主线程调用完全空转。判据改成 worker 自己的栈大小后，契约是「无论从哪条线程调用，都在至少一个 worker 那么大的栈上跑」。代价是主线程单次调用多一次往返（约 6 µs 量级）。
+
+`TypeDecoder` 的公开入口这一轮补上了 `StackSafeExecutor`（此前是三个引擎里唯一漏掉的，512KB 线程上 200 层就报 `too complex`）。因为 `TypeBuilder` 与其构建的类型都无 `Sendable` 约束，走新增的 `executeWithUncheckedSendability`：调用方全程阻塞，是严格交接。
+
 ## Impact
 
-- `NodePrinter.maxPrintDepth` 标记 deprecated；`Remangler.maxDepth` / `TypeDecoder.maxDepth` 提高到兜底值。
+- `NodePrinter.maxPrintDepth` 标记 deprecated；`TypeDecoder.maxDepth` 提高到兜底值；`Remangler.maxDepth` 已无引用，删除。
 - 行为变化：以前返回 `<<too complex>>` / `.tooComplex` 的深符号现在多数正常输出。
 - `Node.==` / `hash(into:)` 遍历顺序变化（哈希值本就不跨进程稳定）。
-- 非 Darwin 平台退化为 unlimited，行为与改动前一致。
+- 非 Darwin 平台退化为帧计数（取各引擎改动前用的那个数），行为与改动前一致。
+- 主线程单次调用多一次线程往返，换来「结果与调用线程无关」。
+- `NodeReference.structuralHash` 编码改为与 `Node.hash(into:)` 一致；`Node` 增加同名别名 `structuralHash(into:)`。
+- `extendedExistentialTypeShape` 的打印修正子节点索引（有意与上游的 off-by-one 分歧）。
+- store 打印路径不再通过公开 `demangleAsNode` 污染 `NodeCache.shared`。
+- `DemanglingPrinter` / `NodePrinter` 可安全复用：`printRoot` 重置全部逐次状态；store 路径的 fragment 缓存键改为整个 `NodeReference`。
 
 ## Results
 
@@ -111,5 +129,8 @@ Remangler 那 6 条的处理：`hashForNode` ↔ `entryForNode` 与 `deepEquals`
 
 ## Future Work
 
-- `Node.Rewriter.visit` 仍是递归。它是 `open class`，改迭代会改变可重写点语义，需单独评估。
+- `Demangler` 的 `setParentForOpaqueReturnTypeNodesImpl` / `demangleBoundGenericArgs` 与 `demangleSwift3*` 环仍是递归。它们在 `demangleAsNode` 内部、因而跑在 worker 上，现实深度下不崩，但失败模式是崩溃而非报错。`Demangler` 是唯一没有 depth 参数的引擎，接护栏要单独引入状态。
+- **`TypeBuilder` 在 store 路径上的身份记忆化**：`NodeReference.materializedNode` 每次访问都重建一棵全新的非 interned 树，所以按 `ObjectIdentifier` 记忆化的 builder 会把同一个 decl 重复创建；`decodeMangledTypeDecl` 每层 context 也各 materialize 一次。已在 `DemanglingNode.materializedNode` 的文档里写明「必须按结构做键，不能按身份」，与 printer 的 scope hook 同一条规则。要真正消除需要在引擎里加一层按 store 索引的 materialize 记忆表，本轮未做。
+- 同时阻塞的调用方超过突发上限时仍会排队，理论上仍可构造出扇出互锁。已记录在 `StackSafeExecutor` 的类型文档里。
+- `NodePrinterTarget.pushTypeReferenceScope` 的 `@autoclosure` 签名是一次**静默**的源码破坏：按旧的 `Node?` 签名实现的富文本 target 编译零警告、文本输出完全正确，但所有 scope 事件静默丢失（协议自带的空默认实现顶上）。Swift 没有诊断近似匹配见证者的机制，已在协议文档里用 `- Important:` 标注。下游 `SemanticString` 需要确认签名已更新。
 - 每层探针的单独代价尚未量化（端到端为净改善）。若成为热点，可考虑「按观测到的实际每层开销自适应调整间隔」，而不是回到固定间隔。
