@@ -55,10 +55,7 @@ public protocol DemanglingNode: Sendable {
 extension DemanglingNode {
     /// Prints this subtree with the given options. Mirrors `Node.print(using:)`.
     public func print(using options: DemangleOptions = .default) -> String {
-        StackSafeExecutor.execute {
-            var printer = DemanglingPrinter<String, Self>(options: options)
-            return printer.printRoot(self)
-        }
+        DemanglingPrinter<String, Self>.print(self, options: options)
     }
 
     @inlinable
@@ -92,16 +89,27 @@ extension DemanglingNode {
         kind == .module && text == stdlibName
     }
 
+    /// Ceiling on `.type`-wrapper unwrapping. They nest only once or twice in
+    /// anything the demangler builds; the bound exists because `NodeBuilder`
+    /// can hand these walks a node that is its own descendant, and an
+    /// unbounded loop on a cycle spins forever — silently, which is harder to
+    /// diagnose than any crash.
+    @usableFromInline
+    static var maxTypeWrapperUnwrapDepth: Int { 64 }
+
     /// Whether this type prints without needing parentheses around it.
     ///
-    /// `.type` wrappers are unwrapped with a loop rather than by recursing.
-    /// They nest only once or twice in anything the demangler builds, but this
-    /// is public API reachable from a caller-assembled tree, and it sits
-    /// outside every engine's stack guard.
+    /// `.type` wrappers are unwrapped with a bounded loop rather than by
+    /// recursing: this is public API reachable from a caller-assembled tree,
+    /// and it sits outside every engine's stack guard.
     public var isSimpleType: Bool {
         var currentNode = self
+        var unwrapDepth = 0
         while currentNode.kind == .type {
-            guard let onlyChild = currentNode.children.first else { return false }
+            unwrapDepth += 1
+            guard unwrapDepth <= Self.maxTypeWrapperUnwrapDepth,
+                  let onlyChild = currentNode.children.first
+            else { return false }
             currentNode = onlyChild
         }
         return currentNode.isSimpleTypeIgnoringTypeWrappers
@@ -166,11 +174,16 @@ extension DemanglingNode {
 
     /// Whether a space belongs between a preceding keyword and this type.
     ///
-    /// Unwraps `.type` with a loop, for the same reason as ``isSimpleType``.
+    /// Unwraps `.type` with a bounded loop, for the same reason as
+    /// ``isSimpleType``.
     public var needSpaceBeforeType: Bool {
         var currentNode = self
+        var unwrapDepth = 0
         while currentNode.kind == .type {
-            guard let onlyChild = currentNode.children.first else { return false }
+            unwrapDepth += 1
+            guard unwrapDepth <= Self.maxTypeWrapperUnwrapDepth,
+                  let onlyChild = currentNode.children.first
+            else { return false }
             currentNode = onlyChild
         }
         return currentNode.needSpaceBeforeTypeIgnoringTypeWrappers

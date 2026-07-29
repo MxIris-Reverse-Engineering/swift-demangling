@@ -144,29 +144,53 @@ public struct NodeReference: Sendable {
     /// Prints the demangled form of this subtree directly from the store,
     /// without materializing a `Node` tree (proposal 0001, Phase 2).
     public func print(using options: DemangleOptions = .default) -> String {
-        StackSafeExecutor.execute {
-            var printer = DemanglingPrinter<String, NodeReference>(options: options)
-            return printer.printRoot(self)
-        }
+        DemanglingPrinter<String, NodeReference>.print(self, options: options)
     }
 
-    /// Whether this subtree is structurally equal to a `Node` tree, matching
-    /// the semantics of `Node.==` (kind + contents + children, recursively)
-    /// without materializing anything.
+    /// Whether this subtree is structurally equal to a `Node` tree
+    /// (kind + contents + children, recursively) without materializing
+    /// anything.
     ///
     /// This is the bridge for callers that hold an externally demangled
     /// `Node` (for example from `demangleAsNode`) and need to find it among
     /// `NodeReference` dictionary keys: reference-to-reference equality stays
     /// O(1) via hash-consing, while reference-to-`Node` equality walks both
-    /// trees. Text payloads compare by string-table bytes first and fall back
-    /// to `String` equality so Unicode canonical equivalence matches `Node.==`.
+    /// trees.
+    ///
+    /// - Important: Text payloads compare by exact UTF-8 bytes — the unit the
+    ///   store interns by — which is *stricter* than `Node.==`'s `String`
+    ///   comparison (Unicode canonical equivalence). The store can hold the
+    ///   NFC and NFD spellings of the same name as two distinct indices; a
+    ///   canonical-equivalence bridge would make those unequal references both
+    ///   equal one `Node`, and equality would stop being transitive. A `Node`
+    ///   built from the same mangled bytes always matches; one built from a
+    ///   differently normalized spelling deliberately does not.
+    ///
     /// Walked with an explicit work list rather than by recursion: this is
     /// public API over trees of arbitrary depth, called from whatever thread
-    /// the consumer's dictionary lookup happens to be on.
+    /// the consumer's dictionary lookup happens to be on. Pairs already proven
+    /// equal are skipped, so a maximally shared DAG costs its node count, not
+    /// its path count.
     public func structurallyEquals(_ node: Node) -> Bool {
+        struct VisitedPair: Hashable {
+            let referenceIndex: UInt32
+            let nodeIdentity: ObjectIdentifier
+        }
+        var visitedPairs = Set<VisitedPair>()
         var pendingPairs: [(reference: NodeReference, node: Node)] = [(self, node)]
 
         while let pair = pendingPairs.popLast() {
+            // A pair seen once contributes nothing new: on a shared DAG the
+            // same (index, instance) pair recurs once per *path*, and every
+            // recurrence repeats the identical subtree comparison. Any
+            // mismatch below a repeated pair aborts the whole walk the first
+            // time, so skipping repeats never changes the outcome.
+            let visitedPair = VisitedPair(
+                referenceIndex: pair.reference.nodeIndex.rawValue,
+                nodeIdentity: ObjectIdentifier(pair.node)
+            )
+            guard visitedPairs.insert(visitedPair).inserted else { continue }
+
             let compact = pair.reference.compactNode
             guard compact.kind == pair.node.kind else { return false }
 
@@ -182,10 +206,8 @@ public struct NodeReference: Sendable {
                 guard pair.reference.index == indexValue else { return false }
             case .text(let textValue):
                 guard case .text = compact.payloadKind else { return false }
-                guard let bytes = pair.reference.textUTF8 else { return false }
-                if !bytes.elementsEqual(textValue.utf8) {
-                    guard pair.reference.text == textValue else { return false }
-                }
+                // Exact bytes, not `String ==`: see the doc comment.
+                guard let bytes = pair.reference.textUTF8, bytes.elementsEqual(textValue.utf8) else { return false }
             }
 
             let referenceChildren = pair.reference.children
@@ -203,11 +225,12 @@ public struct NodeReference: Sendable {
     ///
     /// Within one store this is O(1): hash-consing makes index equality
     /// coincide with structural equality. Across two stores it walks both
-    /// subtrees. Text payloads compare by string-table bytes first and
-    /// fall back to `String` equality so Unicode canonical equivalence
-    /// matches `Node.==`.
+    /// subtrees. Text payloads compare by exact string-table bytes — see
+    /// the `Node` overload for why canonical-equivalence fallback would
+    /// break transitivity.
     /// Walked with an explicit work list rather than by recursion, for the same
-    /// reason as the `Node` overload.
+    /// reason as the `Node` overload, and with the same proven-pair skip so a
+    /// shared DAG costs its node count rather than its path count.
     ///
     /// The same-store test sits inside the loop, but it can only ever fire on
     /// the first pair: a reference's children always come from its own store, so
@@ -215,6 +238,11 @@ public struct NodeReference: Sendable {
     /// at every level. It is kept in the loop only so the root case reads as one
     /// rule rather than two.
     public func structurallyEquals(_ other: NodeReference) -> Bool {
+        struct VisitedPair: Hashable {
+            let leftIndex: UInt32
+            let rightIndex: UInt32
+        }
+        var visitedPairs = Set<VisitedPair>()
         var pendingPairs: [(left: NodeReference, right: NodeReference)] = [(self, other)]
 
         while let pair = pendingPairs.popLast() {
@@ -222,16 +250,22 @@ public struct NodeReference: Sendable {
                 guard pair.left.nodeIndex == pair.right.nodeIndex else { return false }
                 continue
             }
+            let visitedPair = VisitedPair(
+                leftIndex: pair.left.nodeIndex.rawValue,
+                rightIndex: pair.right.nodeIndex.rawValue
+            )
+            guard visitedPairs.insert(visitedPair).inserted else { continue }
+
             let compact = pair.left.compactNode
             let otherCompact = pair.right.compactNode
             guard compact.kind == otherCompact.kind else { return false }
 
             switch (compact.payloadKind, otherCompact.payloadKind) {
             case (.text, .text):
-                guard let bytes = pair.left.textUTF8, let otherBytes = pair.right.textUTF8 else { return false }
-                if !bytes.elementsEqual(otherBytes) {
-                    guard pair.left.text == pair.right.text else { return false }
-                }
+                // Exact bytes, not `String ==`: see the `Node` overload.
+                guard let bytes = pair.left.textUTF8, let otherBytes = pair.right.textUTF8,
+                      bytes.elementsEqual(otherBytes)
+                else { return false }
             case (.index, .index):
                 guard pair.left.index == pair.right.index else { return false }
             case (.text, _), (_, .text), (.index, _), (_, .index):
@@ -282,25 +316,87 @@ extension NodeReference: Hashable {
     /// documented use requires: a value type keying a dictionary by node
     /// structure while storing a `NodeReference` (whose intrinsic `Hashable` is
     /// store-identity based) has to be findable with a `Node` demangled
-    /// elsewhere. Both sides feed the hasher a `Node.Contents`, so the two can
-    /// no longer drift apart the way two hand-written payload encodings did.
+    /// elsewhere. Both sides combine one structural digest whose per-node
+    /// seeding is the shared `Node.seededDigestHasher`, so the two encodings
+    /// cannot drift apart.
     ///
-    /// Walked with an explicit stack, mirroring ``Node/hash(into:)``. The visit
-    /// order differs from a recursive implementation, but structurally equal
-    /// subtrees still produce an identical sequence of `combine` calls, which
-    /// is all the hash/equality contract requires.
+    /// The digest is computed bottom-up with a per-call memo keyed by store
+    /// index — a store is maximally shared by construction, so a per-path walk
+    /// here quadrupled its visit count with every shared level (measured
+    /// 615,165× amplification on a 137-character symbol). Memoized, the cost
+    /// is the store's node count. Walked with an explicit frame stack: public
+    /// API, arbitrary depth.
     public func structuralHash(into hasher: inout Hasher) {
-        var pendingReferences: [NodeReference] = [self]
+        hasher.combine(structuralDigest())
+    }
 
-        while let reference = pendingReferences.popLast() {
-            hasher.combine(reference.kind)
-            hasher.combine(reference.nodeContents)
-            let childrenView = reference.children
-            hasher.combine(childrenView.count)
-            for child in childrenView {
-                pendingReferences.append(child)
-            }
+    /// The reference half of the structural digest; see ``Node/structuralDigest()``.
+    func structuralDigest() -> UInt64 {
+        let rootCompact = compactNode
+        let rootChildren = children
+        if rootChildren.isEmpty {
+            let leafHasher = Node.seededDigestHasher(kind: rootCompact.kind, contents: nodeContents, childCount: 0)
+            return UInt64(bitPattern: Int64(leafHasher.finalize()))
         }
+
+        struct DigestFrame {
+            let reference: NodeReference
+            var hasher: Hasher
+            var nextChildIndex: Int
+        }
+
+        func seededHasher(for reference: NodeReference) -> Hasher {
+            Node.seededDigestHasher(
+                kind: reference.kind,
+                contents: reference.nodeContents,
+                childCount: reference.children.count
+            )
+        }
+
+        var digestByIndex: [UInt32: UInt64] = [:]
+        var frames: [DigestFrame] = [
+            DigestFrame(reference: self, hasher: seededHasher(for: self), nextChildIndex: 0),
+        ]
+        var lastCompletedDigest: UInt64 = 0
+        var pendingChildDigest: UInt64?
+
+        while var frame = frames.popLast() {
+            if let childDigest = pendingChildDigest {
+                frame.hasher.combine(childDigest)
+                pendingChildDigest = nil
+            }
+
+            let childrenView = frame.reference.children
+            var descended = false
+            while frame.nextChildIndex < childrenView.count {
+                let child = childrenView[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                let childIndex = child.nodeIndex.rawValue
+                if let knownDigest = digestByIndex[childIndex] {
+                    frame.hasher.combine(knownDigest)
+                } else if child.children.isEmpty {
+                    let leafHasher = seededHasher(for: child)
+                    let leafDigest = UInt64(bitPattern: Int64(leafHasher.finalize()))
+                    digestByIndex[childIndex] = leafDigest
+                    frame.hasher.combine(leafDigest)
+                } else {
+                    frames.append(frame)
+                    frames.append(DigestFrame(reference: child, hasher: seededHasher(for: child), nextChildIndex: 0))
+                    descended = true
+                    break
+                }
+            }
+            if descended { continue }
+
+            let completedHasher = frame.hasher
+            let digest = UInt64(bitPattern: Int64(completedHasher.finalize()))
+            digestByIndex[frame.reference.nodeIndex.rawValue] = digest
+            lastCompletedDigest = digest
+            pendingChildDigest = digest
+        }
+
+        // The last frame to complete is always the root.
+        return lastCompletedDigest
     }
 }
 

@@ -22,13 +22,17 @@ final class NodeStorePhase3AcceptanceTests: DyldCacheSymbolTests, @unchecked Sen
         return Int(info.phys_footprint)
     }
 
-    /// Synchronous on purpose so the historical (interning) sync overload of
-    /// `demangleAsNode` is selected as the throughput baseline.
+    /// Synchronous on purpose so the sync overload of `demangleAsNode` is
+    /// selected as the throughput baseline, and with `internsSubtrees: false`
+    /// so the baseline does not pin the whole corpus in `NodeCache.shared` for
+    /// the rest of the test process — the comparison is against the store
+    /// path's cache-free `builder.demangle`, and a fair baseline should not
+    /// permanently retain hundreds of megabytes of `Node` objects either.
     private static func runNodePathBaseline(_ corpus: [String]) -> Int {
         var failureCount = 0
         for mangled in corpus {
             do {
-                _ = try demangleAsNode(mangled)
+                _ = try demangleAsNode(mangled, internsSubtrees: false)
             } catch {
                 failureCount += 1
             }

@@ -2,10 +2,12 @@
 
 - **Proposal**: 0002
 - **Author**: Mx-Iris
-- **Status**: Implemented
+- **Status**: Implemented, then **revised 2026-07-29**（`StackBudget` 机制撤回，回到与上游同构的「8MB 大栈 + 实测校准的固定深度上限」；见文末「2026-07-29 修订」）
 - **Date**: 2026-07-28
 - **Branch**: `feature/stack-budget-guard`（自 `feature/node-store` 切出）
-- **Related**: `Documentations/StackSafety.md`（实现说明与实测数据）
+- **Related**: `Documentations/StackSafety.md`（**最终形态**的实现说明与实测数据）
+
+> **阅读提示**：Summary 至 Alternatives Considered 是 2026-07-28 首版方案的历史记录，其中 `StackBudget`、64MB worker、64MB 内联判据、`TypeDecoder` 包装四项已于次日撤回；保留的部分与撤回理由见文末「2026-07-29 修订」。
 
 ## Summary
 
@@ -134,3 +136,23 @@ Remangler 那 6 条的处理：`hashForNode` ↔ `entryForNode` 与 `deepEquals`
 - 同时阻塞的调用方超过突发上限时仍会排队，理论上仍可构造出扇出互锁。已记录在 `StackSafeExecutor` 的类型文档里。
 - `NodePrinterTarget.pushTypeReferenceScope` 的 `@autoclosure` 签名是一次**静默**的源码破坏：按旧的 `Node?` 签名实现的富文本 target 编译零警告、文本输出完全正确，但所有 scope 事件静默丢失（协议自带的空默认实现顶上）。Swift 没有诊断近似匹配见证者的机制，已在协议文档里用 `- Important:` 标注。下游 `SemanticString` 需要确认签名已更新。
 - 每层探针的单独代价尚未量化（端到端为净改善）。若成为热点，可考虑「按观测到的实际每层开销自适应调整间隔」，而不是回到固定间隔。
+
+## 2026-07-29 修订：撤回 `StackBudget`，回到与上游同构的模型
+
+对首版实现的第二轮满强度 review 确认了五条不可接受的代价，且均为「透明跳线程 + 按栈不按深度」这一形态的固有属性，逐条打补丁不收敛：
+
+1. **LLDB `po` 挂死**：64MB 内联判据让主线程也无条件跳 worker，而调试器表达式求值默认只放行当前线程；
+2. **优先级反转**：主线程（USER_INTERACTIVE）在不传递优先级的 `DispatchSemaphore` 上等 USER_INITIATED worker；
+3. **`TypeBuilder` 回调换线程**：同步外观下把用户代码移到后台，`@MainActor` 隔离的 builder 在 Swift 6 下崩溃；
+4. **栈上限不约束工作量**：移除 remangler 深度上限后，构造符号（约 64KB 的 `Sg` 串）的拒绝代价为 Θ(D_max·N) ≈ 9.5 分钟 CPU，公开入口 `mangleAsString` / `canMangle` 即可触发；
+5. **地址空间**：worker 永不退休 + 上限 `max(32, 4×核数)` = 数十条 64MB 栈（watchOS arm64_32 全进程 4GB）。
+
+同日的上游源码调查（`/Volumes/SwiftProjects/swift-project`）证实上游模型就是「8MB 线程 + release 校准的固定常数」：IRGen 注释原话 "Increase the thread stack size on macosx to 8MB … This matches the main thread"；clang 对自家 parser 的机制也是「剩余 < 256KB 就换 8MB 栈」，门槛远低于 64MB。据此裁决（用户决策）：**只保留 main 已有的栈保护形态，常数按 debug 帧实测重定**。
+
+**撤回**：`StackBudget` 类型与每层探针、64MB worker 栈与 64MB 内联判据、`TypeDecoder` 的执行器包装、`NodePrinter.maxPrintDepth` 的 deprecated 标记。
+
+**保留**（首版顺带做出的正确修复）：全部迭代化改写（`hashForNode`、`internTree`、`copy` / `replacingDescendant`、`Rewriter.rewrite`、`description` 转储、`getUnspecialized`、store 侧五条、`deinit` 迭代析构）、线程池（`pthread_create` 检查、槽位清空、autoreleasepool）、printer 复用重置、`withLargeStack`、store 打印不触 `NodeCache` 等。
+
+**新定**：深度上限按 debug、8MB 线程实测崩溃边界取约 30% 余量——printer 768→**512**（实测 725 过 / 745 崩）、remangler 1024→**384**（深度 565 过 / 605 崩；`hashForNode` 迭代化后上限第一次真正可达）、TypeDecoder 1024→**160**（约深度 250 崩）。执行器恢复 2MB 门槛 / 8MB worker；`trySubmit` 的幽灵预约竞态修复（并发提交 + 创建失败可永久挂死调用方，测试可复现）；两个 `printRoot` 私有化、以静态 `print(_:using:)` 为唯一公开打印入口（#12，下游已迁移）。4,522,325 符号语料在新常数下零失配。
+
+最终形态的完整描述见 `Documentations/StackSafety.md`（已重写）。

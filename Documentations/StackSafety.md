@@ -1,200 +1,129 @@
-# 栈安全：把「数帧」换成「量栈」
+# 栈安全：与上游同构的「8MB 大栈 + 帧数上限」模型
 
-日期：2026-07-28
+日期：2026-07-29（首版 2026-07-28 采用按剩余栈字节的 `StackBudget` 方案，后按 review 结论撤回，见「曾经的方案与撤回原因」）
 
 对应提案：`evolution/0002-stack-safety.md`
+
+## 最终模型（一句话）
+
+三个递归引擎各带一个**按 debug 帧大小实测校准的固定深度上限**；`StackSafeExecutor` 在调用线程剩余栈不足 2MB 时把工作搬到 **8MB 常驻 worker 池**；所有不经过引擎入口的整树遍历（interning、`copy`、`Rewriter`、析构、remangler 的替换哈希等）一律**迭代**，不依赖任何护栏。
+
+这与 Swift 上游的模型同构，且每个常数都有实测依据。
 
 ## 动机
 
 两个症状，同一个根因。
 
-**症状一：合法的深嵌套泛型被拒绝。** SwiftUI 里返回 `some View` 的声明，其底层具体类型可以嵌套得非常深。这类符号完全合法，但 release 构建下：
+**症状一：debug 构建下固定深度上限够不着，先崩。** 上游三个常数（`NodePrinter` 768、`Remangler` 1024、`TypeDecoder` 1024）按 release 帧大小校准。本库会被消费方以 debug 配置编译，而 debug 的帧大一个数量级。实测（8MB 线程、嵌套 `Optional`）：
 
-- `print` 嵌套到约 **384 层**就返回 `<<too complex>>`；
-- `mangleAsString` 嵌套到约 **256 层**就返回 `.tooComplex`。
+- printer：725 层存活、745 层 SIGBUS——**768 的上限永远轮不到生效**；
+- remangler：上限之外还有个洞（见下），150 层就崩；
+- TypeDecoder：约 125 层崩，1024 的上限纯属装饰。
 
-此时线程栈还剩几十兆，纯粹是被上限挡掉的。
+**症状二：remangler 的上限有结构性绕过。** `hashForNode` ↔ `entryForNode` 是一对互递归，第一次 `trySubstitution` 时就把整棵子树走完，全程不经过 `mangle(_:depth:)`——depth 计数器根本没机会涨。上游 C++ 有完全相同的洞，靠「调用方保证在大栈上」活着。
 
-**症状二：debug 构建下会崩。** 同一批符号，debug 构建在 8MB 的 worker 线程上：
+## 上游怎么做的（实证）
 
-- `mangleAsString` 到 **150 层** SIGBUS；
-- `print` 到 **375 层** SIGBUS。
+`swift/lib/Demangling/` **没有任何栈相关代码**，只有固定深度常数。它的运行环境靠调用方安排：
 
-深度上限还没触发，栈就先耗尽了。
+- **IRGen worker 线程**（`IRGen.cpp`）：`pthread_attr_setstacksize(8MB)`，注释原话 "Increase the thread stack size on macosx to 8MB (default is 512KB). This matches the main thread."
+- **ModuleInterfaceBuilder**（`ModuleInterfaceBuilder.cpp`）：`ThreadStackSize = 8 << 20`，子编译跑在 `RunSafelyOnThread(..., 8MB)` 上。
+- **运行时**（`stdlib/public/runtime`）：demangle/remangle/TypeDecoder 直接跑在调用者线程上，零栈检测——赌注是 runtime 永远 release 构建、帧足够小，深度常数真能够到。
+- **clang 的同款先例**（`clang/lib/Basic/Stack.cpp`）：`DesiredStackSize = 8MB`，`isStackNearlyExhausted()` 判「距底部剩余 < 256KB」，快耗尽时换到新 8MB 栈继续——「探测剩余栈 + 不够就换 8MB 栈」在 LLVM 生态有正统出处。
+- **解析器为什么不用限**：新版 mangling 是后缀文法，`Demangler` 主循环靠 `NodeStack` 迭代，天生不深递归。旧版 Swift3（`OldDemangler.cpp`）是递归下降，上游给它配了 `MaxDepth = 1024`（本库的 `demangleSwift3*` 未移植该计数，`_T` 前缀符号基本绝迹，已决定不管）。
 
-**根因：用帧数近似栈字节。** 三个引擎的护栏都是固定帧数（`NodePrinter` 768、`Remangler` 1024、`TypeDecoder` 1024，照搬上游 C++ 的 `MaxDepth`）。而「一帧多少字节」在以下三个维度上都不是常量：
-
-- **构建配置**：debug 的帧比 release 大一个数量级。上游那三个常数是按 release 的帧大小定的，所以在 debug 下形同虚设。
-- **泛型特化**：`DemanglingPrinter` 泛型于 `DemanglingNode`，会为 `Node`（class 引用）和 `NodeReference`（16 字节值类型）各特化一份，两份的帧大小不同。一个常数不可能同时对两者正确。
-- **线程栈大小**：主线程 8MB，Swift 并发协作线程和 libdispatch 线程各 512KB，自建 `Thread` 任意。同一个帧数在不同线程上意味着完全不同的安全边界。
-
-**调大常数解决不了问题**：调大到能容纳合法深符号，debug 就崩；调小到 debug 安全，release 就拒绝更多合法符号。这两个方向互相排斥。
-
-## 上游怎么做的
-
-`swift/lib/Demangling/` 整个目录**没有任何栈相关代码**。全仓 `pthread_get_stackaddr_np` 只有 `include/swift/Threading/Impl/Darwin.h` 一处封装，唯一使用者是 `stdlib/public/stubs/Stubs.cpp`，与 demangling 无关。上游从不用剩余栈空间做决策。
-
-它靠两件事：
-
-1. **引擎内部的固定帧数上限**（就是上面那三个常数）；
-2. **调用方在任务边界上一次性换到大栈线程**：
-   - SourceKit 的 `WorkQueue` 有个 `isStackDeep` 标志，命中时起一条 8MB 的 `llvm::thread` 跑完 join（`Concurrency-libdispatch.cpp`）。全 SourceKit 只有一处传 `true`（`Requests.cpp`，语义请求队列）——**一个请求一次，不是一次 demangle 一次**。
-   - IRGen 的 worker 线程建的时候直接 `pthread_attr_setstacksize(8MB)`（`IRGen.cpp`），注释写着「macOS 默认 512KB，提到 8MB 和主线程一致」。
-   - `ModuleInterfaceBuilder` 用 `CrashRecoveryContext().RunSafelyOnThread(..., 8MB)`。
-
-值得注意的是：**上游的 remangler 有和本仓完全相同的无保护递归**——`RemanglerBase::hashForNode` 对每个 child 调 `entryForNode`，后者再调回 `hashForNode`，整条链没有 depth 参数；`SubstitutionEntry::deepEquals` 同样无界。上游能活下来，靠的就是「调用方保证在大栈上」这个前提。
-
-作为库，我们没法把决策上推到调用方的任务边界，所以需要一个自己的答案。
+本库与上游环境唯一的本质差别：**会被人用 debug 配置编译**。所以模型照搬、常数重新校准。
 
 ## 方案
 
-### 一、护栏改成量剩余栈字节
+### 一、深度上限按 debug 实测重定
 
-新增 `Utils/StackBudget.swift`。它在操作入口按当前线程的栈边界算出一个 floor（栈底 + 预留量），递归时把栈指针和 floor 比较。
+方法：8MB 线程、debug 构建、嵌套 `Optional` 符号逐深度探测崩溃边界，取约 30% 安全余量。
 
-- **每层都探**。曾经试过「每 N 层探一次、N 由预留量除以假定的每层开销推出」，**这是不安全的**：假定值必须对任意引擎、任意构建配置的最大帧都成立，一旦不成立，两次探针之间就能跨过整个预留区照样崩。猜帧大小正是固定帧数上限犯的错，这个类型的存在就是为了不再犯。实测代价见下。
-- **读取动作放在 `@inline(never)` 辅助函数里**。对局部变量取地址会给所在函数的序言塞进 stack-protector 检查；隔离到一个小函数后，热路径的递归函数不受影响，只付一次调用。
-- **非粘性**。某条深路径触发后照常写 `<<too complex>>` 并退栈；等递归退回到浅层兄弟节点时栈已经空出来了，兄弟节点正常输出。这与原来「一条深路径退化、其余不受影响」的语义一致，也避免了标记刷屏。
-- **被截断的片段不进 `printCache`**。printer 会把每个可缓存节点的渲染结果记进 `printCache`，而深路径放弃时写下的 `<<too complex>>` 就落在祖先节点的片段里。若照常缓存，同一个节点后续在浅层位置命中缓存时会重放这段截断——「非粘性」就名存实亡了。所以缓存前比对放弃计数，只有整棵子树完整渲染才写入。
-- **保留一个极大的帧数兜底**（`absoluteDepthLimit = 1_000_000`），只用来防节点图成环导致的真无限递归——环不会逼近栈底，光靠栈探针停不下来。注意它只约束**递归的**那三个引擎；下面那些改成迭代的辅助函数增长的是工作队列而不是栈，不查任何上限，真给它一个成环的图会耗尽内存。本库自己产出的永远是 DAG 而非环，但手工构造的 `Node` 图可以是。
-- **拿不到栈边界时回退到帧数**。非 Darwin 平台（以及 `pthread_get_stackaddr_np` 失败时）没有栈测量，此时 `StackBudget` 退回各引擎在本次改动前使用的那个帧数常数（printer 768、remangler / TypeDecoder 1024）。**这一点是必须的**：如果只是「拿不到就不设限」，那么在把三个引擎的帧数上限提到兜底值之后，Linux 上就等于完全没有护栏了。
+| 引擎 | 上游常数 | 实测崩溃边界 | 新常数 | 覆盖的真实嵌套层数 |
+|---|---|---|---|---|
+| `DemanglingPrinter.maxPrintDepth` | 768 | 725 层过 / 745 层崩 | **512** | ≈253 层 |
+| `Remangler.maxDepth` | 1024 | 深度 565 过 / 605 崩（140/150 层，每层 4 深度单位） | **384** | ≈94 层 |
+| `TypeDecoderEngine.maxDepth` | 1024 | 深度约 250 崩（120/130 层，每深度单位约 30KB！） | **160** | ≈78 层 |
 
-预留量取 `min(1MB, max(栈大小 / 8, 32KB))`：小栈上 1MB 会吃掉全部预算，所以按比例缩；32KB 是下限，因此在小于 256KB 的栈上预留会超过八分之一。
+实测过的最深真实符号（SwiftUI `View.Body` typealias）是 41 层，全部常数都有 2 倍以上余量；**4,522,325 个 dyld cache 真实符号在新常数下零失配**。代价：release 下本可以处理更深的构造性输入，现在统一在同一深度拒绝——换来的是同一符号在两种配置下行为一致。
 
-### 二、worker 栈 8MB → 64MB
+### 二、`hashForNode` 改迭代，让 remangler 的上限第一次真正生效
 
-线程栈是**虚拟地址空间预留**，只有真正写到的页才分配物理内存。所以放大栈的代价是地址空间（64 位下不稀缺），不是常驻内存。
+互递归改成显式栈后序折叠，缓存语义逐条保持。这不是「新增保护」，是**修补 main 上已有保护的绕过**——改完之后 `maxDepth` 才是真实的上限，上表中 remangler 的边界也才有意义。它同时消灭了一个 DoS：没有深度上限时，靠栈耗尽拒绝一个 3.2 万层的构造符号要烧约 9.5 分钟 CPU（每层都重走整棵子树，Θ(D_max·N)）；深度检查 0.1 秒内拒绝。
 
-### 三、堵掉所有无保护递归
+### 三、执行器：2MB 门槛 + 8MB 常驻池
 
-护栏只有装在收敛点上才有效。动手前做了一次调用图审计：把每个引擎的函数调用图建出来，用 Tarjan 找强连通分量，然后**把候选收敛点从图里删掉再找一次**——剩下的环就是护栏覆盖不到的。
+- **门槛 2MB**：剩余栈 ≥ 2MB 就地跑（clang 的对应值是 256KB，我们保守 8 倍）。主线程、消费方自建的大栈线程零开销、LLDB `po` 可用；512KB 的协作/dispatch 线程跳到 worker。
+- **worker 栈 8MB**：与主线程、与上游一致。深度常数按它校准。
+- **池化保留**（对 node store 批量场景是刚需：每次新建线程约 41µs，23 万符号就是约 10 秒纯开销）。稳态上限 `max(2, 核数)`，阻塞式提交可撑到 `max(32, 4×)`（扇出防互锁），异步提交守稳态上限。
+- **`pthread_create` 而非 `Thread.start()`**，创建失败有返回码可查——`start()` 静默失败会永久毒化进程级单例。
+- **幽灵预约不再挂死任何人**：并发提交、创建全部失败时，最后一个回滚到零的提交者**就地排空队列**再拒绝，且入队时复验存活 worker 数。之前的写法里，先回滚的提交者会把别人的幽灵预约当成存活 worker，入队后永久阻塞（测试可复现：8 个并发提交者 7 个挂死）。
+- **worker 上的嵌套调用**：栈还多（≥2MB）就内联跑（嵌套 demangle 的常态）；真的深到不足 2MB 时起一条一次性 8MB 线程，绝不向自己所在的池子回提交（那个等待可能排在它自己正在执行的条目后面）。
+- **`withLargeStack {}`** 保留：批量场景包一次，作用域内全部内联，零往返。
 
-结果：
+### 四、`TypeDecoder` 不再跳线程（撤回首版的包装）
 
-| 引擎 | 候选收敛点 | 删掉后剩余的环 |
-|---|---|---|
-| `DemanglingPrinter` | `printName` | 1 条：`findSugar` |
-| `Remangler` | `mangle` + `mangleAnyNominalType` | **6 条**（去掉误报后） |
-| `TypeDecoderEngine` | `decodeMangledType` | 4 条 |
+`TypeDecoder` 调的是**用户代码**（`TypeBuilder` 回调），首版把整段搬到 worker 后，`@MainActor` 隔离或线程绑定的 builder 会在一个看起来同步的调用背后被移到后台线程。现在回到 main 的契约：**回调永远在调用者线程**，栈是调用者的责任，深批量自己包 `withLargeStack`。深度上限（160）保证 debug 下上限先于栈崩溃生效。
 
-（误报三个：`mangleIdentifier` 和 `mangleProtocolList` 是重载不是自递归，`lookupWord` 是嵌套局部函数。）
+### 五、引擎之外的整树遍历：迭代（全部保留）
 
-Remangler 那 6 条的处理：
+这些不经过任何引擎入口，护栏永远覆盖不到，迭代是唯一正确形态：
 
-| 递归 | 处理 |
-|---|---|
-| `hashForNode` ↔ `entryForNode` | **改成迭代**（显式栈后序折叠），缓存语义逐条保持 |
-| `SubstitutionEntry.deepEquals` | **改成迭代**（成对工作队列） |
-| `isSpecialized` | **改成循环**（本来就是尾递归） |
-| `getUnspecialized` | 传入护栏自行探针（要在退栈时重建节点，不能改循环；用帧数上限会重蹈固定帧数的覆辙——它每层还分配一个数组） |
-| `mangleGenericArgs` | 补护栏检查（本来带 `depth` 但从不检查） |
-| 7 个 protocol conformance 函数的互递归环 | 同上，逐个补 |
+- `NodeCache.internTreeUnsafe`（每次默认 demangle 都跑）、`NodeStoreBuilder.internTree`
+- `Node.==` / `Node.hash(into:)`（后者现为记忆化摘要，见 NodeStore 相关文档）
+- `Node.copy()` / `replacingDescendant(_:with:)`（`NodeBuilder` 持锁期间调用）
+- `Node.Rewriter.rewrite`（`rewrite` 是 `final`，只有 `visit` 是 `open`，迭代化不改变任何可重写点）
+- `Node.description` 的树转储——**并且不再包 `StackSafeExecutor`**：迭代遍历不可能爆栈，而它恰是调试器 `po` 走的路，包一层只会把 `po` 变成挂死
+- remangler 的 `hashForNode` / `deepEquals` / `getUnspecialized`（pending-rebuild 迭代，`nil` 恢复单一含义）
+- `NodeStore.materializeNode`、`NodeReference.structurallyEquals` / `structuralHash`
+- `DemanglingNode.isSimpleType` / `needSpaceBeforeType`（`.type` 链解包，带步数上限防自引用环）
 
-Printer 的 `findSugar` 只沿单子 `.type` 链下降，给了一个独立的小上限。TypeDecoder 的 6 处检查全部接上护栏。
+### 六、`Node` 迭代式析构（保留）
 
-### 四、顺带堵掉既有的全树递归
+释放引用类型的树本身就是递归——由运行时执行，发生在最后一个引用消失的地方，**任何引擎侧护栏都覆盖不到**，崩溃时栈顶没有本库的帧，几乎必然被误判。实测 512KB 线程上 620 层就崩。`deinit` 把孩子摘进显式工作队列逐个排空，只拆解唯一引用的节点。
 
-它们不属于任何引擎，因此从来不在任何护栏覆盖范围内：
+### 七、打印入口收拢
 
-- **`NodeCache.internTreeUnsafe`** —— 自底向上 hash-consing。`demangleAsNode` 默认 `internsSubtrees: true`，所以**每次 demangle 都会跑这趟**。改成迭代。
-- **`Node.==` / `Node.hash(into:)`** —— 公开 API，深树上无界递归。改成迭代。（哈希的访问顺序变了，但相等的树仍产生完全相同的 `combine` 序列，契约只要求这个。）
-- **`Node.copy()` / `Node.replacingDescendant(_:with:)`** —— 两条公开的整树递归，而且经 `NodeBuilder` 进入时递归发生在 `os_unfair_lock` **持锁期间**。第一轮调用图审计漏掉了它们（它们不在任何引擎里，靠「从引擎出发」的审计走不到）。改成迭代，共用一个 `RebuildFrame`。
-- **`Node.Rewriter.rewrite`** —— 同样是公开的整树递归，且不经过 `StackSafeExecutor`。改成迭代不改变任何可重写点：`rewrite` 是 `public final func`，只有 `visit` 是 `open`，访问顺序仍是原来的后序。
-- **`Node.description` 的树转储** —— 改成显式栈的先序遍历。它是调试器、日志、断言消息都会碰的入口，最不该按层吃帧。
-- **`getUnspecialized`**（remangler） —— 见下文「返回 `nil` 的二义性」。
-- **`DemanglingNode.isSimpleType` / `needSpaceBeforeType`** —— 沿 `.type` 包装链的线性下降，改成 `while` 循环。
-- **store 侧五条**：`NodeStoreBuilder.internTree`（原 `internRecursively`）、`NodeStore.materializeNode`、`NodeReference.structurallyEquals` 两个重载、`NodeReference.structuralHash`。全部改成迭代。其中 `structurallyEquals(_ other: NodeReference)` 的同 store 短路现在在**每一层**生效，不只根节点。
+`DemanglingPrinter.printRoot` / `NodePrinter.printRoot` 不再公开；唯一公开入口是静态 `print(_:using:)`（`NodePrinter<Target>.print` / SPI 的 `DemanglingPrinter.print`），内部统一过 `StackSafeExecutor`。之前实例级 `printRoot` 是公开的，富文本消费方直驱它就绕开了大栈切换，同一棵树的截断点取决于调用者当时用掉多少栈。下游（MachOSwiftSection）已迁移。
 
-**`getUnspecialized` 的返回 `nil` 二义性**：这个函数一边下降一边重建节点，所以不能写成纯循环。第一版给它加了栈探针，结果反而更糟——探针失败返回 `nil`，而调用方把 `nil` 一律翻译成 `.invalidNodeStructure`，于是「栈不够」被报成「树畸形」，`.tooComplex` 在这条路径上变成不可达，调用方会判定符号损坏并丢弃，而不是按文档换个大栈重试。改成自带 pending-rebuild 栈的迭代实现之后，没有递归也就没有深度可耗尽，`nil` 重新只有一个含义。
+## 曾经的方案与撤回原因
 
-`NodeStoreBuilder` 那条值得单独说：`demangle(_:isType:)` 把 transient demangle 交给 `StackSafeExecutor`，但**返回之后才 intern**，而 intern 跑在调用方自己的线程上。批量索引场景下那就是一条 512KB 的协作线程——恰恰是最深的泛型类型到达的地方。改成迭代之前实测：debug 下 **500 层**崩、release 下 **1200 层**崩。这个形状是 `NodeStoreBuilder.demangle` 本来就有的（不是本次改动引入），但本次把「支持深嵌套」立为目标之后，它就从边缘风险变成了必须堵的口子。
+首版（2026-07-28）用 `StackBudget` 按**剩余栈字节**做每层探针，并把「不足 64MB 一律跳 worker」作为门槛，worker 栈 64MB。深度能力确实好（3000 层完整打印），但 review 确认了五条不可接受的代价，且它们是这个形态的固有属性而非实现瑕疵：
 
-### 五、`Node` 改成迭代式析构
+1. **LLDB `po` 挂死**——64MB 门槛让主线程也无条件跳线程，而 LLDB 表达式求值默认只放行当前线程，worker 永远调度不到；
+2. **优先级反转**——USER_INTERACTIVE 的主线程在 `DispatchSemaphore` 上等 USER_INITIATED worker，信号量不传递优先级；
+3. **`TypeBuilder` 回调换线程**——同步外观下把用户代码移到后台；
+4. **栈上限不约束工作量**——移除 remangler 深度上限后，构造符号的拒绝代价变成 Θ(D_max·N)（9.5 分钟 CPU 换一个 `.tooComplex`），而 demangle 同一输入只要 1 毫秒；
+5. **数十条 64MB 栈常驻**（10 核机上限 40 条 = 2.5GB 地址空间；watchOS arm64_32 全进程只有 4GB）。
 
-这条谁都没提，但它是支持深树的必要条件：**释放一棵引用类型的树本身就是递归的**——释放根会释放孩子，孩子的 deinit 再释放它的孩子，一层一帧。实测 512KB 线程上释放 620 层的树直接崩。
-
-而且这条**任何引擎侧的护栏都覆盖不到**：释放发生在最后一个引用消失的地方，由运行时执行，不经过本库任何代码。
-
-`Node.deinit` 改成：把孩子摘进一个显式工作队列然后逐个排空。只有在「这是最后一个引用」时才拆解一个节点（`isKnownUniquelyReferenced`），否则它还活着、必须保留孩子。因为每个被唯一引用的节点在释放前孩子已被摘走，它自己的 deinit 就没有可下降的东西了。
-
-### 六、线程池重做
-
-原来是**每次调用新建一条 `Thread` 再 join**，实测每次约 41 µs——对一个典型符号是本体工作量的 5～18 倍，索引一个框架就是好几秒的纯开销。
-
-新的池子有四条承重性质：
-
-- **worker 不退休。** 「空闲超时退休」有一个窗口：超时触发后 worker 要重新抢锁，这期间的提交会把它算作可用、于是不建替补也没人接收信号，任务就此丢失、调用方永久阻塞。保持 worker 存活是消除这个窗口，而不是试图关上它。空闲 worker 的代价是一个内核线程结构；它们的 64MB 栈是没被写过的地址空间。
-- **先建线程，再排队，且检查建线程是否成功。** 这条是第二轮 review 抓出来的：`Thread.start()` 没有失败返回值，而每条 worker 预留 64MB 栈，`pthread_create` 是可能失败的。原实现先在锁内 `workerCount += 1`、再到锁外 `start()`，失败时任务留在队列里没人取（同步调用方永久卡在信号量上，异步调用方的 `CheckedContinuation` 既不 resume 也不销毁，连运行时的 leak 诊断都不会触发），而那个幽灵名额还占着，导致之后每次提交都认为「人手够了」不再补线程——**线程池是进程级单例，一次失败永久毒化后续所有 demangle/print/mangle**。现在改用 `pthread_create` 并检查返回码，失败就释放名额。
-- **提交可以被拒绝。** 被拒的任务由调用方在自己的线程上跑（`StackBudget` 保证那样不会崩，只是深度上限低一些）。这条是上面所有失败模式「降级而不是挂死」的落点。
-- **worker 绝不等待池子。** printer 会为嵌套的 mangled 名字重新进入 demangle，这类从 worker 发出的提交会在有上限的池子上死锁。用线程本地 `pthread_key_t` 标记识别 worker，让这些调用直接内联跑——它们本来就已经在大栈上了。（`pthread_key_create` 的返回值现在也检查：拿不到 key 就整个禁用池子，全部内联跑，而不是让 worker 认不出自己然后死锁。）
-
-**上限与突发额度。** 常规按需增长到 `max(2, activeProcessorCount)`。线程本地标记只挡得住 worker **直接**提交；一个 worker 如果扇出到别的线程（在 `withLargeStack` 批次里用 `concurrentPerform` 或 TaskGroup，索引 dyld cache 最自然的写法），那些提交来自池子认不出的线程，硬上限下外层等内层、内层排在外层后面，就是互锁。所以**阻塞式提交**额外获得一段额度，可以把池子撑到 `max(32, 4 × 常规上限)`——一个即将阻塞的调用方本身就是「有线程被 park 住」的证据，为它增长正是打破环的手段；**异步提交**挂起时不占线程、不可能参与这种环，因此守在常规上限内，一波 500 个 `executeAsync` 撑不大池子。同时阻塞的调用方超过突发上限时仍会排队，这一层残留限制没有消除，只是记录在案。
-
-队列用头指针出队，不用 `removeFirst()`（那是持锁的 O(n) memmove），**并且出队时把槽位清空**——`removeAll` 只在队列恰好排空的那一刻才跑，持续突发下每个已执行完的闭包会一直被数组强引用，而 print / remangle 路径的闭包捕获着整棵 `Node` 树，峰值内存会随累计提交量而不是在途数量增长。每个 work item 包一层 `autoreleasepool`，否则 autorelease 对象的释放点会从「调用结束」漂移到「进程结束」。
-
-### 七、新增批量作用域 API
-
-`StackSafeExecutor.withLargeStack { }`，对应上游 SourceKit 的 `isStackDeep`。批量索引在最外层包一次，里面所有 demangle / print / remangle 直接内联跑，线程往返开销归零。
-
-### 八、结果不再取决于调用线程
-
-第一版的「当前线程栈够就内联跑」用的是 2MB 阈值，这条阈值制造了一个反直觉的结果：**栈越大的线程能力越差**。主线程 8MB 永远过阈值、于是一直内联跑，保留自己那个低得多的上限；而 512KB 的协作线程不过阈值、被搬到 64MB worker 上。实测同一棵 1000 层的树，debug 下 512KB 线程完整输出、8MB 线程返回 `<<too complex>>`，4MB 线程比 512KB 线程还差。`node.print()` 于是不是纯函数：同样的代码放进 `Task` 正常、放在主线程截断。新加的 `withLargeStack` 从主线程调用更是彻底空转——名字承诺的东西一件没做。
-
-现在阈值改成 **worker 自己的栈大小**：只有真正已经有 ≥64MB 可用的线程才内联跑，其余一律搬到 worker。于是契约变成一句能用的话：**无论从哪条线程调用，工作都在至少一个 worker 那么大的栈上跑**（除非池子拒收，那时 `StackBudget` 兜底）。代价是主线程的单次调用多一次线程往返（实测约 6 µs 量级）；批量场景本来就该用 `withLargeStack`，作用域内为零。
-
-`TypeDecoder` 也在这一轮补上了 `StackSafeExecutor`——它是三个引擎里唯一漏掉的，实测 512KB 协作线程上 200 层嵌套就抛 `too complex`，而同一棵树在同一线程上 print / mangle 能到 1000 层。因为 `TypeBuilder` 和它构建的类型都没有 `Sendable` 约束，走的是新增的 `executeWithUncheckedSendability`（调用方全程阻塞，是严格交接，编译器的检查在这里比实际情况更严）。
+结论：**丢机制、留数字**。每层探针、`StackBudget` 类型、64MB 门槛全部移除；它测出的帧大小数据（debug 下 printer 每层约 11.6KB、TypeDecoder 每深度单位约 30KB、512KB 栈上 deinit 约 620 层崩）成为新常数的校准依据。首版顺带做出的正确修复（迭代化、池化、析构、复用重置）全部保留。
 
 ## 数据
 
-**深度能力**（debug 构建，嵌套 Optional 符号）：
+**校准探测**（debug、8MB 线程、嵌套 `Optional`）：见上表。
 
-| | 改之前 | 改之后 |
-|---|---|---|
-| `print` | 384 层返回 `<<too complex>>`，**375 层崩溃** | **3000 层正常打印**，不崩 |
+**语料**：dyld 共享缓存全量 **4,522,325 个真实符号**（release），demangle 失败 0、node tree 不一致 0、remangle 不一致 0——新常数没有伤到任何真实符号。
 
-**线程往返开销**（release，512KB 线程）：
-
-| 操作 | 改之前 | 改之后 | 改善 |
-|---|---|---|---|
-| `demangleAsNode` | 46.73 µs | 12.48 µs | −73% |
-| `print` | 43.10 µs | 8.49 µs | −80% |
-| `mangleAsString` | 53.89 µs | 17.73 µs | −67% |
-
-**批量作用域**：50 次 demangle，用 `withLargeStack` 包住是 6.43 µs/次，不包是 11.3 µs/次；主线程内联基线是 6.58 µs/次——**作用域内的往返开销为零**。
-
-**正确性**：dyld 共享缓存全量语料 **4,522,325 个真实符号**，demangle 失败 0、node tree 不一致 0、remangle 不一致 0。
+**线程池收益**（release、512KB 线程，池化 vs 每次建线程）：`demangleAsNode` 46.73 → 12.48 µs（−73%）、`print` 43.10 → 8.49 µs（−80%）、`mangleAsString` 53.89 → 17.73 µs（−67%）。`withLargeStack` 批次内往返为零。
 
 ## 影响面
 
-- **`NodePrinter.maxPrintDepth` 标记为 deprecated**。它不再是护栏，保留只为让读它的代码继续编译。
-- **`Remangler.maxDepth` / `TypeDecoder.maxDepth` 提高到兜底值**，实际限制由栈决定。
-- **行为变化**：以前返回 `<<too complex>>` / `.tooComplex` 的深符号，现在多数会正常输出。依赖「超过 N 层就截断」的调用方需要知道这一点。
-- **`StackSafeExecutor` 新增 `withLargeStack(_:)`**，批量消费方应当采用。
-- **`Node.==` / `hash(into:)` 的遍历顺序变了**。哈希值在同一进程内自洽（Swift 的 `Hasher` 本来就是每进程随机种子），跨版本本就不保证稳定。
-- **非 Darwin 平台**：`StackBudget.forCurrentThread(fallbackDepthLimit:)` 退化为帧计数，取各引擎在本次改动前用的那个数，行为与改动前一致。
-- **主线程上的单次调用多一次线程往返**（见第八节）。换来的是「结果与调用线程无关」。
-- **`NodeReference.structuralHash` 的编码变了**，现在与 `Node.hash(into:)` 一致（两边都喂 `Node.Contents`）。之前两套手写编码对不上，导致 `structurallyEquals` 文档里承诺的「用外部 demangle 的 `Node` 在 `NodeReference` 字典键里查找」100% 查不到。同时给 `Node` 加了同名的 `structuralHash(into:)`（就是 `hash(into:)` 的别名），让这个用法两边对称。
-- **`extendedExistentialTypeShape` 的打印输出变了**：之前读子节点 1/2，而 demangler 建在 0/1，结果把 requirement signature 打在类型位置、类型本身输出 `<null node pointer>`。C++ 上游有同样的 off-by-one，这里**有意与上游分歧**——`<null node pointer>` 对一个展示符号的工具没有任何用处。
-- **store 打印路径不再污染 `NodeCache.shared`**：printer 中三处对嵌套 mangled 名字的重新 demangle 原先走公开的 `demangleAsNode`（默认 intern），现在走 `demangleAsNodeTransient`。整个二进制打印一遍不再让全局缓存无界增长。
-- **`DemanglingPrinter` / `NodePrinter` 现在可以安全复用**：`printRoot` 会重置 target、fragment 缓存、`specialized ` 前缀标记和深度状态。之前只重置了栈预算，于是第二个符号会把第一个的输出接在前面；store 路径更糟——缓存键是每个 store 从 0 开始的节点索引，跨 store 直接撞车。缓存键现在是整个 `NodeReference`（store 身份 + 索引）。
+- **`NodePrinter<Target>` 变为纯静态入口**：`print(_:using:)` + `maxPrintDepth`；实例构造与 `printRoot` 不再公开（#12 的修复，下游已迁移）。
+- **深度上限下调**（768→512、1024→384、1024→160）：debug 下从「先崩」变成「先拒」；release 下拒绝点比上游早，但仍在任何真实符号的 2 倍以上。
+- **`TypeDecoder` 回调线程契约恢复为调用者线程**。
+- **`Node.description` 不再跳线程**（调试器安全）。
+- **主线程 / 大栈线程上的调用零往返**（恢复 main 行为）。
+- 非 Darwin 平台无变化：没有执行器，深度上限单独生效。
 
 ## 迁移注意事项
 
-- 批量场景请改用 `StackSafeExecutor.withLargeStack { }` 包住整批，而不是依赖逐次调用的自动跳转。
-- 直接驱动 `DemanglingPrinter` / `NodePrinter` 的富文本消费方不需要改动：护栏在 `printName` 内部，`printRoot` 也受保护。
-- 若消费方自己建线程跑 demangling，建议把 `stackSize` 设为 64MB 并在其上直接调用——`StackSafeExecutor` 会判定栈足够而全程内联，零往返。
+- 富文本消费方：`var printer = NodePrinter<T>(...); printer.printRoot(node)` → `NodePrinter<T>.print(node, using: options)`。
+- 批量场景包 `StackSafeExecutor.withLargeStack {}`；自建线程直接把 `stackSize` 设为 8MB 以上，执行器判定栈足够会全程内联。
+- 依赖「1000 层也能完整打印」的调用方（如果存在）：现在统一在校准过的深度拒绝，这是有意的取舍。
 
-## 未解决 / 待评估
+## 未解决 / 有意保留
 
-### 仍是递归、且是有意保留的
-
-- **`Demangler` 的 `setParentForOpaqueReturnTypeNodesImpl` 与 `demangleBoundGenericArgs`** —— 前者处理 opaque return type（即 `some View`），后者处理绑定泛型，都在常规路径上。`Demangler` 是三个引擎里唯一没有 depth 参数的（主循环不是递归下降，上游也因此没给它深度限制），接护栏要单独引入状态。
-- **`demangleSwift3*` 的 16 函数互递归环** —— 只有 `_T` 前缀符号可达，基本绝迹，上游同样无限制。
-
-这两条都在 `demangleAsNode` 内部，而 `demangleAsNode` 走 `StackSafeExecutor`，所以确实跑在 64MB worker 上，实测 demangle 到 4000 层没问题，**现实深度下不会崩**；但它们的失败模式是崩溃而不是报错。想把「预期能撑住的深度」再往上抬之前，得先给它们加护栏。
-
-> 上一版这里还列着 `Node.Rewriter.rewrite` 和 `Node.description`，理由写的是「`open class`，改迭代会改变可重写点」和「都跑在 64MB worker 上」。两条都不成立：`rewrite` 是 `public final func`（只有 `visit` 是 `open`），而它根本没经过 `StackSafeExecutor`，实测 512KB 线程上约 600 层就 SIGBUS。两者现已改成迭代，见上文第四节。
-
-### 其他待评估
-- **printer 改成显式栈迭代**（彻底与线程栈解耦）暂未做：64MB 已足够任何真实符号，而 printer 带着 `printCache`、`asPrefixContext` 等状态，迭代化的出错面远大于收益。
-- 每层探针的实测代价尚未单独量化（当前数据是端到端的，且端到端是净改善）。若后续发现是热点，可考虑「探针 + 观测到的实际每层开销自适应调整间隔」，而不是回到固定间隔。
+- **`Demangler` 的 `setParentForOpaqueReturnTypeNodesImpl` / `demangleBoundGenericArgs` 仍是无保护递归**——与上游一致（上游解析器同样无深度限制），主循环迭代、这两处现实深度浅。失败模式是崩溃而非报错；要抬高预期深度得先加保护。
+- **`demangleSwift3*` 未移植上游 `OldDemangler` 的 `MaxDepth = 1024`**——`_T` 前缀基本绝迹，已决定不管（2026-07-29）。
+- **2MB 门槛不是「下面一定有 8MB」的保证**——一个已经吃掉 6MB 栈的调用者仍会内联跑，debug 下深符号可能崩。与 main、与上游 runtime 的暴露面相同；clang 的 256KB 门槛同理。若未来要绝对保证，把门槛提到「剩余 ≥ 上限所需」即可（一个常数的改动）。

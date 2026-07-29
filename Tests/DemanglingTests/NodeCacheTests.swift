@@ -280,8 +280,11 @@ struct NodeCacheDemangleTests {
         #expect(interned.print(using: .default) == uninterned.print(using: .default))
         #expect(try mangleAsString(interned) == mangleAsString(uninterned), "Remangling should be unaffected by interning")
 
-        // Clean up
-        NodeCache.shared.clear()
+        // Deliberately no `NodeCache.shared.clear()` cleanup: top-level suites
+        // run in parallel and `.serialized` only orders tests within this one,
+        // so a clear here can land between another suite's two `demangleAsNode`
+        // calls and break its canonical-instance assertions. The handful of
+        // nodes this test pins are irrelevant; a concurrent clear is not.
     }
 }
 

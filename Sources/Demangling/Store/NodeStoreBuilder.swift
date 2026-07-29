@@ -60,8 +60,17 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// The intermediate `Node` tree is transient and fully cache-free: neither
     /// leaves nor subtrees touch `NodeCache.shared`, so bulk demangling leaves
     /// no trace in global state (proposal 0001, Phase 3).
-    public mutating func demangle(_ mangled: String, isType: Bool = false) throws(DemanglingError) -> NodeStore.NodeIndex {
-        let tree = try demangleAsNodeTransient(mangled, isType: isType)
+    ///
+    /// - Parameter symbolicReferenceResolver: resolves symbolic references
+    ///   (`\u{01}`–`\u{0C}` markers) encountered in `mangled`. Bulk indexing of
+    ///   metadata mangled names — this method's target use — is exactly where
+    ///   those occur; without a resolver such symbols throw.
+    public mutating func demangle(
+        _ mangled: String,
+        isType: Bool = false,
+        symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil
+    ) throws(DemanglingError) -> NodeStore.NodeIndex {
+        let tree = try demangleAsNodeTransient(mangled, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver)
         return intern(tree)
     }
 

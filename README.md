@@ -206,8 +206,7 @@ struct AttributedStringTarget: NodePrinterTarget {
     }
 }
 
-var printer = NodePrinter<AttributedStringTarget>(options: .default)
-let attributed = printer.printRoot(node)
+let attributed = NodePrinter<AttributedStringTarget>.print(node, using: .default)
 ```
 
 ### Type Decoding
@@ -243,18 +242,20 @@ let node = try demangleAsNode(symbol, internsSubtrees: false)
 
 ### Deep Generic Nesting and Thread Stacks
 
-Recursion in the printer, remangler, and type decoder is bounded by **remaining stack space**, not by a fixed frame count. Deeply nested generic types — the concrete type behind a `some View` body, for example — print and remangle in full rather than degrading to `<<too complex>>` at an arbitrary depth, and running out of stack produces that marker (or a `.tooComplex` error) instead of crashing the process, in every build configuration.
+Recursion in the printer, remangler, and type decoder is bounded by fixed depth limits, the same model the Swift compiler uses — but calibrated so they actually fire before the stack dies in **unoptimized builds** (upstream's constants assume release-built frames and an 8MB stack). Every limit clears the deepest real-world symbol measured by 2× or more; a pathologically deep tree degrades to `<<too complex>>` (or a `.tooComplex` / type-lookup error) instead of crashing the process, identically in debug and release.
 
-On Darwin every thread except the main one gets a 512KB stack, which only covers a few dozen levels of nesting — and the main thread's 8MB is not much better in an unoptimized build. Calls are therefore moved onto a pooled worker with a large stack unless the calling thread already has one, so the result does not depend on which thread produced it. When you are about to make many calls, wrap the batch so it pays for that hop once:
+On Darwin every thread except the main one gets a 512KB stack, which only covers a few dozen levels of nesting. When the calling thread runs low, printing, remangling and demangling hop onto a pooled 8MB-stack worker; threads with room to spare (the main thread, or big threads you create yourself) run inline with zero overhead — which also keeps `po node` usable under LLDB. When you are about to make many calls from small-stack threads, wrap the batch so it pays for at most one hop:
 
 ```swift
-// One thread hop for the whole batch; every call inside runs inline.
+// At most one thread hop for the whole batch; every call inside runs inline.
 let results = StackSafeExecutor.withLargeStack {
     symbols.map { try? demangleAsNode($0) }
 }
 ```
 
-`withLargeStack` requires `@_spi(Internals) import Demangling`. If you drive the demangler from threads you create yourself, setting `stackSize` to 64MB has the same effect — the library detects the headroom and never hops.
+`withLargeStack` requires `@_spi(Internals) import Demangling`. If you drive the demangler from threads you create yourself, setting `stackSize` to 8MB or more has the same effect — the library detects the headroom and never hops.
+
+`TypeDecoder` is the deliberate exception: its `TypeBuilder` callbacks are your code and may be tied to an actor or a thread, so decoding always runs on the calling thread. Wrap deep batches in `withLargeStack` yourself.
 
 ### Bulk Demangling with NodeStore
 
