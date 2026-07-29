@@ -3,32 +3,32 @@
 /// `NodeReference`). See evolution proposal 0001, Phase 2.
 ///
 /// SPI note: exposed as `@_spi(Internals)` so deep consumers (MachOSwiftSection)
-/// can print `NodeReference` trees into custom rich targets. On the store path
-/// `NodePrintContext.node` receives nil (`name as? Node`); a rich target that
-/// keys on it must account for that until the context is abstracted over
-/// `DemanglingNode`. The type-reference scope hooks do receive a node on both
+/// can print `NodeReference` trees into custom rich targets.
+/// `NodePrintContext.node` is populated on both paths via `materializedNode` —
+/// free on the `Node` path, a small per-unique-node materialization on the
+/// store path (context-carrying writes happen inside cached fragments, so each
+/// unique node pays once). The type-reference scope hooks also deliver on both
 /// paths, but only the `Node` path delivers a canonical instance: store-backed
 /// printing materializes a fresh subtree per evaluation, so scopes must be
 /// keyed by structure (e.g. the remangled string) rather than by
-/// `===`/`ObjectIdentifier`. Wrap calls in `StackSafeExecutor.execute` for
-/// deeply nested symbols.
+/// `===`/`ObjectIdentifier`. Print through the static ``print(_:options:)``,
+/// which routes the walk through `StackSafeExecutor` — the instance-level walk
+/// is deliberately not public, so no consumer can accidentally tie the depth a
+/// tree survives to the stack its calling thread happens to have left.
 @_spi(Internals)
 public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: Sendable {
-    /// The frame count that used to bound the print recursion, mirroring
-    /// ``swift::Demangle::NodePrinter::MaxDepth``.
+    /// Bails the print recursion with `<<too complex>>` once a single
+    /// root-to-leaf path would exceed this many ``printName`` frames.
     ///
-    /// No longer the guard: a frame count cannot be right for a debug build, a
-    /// release build and both `DemanglingNode` specializations at once, and
-    /// calibrated for release it rejected legitimate deeply nested generics
-    /// long before the stack was anywhere near full. ``StackBudget`` measures
-    /// the stack directly instead. Kept only so existing callers that read it
-    /// still compile.
-    @available(*, deprecated, message: "The print recursion is bounded by remaining stack, not by a frame count. See StackBudget.")
-    public static var maxPrintDepth: Int { classicPrintDepthLimit }
-
-    /// The frame count this engine used before ``StackBudget`` existed, kept as
-    /// the fallback where a platform cannot report thread stack bounds.
-    static var classicPrintDepthLimit: Int { 768 }
+    /// The C++ ``NodePrinter`` uses 768, calibrated for release-built frames
+    /// on the 8MB stack every thread that demangles is given upstream. This
+    /// library is also built unoptimized, where one ``printName`` level was
+    /// measured at ~11.6KB of stack (725 levels survived an 8MB thread, 745
+    /// overflowed it) — at 768 the stack dies before the counter fires. 512
+    /// levels ≈ 5.9MB fits the ``StackSafeExecutor`` thread with headroom,
+    /// and the deepest real-world symbol measured (a SwiftUI `View.Body`
+    /// typealias) is 41 levels.
+    public static var maxPrintDepth: Int { 512 }
 
     /// Bound for ``findSugar(_:depth:)``, the only print recursion that does
     /// not converge on ``printName(_:asPrefixContext:)``. Sugar wrappers are a
@@ -41,13 +41,17 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     private var hidingCurrentModule: String = ""
     private var dependentMemberTypeDepth: Int = 0
     private var printDepth: Int = 0
-    /// Bounds the recursion by remaining stack rather than by frame count.
-    /// Re-derived at every ``printRoot(_:)`` so a reused printer instance never
-    /// inherits an exhausted budget from a previous walk.
-    private var stackBudget: StackBudget = .countingFrames(upTo: classicPrintDepthLimit)
-    /// Number of times the walk gave up for want of stack. Used to detect that
-    /// a subtree's rendering is a truncation and must not enter ``printCache``.
-    private var stackBailCount: Int = 0
+    /// Number of times the walk hit ``maxPrintDepth`` and gave up. Used to
+    /// detect that a subtree's rendering is a truncation and must not enter
+    /// ``printCache``.
+    private var truncationCount: Int = 0
+    /// Number of times ``printSpecializationPrefix`` consulted the one-shot
+    /// "specialized " latch. A fragment during whose rendering that happened
+    /// depends on walk-global state — it either contains the prefix (and a
+    /// cache replay would print it a second time) or omits it (and a replay at
+    /// a position where the latch is clear would drop it) — so such fragments
+    /// must not enter ``printCache``.
+    private var specializationPrefixVisitCount: Int = 0
     /// Memoizes the rendered fragment for each shared substitution node.
     /// The demangler returns the same ``SomeNode`` instance for every
     /// back-reference (``A23_`` etc.), so one mangling can produce a DAG
@@ -66,6 +70,19 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         self.options = options
     }
 
+    /// Prints `root` into a fresh `Target` on a stack large enough for real
+    /// symbols.
+    ///
+    /// This is the only public way to run the walk: it routes through
+    /// `StackSafeExecutor`, so the depth a tree survives does not depend on
+    /// how much stack the calling thread happens to have left.
+    public static func print(_ root: SomeNode, options: DemangleOptions = .default) -> Target {
+        StackSafeExecutor.executeWithUncheckedSendability {
+            var printer = DemanglingPrinter(options: options)
+            return printer.printRoot(root)
+        }
+    }
+
     /// Prints `root` and returns the finished target.
     ///
     /// Every piece of walk state is reset here, not just the stack budget.
@@ -76,27 +93,25 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// symbol silently lost its prefix. The cache key is where it bit hardest
     /// — on the store path it is a per-store node index, and index 0 of one
     /// store means nothing in another.
-    public mutating func printRoot(_ root: SomeNode) -> Target {
+    mutating func printRoot(_ root: SomeNode) -> Target {
         target = Target()
         printCache.removeAll(keepingCapacity: true)
         specializationPrefixPrinted = false
         dependentMemberTypeDepth = 0
         printDepth = 0
-        stackBudget = .forCurrentThread(fallbackDepthLimit: Self.classicPrintDepthLimit)
-        stackBailCount = 0
+        truncationCount = 0
+        specializationPrefixVisitCount = 0
         _ = printName(root)
         return target
     }
 
     private mutating func printName(_ name: SomeNode, asPrefixContext: Bool = false) -> SomeNode? {
-        guard stackBudget.hasHeadroom(atDepth: printDepth) else {
+        guard printDepth < Self.maxPrintDepth else {
             // Matches the C++ printer's behaviour when it hits `MaxDepth`: emit
-            // the marker in place and unwind this path only. Unlike a frame
-            // count this fires only when the stack really is about to run out,
-            // so on a large-stack worker a legitimately deep generic prints in
-            // full.
+            // the marker in place and unwind this path only, so siblings of the
+            // too-deep path still print.
             target.write("<<too complex>>")
-            stackBailCount += 1
+            truncationCount += 1
             return nil
         }
         // Only memoize prints that don't depend on caller-side state. A
@@ -116,15 +131,18 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             // live target and remember it for later reuse.
             var subTarget = Target()
             swap(&target, &subTarget)
-            let bailCountBefore = stackBailCount
+            let truncationCountBefore = truncationCount
+            let specializationPrefixVisitCountBefore = specializationPrefixVisitCount
             let result = dispatchPrintName(name, asPrefixContext: asPrefixContext)
             swap(&target, &subTarget)
-            // Only memoize a complete rendering. If any descendant gave up for
-            // want of stack, this fragment ends in `<<too complex>>`; caching it
-            // would replay that truncation at shallower positions that had
-            // plenty of headroom, turning a one-path degradation into a
-            // permanent one.
-            if stackBailCount == bailCountBefore {
+            // Only memoize a rendering that is complete and position-
+            // independent. A fragment whose descendant hit the depth limit
+            // ends in `<<too complex>>`, and one that consulted the one-shot
+            // "specialized " latch renders differently depending on where in
+            // the walk it runs; caching either replays the wrong output at
+            // positions the uncached walk would have handled correctly.
+            if truncationCount == truncationCountBefore,
+               specializationPrefixVisitCount == specializationPrefixVisitCountBefore {
                 printCache[name.printCacheIdentity] = subTarget
             }
             target.append(subTarget)
@@ -709,7 +727,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 
     private mutating func printModule(_ name: SomeNode) {
         if options.contains(.displayModuleNames) {
-            target.write(name.text ?? "", context: .context(for: name as? Node, state: .printModule))
+            target.write(name.text ?? "", context: .context(for: name.materializedNode, state: .printModule))
         }
     }
 
@@ -1758,7 +1776,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printIdentifier(_ name: SomeNode, asPrefixContext: Bool = false, parentKind: Node.Kind? = nil) {
-        target.write(name.text ?? "", context: .context(for: name as? Node, parentKind: parentKind, state: .printIdentifier))
+        target.write(name.text ?? "", context: .context(for: name.materializedNode, parentKind: parentKind, state: .printIdentifier))
     }
 
     private mutating func printAbstractStorage(_ name: SomeNode?, asPrefixContext: Bool, extraName: String) -> SomeNode? {
@@ -1937,6 +1955,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printSpecializationPrefix(_ name: SomeNode, description: String, paramPrefix: String = "") {
+        specializationPrefixVisitCount += 1
         if !options.contains(.displayGenericSpecializations) {
             if !specializationPrefixPrinted {
                 if name.children.first?.kind == .representationChanged {
@@ -2001,17 +2020,17 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         target.write("(")
         for tuple in parameters.children.enumerated() {
             if let label = labelList?.children.at(tuple.offset) {
-                target.write(label.kind == .identifier ? (label.text ?? "") : "_", context: .context(for: parameterType as? Node, state: .printFunctionParameters))
+                target.write(label.kind == .identifier ? (label.text ?? "") : "_", context: .context(for: parameterType.materializedNode, state: .printFunctionParameters))
                 target.write(":")
                 if showTypes {
                     target.write(" ")
                 }
             } else if !showTypes {
                 if let label = tuple.element.children.first(where: { $0.kind == .tupleElementName }) {
-                    target.write(label.text ?? "", context: .context(for: parameterType as? Node, state: .printFunctionParameters))
+                    target.write(label.text ?? "", context: .context(for: parameterType.materializedNode, state: .printFunctionParameters))
                     target.write(":")
                 } else {
-                    target.write("_", context: .context(for: parameterType as? Node, state: .printFunctionParameters))
+                    target.write("_", context: .context(for: parameterType.materializedNode, state: .printFunctionParameters))
                     target.write(":")
                 }
             }
@@ -2298,17 +2317,18 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 /// The printing logic lives in the generic engine so it can also print
 /// `NodeReference` trees straight from a `NodeStore` without materializing
 /// a class tree (see `NodeReference.print(using:)`).
-public struct NodePrinter<Target: NodePrinterTarget>: Sendable {
-    @available(*, deprecated, message: "The print recursion is bounded by remaining stack, not by a frame count. See StackBudget.")
-    public static var maxPrintDepth: Int { DemanglingPrinter<Target, Node>.classicPrintDepthLimit }
+public enum NodePrinter<Target: NodePrinterTarget> {
+    /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth``; see
+    /// `DemanglingPrinter.maxPrintDepth` for the calibration.
+    public static var maxPrintDepth: Int { DemanglingPrinter<Target, Node>.maxPrintDepth }
 
-    private var engine: DemanglingPrinter<Target, Node>
-
-    public init(options: DemangleOptions = .default) {
-        self.engine = DemanglingPrinter(options: options)
-    }
-
-    public mutating func printRoot(_ root: Node) -> Target {
-        engine.printRoot(root)
+    /// Prints `root` into a fresh `Target` on a stack large enough for real
+    /// symbols.
+    ///
+    /// This is the only public way to run the walk: it routes through
+    /// `StackSafeExecutor`, so the depth a tree survives does not depend on
+    /// how much stack the calling thread happens to have left.
+    public static func print(_ root: Node, using options: DemangleOptions = .default) -> Target {
+        DemanglingPrinter<Target, Node>.print(root, options: options)
     }
 }

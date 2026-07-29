@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Demangling
 
@@ -234,11 +235,33 @@ struct TypeDecoderTests {
 
 // MARK: - StringTypeBuilder
 
+/// Records which threads a `TypeBuilder`'s callbacks ran on, so tests can pin
+/// the decoder's contract that user code never leaves the calling thread.
+final class CallbackThreadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedThreads: Set<mach_port_t> = []
+
+    func record() {
+        lock.lock()
+        recordedThreads.insert(pthread_mach_thread_np(pthread_self()))
+        lock.unlock()
+    }
+
+    var observedThreads: Set<mach_port_t> {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedThreads
+    }
+}
+
 /// A `TypeBuilder` that produces a string representation of a type. Output
 /// format approximates the Swift AST type printer: nominal types use just the
 /// type name (module stripped), generics use `<>`, sugar types use `?`/`[]`,
 /// metatypes use `T.Type` with optional `@repr` prefix.
 struct StringTypeBuilder: TypeBuilder {
+    /// When set, key creation callbacks note the thread they were invoked on.
+    var callbackThreadRecorder: CallbackThreadRecorder?
+
     typealias BuiltType = String
     typealias BuiltTypeDecl = String
     typealias BuiltProtocolDecl = String
@@ -261,6 +284,7 @@ struct StringTypeBuilder: TypeBuilder {
     // MARK: Type Decls
 
     func createTypeDecl(node: Node, typeAlias: inout Bool) -> String? {
+        callbackThreadRecorder?.record()
         typeAlias = node.kind == .typeAlias || node.kind == .boundGenericTypeAlias
         return Self.extractName(from: node)
     }
@@ -286,11 +310,13 @@ struct StringTypeBuilder: TypeBuilder {
     // MARK: Nominals
 
     func createNominalType(typeDecl: String, parent: String?) -> String {
+        callbackThreadRecorder?.record()
         if let parent { return "\(parent).\(typeDecl)" }
         return typeDecl
     }
 
     func createBoundGenericType(typeDecl: String, args: [String], parent: String?) -> String {
+        callbackThreadRecorder?.record()
         let head = parent.map { "\($0).\(typeDecl)" } ?? typeDecl
         return "\(head)<\(args.joined(separator: ", "))>"
     }

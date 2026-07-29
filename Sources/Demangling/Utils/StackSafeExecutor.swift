@@ -13,35 +13,35 @@ private struct UncheckedSendableBox<Value>: @unchecked Sendable {
 ///
 /// On Darwin every thread except the main one gets a 512KB stack — Swift
 /// Concurrency cooperative workers and libdispatch workers alike — which is
-/// enough for a few dozen levels of generic nesting. ``StackBudget`` makes
-/// running out of it a clean `<<too complex>>` / `.tooComplex` instead of a
-/// crash; this type is what makes running out of it *rare*, by moving the work
-/// onto a pooled worker with a large stack.
+/// enough for a few dozen levels of generic nesting. The engines' depth limits
+/// make running out of stack a clean `<<too complex>>` / `.tooComplex` instead
+/// of a crash; this type is what makes running out of it *rare*, by moving the
+/// work onto a pooled worker with a large stack when the calling thread is low.
 ///
-/// This mirrors what the Swift compiler does. `lib/Demangling` contains no
-/// stack handling at all; its callers arrange a big stack once at a task
-/// boundary — SourceKit dispatches semantic requests onto an 8MB
-/// `llvm::thread` (`Concurrency-libdispatch.cpp`), IRGen creates its worker
-/// threads with `pthread_attr_setstacksize(8MB)` — and the engines carry depth
-/// limits. The difference here is granularity: a library cannot hoist the
-/// decision to the caller's task boundary, so ``withLargeStack(_:)`` exists for
-/// callers who *can*.
+/// This mirrors what the Swift project does. `lib/Demangling` contains no
+/// stack handling at all; its callers arrange a big stack at a task boundary —
+/// IRGen creates its worker threads with `pthread_attr_setstacksize(8MB)`
+/// "to match the main thread" (`IRGen.cpp`), module-interface subcompilations
+/// run on explicit 8MB threads (`ModuleInterfaceBuilder.cpp`) — and the
+/// engines carry fixed depth limits calibrated for that stack. clang guards
+/// its own recursive parser the same way this type does: probe the remaining
+/// stack, and move to a fresh 8MB stack when it runs low
+/// (`clang/lib/Basic/Stack.cpp`).
 ///
 /// ### What is guaranteed
 ///
-/// Every entry point runs its work with at least ``largeStackThreadSize`` of
-/// stack below it, *whatever thread it was called from*, unless the pool cannot
-/// take the work at all (see ``LargeStackThreadPool``), in which case it runs
-/// inline and ``StackBudget`` keeps it from crashing.
-///
-/// The earlier design compared the caller's remaining stack against a 2MB
-/// threshold and ran inline above it. That made the result depend on the
-/// calling thread: the main thread's 8MB always cleared the bar and kept its own
-/// much lower ceiling, while a 512KB cooperative worker was moved to a 64MB
-/// worker and printed the same tree in full. `node.print()` returning
-/// `<<too complex>>` on the main thread and the complete type from inside a
-/// `Task` is not something a caller can reason about, so the comparison is now
-/// against a worker's own stack size — nothing short of that runs inline.
+/// Work starts only on a thread with at least ``minimumRemainingStackSize``
+/// of stack still free — the caller's own thread when it qualifies, a
+/// large-stack thread otherwise. The engines' depth limits bound how much of
+/// it a walk may consume; they are calibrated for a full
+/// ``largeStackThreadSize`` stack, so a caller that has already consumed most
+/// of a large stack before calling in relies on the limits' margin rather
+/// than on a fresh guarantee. This matches the upstream model (fixed limits
+/// sized for 8MB threads) rather than trying to make output fully
+/// thread-independent: an earlier design compared against a 64MB worker-sized
+/// stack so that *no* thread ran inline, which made every call from the main
+/// thread hop — blocking debugger expression evaluation (`po node` never
+/// schedules the worker) and inverting priority against the pool.
 ///
 /// SPI note: exposed as `@_spi(Internals)` so deep consumers driving
 /// ``DemanglingPrinter`` directly get the same treatment as the library's own
@@ -49,37 +49,46 @@ private struct UncheckedSendableBox<Value>: @unchecked Sendable {
 @_spi(Internals)
 public enum StackSafeExecutor {
     #if canImport(Darwin)
-    /// Stack size for the pooled workers.
+    /// Minimum remaining stack below which work is moved to a large-stack
+    /// thread.
     ///
-    /// A thread stack is a *virtual* reservation: only the pages the thread
-    /// actually writes to are backed by physical memory, so raising this costs
-    /// address space (abundant on 64-bit) rather than resident memory. Sized to
-    /// hold the deepest generic nesting a real symbol reaches even in an
-    /// unoptimized build, where one nesting level of the printer costs roughly
-    /// 20KB: 8MB ran out at about 400 levels, 64MB carries past 3000.
-    static let largeStackThreadSize = 64 * 1024 * 1024 // 64MB
+    /// clang considers 256KB sufficient between probes of its recursive
+    /// parser; the demangling engines probe once per entry rather than once
+    /// per frame, so this is deliberately eight times more conservative.
+    static let minimumRemainingStackSize = 2 * 1024 * 1024 // 2MB
+
+    /// Stack size for pooled workers and dedicated fallback threads.
+    ///
+    /// Matches the macOS main thread and the stack the Swift project gives
+    /// every thread that demangles (see the type discussion). The engines'
+    /// depth limits are calibrated against this size in an unoptimized build.
+    static let largeStackThreadSize = 8 * 1024 * 1024 // 8MB
     #endif
 
-    /// Runs `body` on a large-stack worker and returns its result.
+    /// Runs `body` with a large stack and returns its result.
     ///
     /// Use this at a batch boundary — indexing every symbol of a binary, say —
-    /// so the whole batch pays for one thread hop instead of one per call.
-    /// Every nested demangle / print / remangle inside `body` then sees a stack
-    /// with room to spare and runs inline.
+    /// so the whole batch pays for at most one thread hop instead of one per
+    /// call. Calls inside `body` then find plenty of remaining stack and run
+    /// inline.
     public static func withLargeStack<Success: Sendable, Failure: Error>(
         _ body: @escaping @Sendable () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         try execute(body)
     }
 
-    /// Executes the given block on a stack large enough for real symbols,
-    /// moving it to a pooled worker unless the current thread already qualifies.
+    /// Executes the given block, moving it to a large-stack thread when the
+    /// current thread's remaining stack is insufficient.
     public static func execute(_ block: @escaping @Sendable () -> String) -> String {
         #if canImport(Darwin)
-        if currentThreadAlreadyHasAWorkerSizedStack {
+        if currentThreadHasSufficientStack {
             return block()
         }
-        return runOnPoolWorker(block)
+        nonisolated(unsafe) var result = ""
+        runOnLargeStack {
+            result = block()
+        }
+        return result
         #else
         return block()
         #endif
@@ -91,10 +100,18 @@ public enum StackSafeExecutor {
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         #if canImport(Darwin)
-        if currentThreadAlreadyHasAWorkerSizedStack {
+        if currentThreadHasSufficientStack {
             return try block()
         }
-        return try runOnPoolWorker(block)
+        nonisolated(unsafe) var outcome: Result<Success, Failure>!
+        runOnLargeStack {
+            do throws(Failure) {
+                outcome = .success(try block())
+            } catch {
+                outcome = .failure(error)
+            }
+        }
+        return try outcome.get()
         #else
         return try block()
         #endif
@@ -103,16 +120,16 @@ public enum StackSafeExecutor {
     /// ``execute(_:)`` for callers whose values carry no `Sendable`
     /// conformance.
     ///
-    /// `TypeBuilder` and the types it builds are deliberately unconstrained, so
-    /// the type decoder cannot use the checked entry point. The call is still a
-    /// strict handoff — the calling thread blocks for its whole duration and no
-    /// other thread can reach the values — which is precisely the shape the
-    /// checking cannot express.
+    /// `NodePrinterTarget` implementations are deliberately unconstrained, so
+    /// the printing entry points cannot use the checked variant for a generic
+    /// target. The call is still a strict handoff — the calling thread blocks
+    /// for its whole duration and no other thread can reach the values —
+    /// which is precisely the shape the checking cannot express.
     static func executeWithUncheckedSendability<Success, Failure: Error>(
         _ block: @escaping () throws(Failure) -> Success
     ) throws(Failure) -> Success {
         #if canImport(Darwin)
-        if currentThreadAlreadyHasAWorkerSizedStack {
+        if currentThreadHasSufficientStack {
             return try block()
         }
         // Boxed as a non-throwing closure returning a `Result`: a typed-throws
@@ -126,15 +143,9 @@ public enum StackSafeExecutor {
             }
         })
         nonisolated(unsafe) var outcome: Result<Success, Failure>!
-        let semaphore = DispatchSemaphore(value: 0)
-        let accepted = LargeStackThreadPool.shared.trySubmit(allowingOverflow: true) {
+        runOnLargeStack {
             outcome = blockBox.value()
-            semaphore.signal()
         }
-        guard accepted else {
-            return try block()
-        }
-        semaphore.wait()
         return try outcome.get()
         #else
         return try block()
@@ -147,7 +158,7 @@ public enum StackSafeExecutor {
         _ block: @escaping @Sendable () throws(Failure) -> Success
     ) async throws(Failure) -> Success {
         #if canImport(Darwin)
-        if currentThreadAlreadyHasAWorkerSizedStack {
+        if currentThreadHasSufficientStack {
             return try block()
         }
         let outcome: Result<Success, Failure>? = await withCheckedContinuation { continuation in
@@ -161,13 +172,24 @@ public enum StackSafeExecutor {
                     continuation.resume(returning: .failure(error))
                 }
             }
-            if !accepted {
+            if accepted {
+                return
+            }
+            // The pool cannot take it: run on a dedicated thread, and if even
+            // that cannot be created, inline — the depth limits degrade the
+            // result instead of crashing.
+            let spawned = spawnDedicatedLargeStackThread {
+                do throws(Failure) {
+                    continuation.resume(returning: .success(try block()))
+                } catch {
+                    continuation.resume(returning: .failure(error))
+                }
+            }
+            if !spawned {
                 continuation.resume(returning: nil)
             }
         }
         guard let outcome else {
-            // The pool could not take it. Running inline keeps the caller
-            // making progress; `StackBudget` bounds it to the stack it has.
             return try block()
         }
         return try outcome.get()
@@ -177,57 +199,90 @@ public enum StackSafeExecutor {
     }
 
     #if canImport(Darwin)
-    /// Whether the current thread already has at least as much stack below it
-    /// as a pool worker would provide, making a hop pointless.
-    ///
-    /// A worker is on its own stack by construction, and checking the
-    /// thread-local marker first also keeps nested calls off the two `pthread`
-    /// queries and the probe.
-    private static var currentThreadAlreadyHasAWorkerSizedStack: Bool {
-        if LargeStackThreadPool.isRunningOnPoolWorker {
-            return true
-        }
+    /// Whether the current thread still has ``minimumRemainingStackSize`` of
+    /// stack below the probe.
+    private static var currentThreadHasSufficientStack: Bool {
         let stackTopAddress = pthread_get_stackaddr_np(pthread_self())
         let stackSize = pthread_get_stacksize_np(pthread_self())
         let stackBaseAddress = stackTopAddress - stackSize
         var stackProbe = 0
         let currentAddress = withUnsafeMutablePointer(to: &stackProbe) { Int(bitPattern: $0) }
         let remainingStackSpace = currentAddress - Int(bitPattern: stackBaseAddress)
-        return remainingStackSpace >= largeStackThreadSize
+        return remainingStackSpace >= minimumRemainingStackSize
     }
 
-    private static func runOnPoolWorker<Success: Sendable>(_ block: @escaping @Sendable () -> Success) -> Success {
-        nonisolated(unsafe) var result: Success!
+    /// Runs `work` on a large-stack thread and blocks until it completes,
+    /// degrading to inline execution when no such thread can be arranged.
+    ///
+    /// Routing, in order:
+    /// 1. A pool worker that is itself low on stack must not submit back into
+    ///    its own capped pool (the wait could be behind the very item it is
+    ///    running), so it gets a dedicated one-off thread.
+    /// 2. Everything else goes to the pool; a caller about to block may grow
+    ///    it past steady state, which is what breaks fan-out wait cycles.
+    /// 3. A refused submission gets a dedicated one-off thread.
+    /// 4. If the OS cannot create a thread at all, the work runs inline and
+    ///    the engines' depth limits keep it from crashing.
+    private static func runOnLargeStack(_ work: @escaping @Sendable () -> Void) {
         let semaphore = DispatchSemaphore(value: 0)
-        let accepted = LargeStackThreadPool.shared.trySubmit(allowingOverflow: true) {
-            result = block()
+        let signalingWork: @Sendable () -> Void = {
+            work()
             semaphore.signal()
         }
-        guard accepted else {
-            return block()
+
+        if !LargeStackThreadPool.isRunningOnPoolWorker,
+           LargeStackThreadPool.shared.trySubmit(allowingOverflow: true, signalingWork) {
+            semaphore.wait()
+            return
         }
-        semaphore.wait()
-        return result
+        if spawnDedicatedLargeStackThread(signalingWork) {
+            semaphore.wait()
+            return
+        }
+        work()
     }
 
-    private static func runOnPoolWorker<Success: Sendable, Failure: Error>(
-        _ block: @escaping @Sendable () throws(Failure) -> Success
-    ) throws(Failure) -> Success {
-        nonisolated(unsafe) var outcome: Result<Success, Failure>!
-        let semaphore = DispatchSemaphore(value: 0)
-        let accepted = LargeStackThreadPool.shared.trySubmit(allowingOverflow: true) {
-            do throws(Failure) {
-                outcome = .success(try block())
-            } catch {
-                outcome = .failure(error)
+    /// Context handed to a dedicated thread's C entry point.
+    private final class DedicatedThreadContext {
+        let work: @Sendable () -> Void
+
+        init(work: @escaping @Sendable () -> Void) {
+            self.work = work
+        }
+    }
+
+    /// Starts a one-off detached thread with a ``largeStackThreadSize`` stack,
+    /// reporting whether the OS actually made it.
+    ///
+    /// `Thread`/`NSThread` is deliberately not used: `start()` returns `Void`
+    /// and swallows exactly the failure this reports.
+    static func spawnDedicatedLargeStackThread(_ work: @escaping @Sendable () -> Void) -> Bool {
+        var threadAttributes = pthread_attr_t()
+        guard pthread_attr_init(&threadAttributes) == 0 else { return false }
+        defer { pthread_attr_destroy(&threadAttributes) }
+        guard pthread_attr_setstacksize(&threadAttributes, largeStackThreadSize) == 0,
+              pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
+        else {
+            return false
+        }
+        _ = pthread_attr_set_qos_class_np(&threadAttributes, QOS_CLASS_USER_INITIATED, 0)
+
+        let context = Unmanaged.passRetained(DedicatedThreadContext(work: work)).toOpaque()
+        var threadHandle: pthread_t?
+        let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
+            let dedicatedContext = Unmanaged<StackSafeExecutor.DedicatedThreadContext>
+                .fromOpaque(rawContext).takeRetainedValue()
+            pthread_setname_np("swift-demangling.large-stack")
+            autoreleasepool {
+                dedicatedContext.work()
             }
-            semaphore.signal()
+            return nil
+        }, context)
+        guard creationResult == 0 else {
+            Unmanaged<DedicatedThreadContext>.fromOpaque(context).release()
+            return false
         }
-        guard accepted else {
-            return try block()
-        }
-        semaphore.wait()
-        return try outcome.get()
+        return true
     }
     #endif
 }
@@ -237,47 +292,55 @@ public enum StackSafeExecutor {
 ///
 /// Creating and joining a thread per call costs roughly 41µs measured on this
 /// package — five to eighteen times the work itself for a typical symbol, and
-/// seconds of pure overhead when indexing a framework. Workers are therefore
-/// created on demand and kept.
+/// seconds of pure overhead when indexing a framework from small-stack
+/// threads. Workers are therefore created on demand and kept.
 ///
-/// Four properties are load-bearing and easy to lose:
+/// Properties that are load-bearing and easy to lose:
 ///
 /// - **Workers never retire.** An idle-timeout retirement has a window between
 ///   the timeout firing and the worker reacquiring the lock in which a
 ///   submission counts it as available, creates no replacement, and signals
 ///   nobody — the work item is then never run and the caller blocks forever.
 ///   Keeping workers alive removes the window rather than trying to close it.
-///   Idle workers cost a kernel thread structure each; their 64MB stacks are
+///   Idle workers cost a kernel thread structure each; their 8MB stacks are
 ///   untouched address space.
 /// - **A worker is created before its work is queued, and creation is
 ///   checked.** `Thread.start()` reports nothing when the OS refuses to make a
-///   thread, so the previous design incremented the worker count, failed to
-///   start anything, and left the item queued with nobody to run it: the caller
-///   blocked forever, and because the phantom worker still counted, every later
-///   submission saw a full pool and never created a replacement — one failure
-///   poisoned a process-wide singleton permanently. `pthread_create` returns an
-///   error code, so the slot is released and the submission refused instead.
-/// - **Submission can be refused.** A refused item runs on the caller's own
-///   thread. That is what makes every failure mode above degrade rather than
-///   hang, and ``StackBudget`` is what makes running inline safe.
-/// - **A worker never waits on the pool.** Printing re-enters demangling for
-///   nested mangled names, so work submitted from a worker would block on a
-///   capped pool. ``isRunningOnPoolWorker`` makes those calls run inline
-///   instead — they are already on a large stack, which is the whole point.
+///   thread, so a design built on it increments the worker count, fails to
+///   start anything, and leaves the item queued with nobody to run it: the
+///   caller blocks forever, and because the phantom worker still counts, every
+///   later submission sees a full pool and never creates a replacement — one
+///   failure poisons a process-wide singleton permanently. `pthread_create`
+///   returns an error code, so the slot is released instead.
+/// - **When the last spawn attempt fails, the failing submitter drains the
+///   queue itself.** Two concurrent submitters can each reserve a worker slot
+///   and both fail to spawn; the first to roll back still sees the other's
+///   reservation, concludes a worker survives, queues its item and blocks.
+///   Only the second roll-back can know the pool is truly empty — so it runs
+///   everything still queued on its own thread before refusing. Nobody hangs;
+///   the cost is running someone's work on a caller's stack in a process that
+///   cannot create threads at all, where the depth limits degrade instead of
+///   crash.
+/// - **Submission can be refused.** A refused item is the caller's to run —
+///   `StackSafeExecutor` puts it on a dedicated thread, or inline as the last
+///   resort. That is what makes every failure mode degrade rather than hang.
+/// - **A worker never submits back into its own pool.** Printing re-enters
+///   demangling for nested mangled names; a worker deep enough in its own
+///   stack to need a hop gets a dedicated thread instead
+///   (``StackSafeExecutor/runOnLargeStack(_:)``), because its wait could sit
+///   behind the very item it is running.
 ///
 /// ### The overflow allowance
 ///
-/// The thread-local marker only catches a worker submitting *directly*. A
-/// worker that fans out to other threads — `concurrentPerform` or a task group
-/// inside a ``StackSafeExecutor/withLargeStack(_:)`` batch — produces
-/// submissions from threads the pool cannot recognise, and with a hard cap the
-/// outer items wait for inner items that are queued behind them.
-///
-/// Blocking submissions therefore get an allowance above the steady-state
-/// limit: a caller that is about to block is evidence of a thread waiting, and
-/// growing for it is what breaks the cycle. Asynchronous submissions occupy no
-/// thread while suspended, cannot be part of such a cycle, and stay under the
-/// steady-state limit so a burst of them cannot inflate the pool.
+/// Blocking submissions may grow the pool above the steady-state limit: a
+/// worker that fans out — `concurrentPerform` or a task group inside a
+/// ``StackSafeExecutor/withLargeStack(_:)`` batch — produces submissions from
+/// threads the pool cannot recognise, and with a hard cap the outer items
+/// would wait for inner items queued behind them. A caller that is about to
+/// block is evidence of a thread waiting, and growing for it is what breaks
+/// the cycle. Asynchronous submissions occupy no thread while suspended,
+/// cannot be part of such a cycle, and stay under the steady-state limit so a
+/// burst of them cannot inflate the pool.
 ///
 /// Nesting deeper than ``burstWorkerLimit`` simultaneously blocked callers is
 /// still possible in principle; those submissions queue as before.
@@ -294,9 +357,9 @@ final class LargeStackThreadPool: @unchecked Sendable {
     /// bare `pthread_getspecific`.
     ///
     /// Without the marker the pool cannot tell a worker from any other thread,
-    /// and a worker submitting back into a capped pool would deadlock. The pool
-    /// disables itself instead: everything runs inline under ``StackBudget``,
-    /// which is a depth ceiling, not a crash.
+    /// and a worker submitting back into a capped pool could deadlock. The
+    /// pool disables itself instead: submissions are refused and
+    /// `StackSafeExecutor` falls back to dedicated threads.
     private static let workerMarkerKey: pthread_key_t? = {
         var key = pthread_key_t()
         guard pthread_key_create(&key, nil) == 0 else { return nil }
@@ -329,6 +392,18 @@ final class LargeStackThreadPool: @unchecked Sendable {
     /// is a kernel thread structure per worker.
     private let burstWorkerLimit = max(32, 4 * max(2, ProcessInfo.processInfo.activeProcessorCount))
 
+    /// Test hook: makes every spawn attempt fail as if the OS refused to
+    /// create the thread, so the failure paths can be exercised on a private
+    /// pool instance. Never set on ``shared``.
+    var simulatesSpawnFailureForTesting = false
+
+    /// Test hook: how long a simulated spawn failure takes to report. A real
+    /// `pthread_create` failure is not instantaneous either; the delay holds
+    /// concurrent submitters in the reserved-but-not-yet-failed state at the
+    /// same time, which is the interleaving the failure handling has to
+    /// survive.
+    var simulatedSpawnFailureDelayForTesting: TimeInterval = 0
+
     private let condition = NSCondition()
     private var pendingWorkItems: [@Sendable () -> Void] = []
     /// Index of the next item to run. Removing from the front of the array
@@ -358,8 +433,10 @@ final class LargeStackThreadPool: @unchecked Sendable {
     ///   item runs. Blocking callers may grow the pool past its steady-state
     ///   limit; see the type's discussion.
     /// - Returns: `false` if the pool cannot run the item, in which case the
-    ///   caller must run it itself. The item is never queued when this returns
-    ///   `false`.
+    ///   caller must run it elsewhere. When this returns `true` the item is
+    ///   guaranteed to run: by a worker, or — if thread creation collapses
+    ///   process-wide — on the thread of whichever submitter discovered the
+    ///   collapse.
     func trySubmit(allowingOverflow: Bool, _ workItem: @escaping @Sendable () -> Void) -> Bool {
         guard Self.workerMarkerKey != nil else { return false }
 
@@ -375,20 +452,56 @@ final class LargeStackThreadPool: @unchecked Sendable {
         if needsAdditionalWorker, !spawnWorker() {
             condition.lock()
             workerCount -= 1
-            let survivingWorkerCount = workerCount
-            condition.unlock()
-            // Nothing exists to drain the queue, so the item must not be
-            // queued at all.
-            if survivingWorkerCount == 0 {
+            if workerCount == 0 {
+                // Workers never retire, so a zero count here means no worker
+                // thread exists at all — and a concurrent submitter that saw
+                // this thread's reservation may have queued an item and
+                // blocked on it. Run everything still queued right here so
+                // nobody waits on a pool that cannot act, then refuse.
+                drainPendingWorkItemsWhileLocked()
+                condition.unlock()
                 return false
             }
+            condition.unlock()
         }
 
         condition.lock()
+        guard workerCount > 0 else {
+            // Every counted worker turned out to be a failed reservation and
+            // the last roll-back already ran its drain. Queueing now would
+            // strand the item: refuse instead.
+            condition.unlock()
+            return false
+        }
         pendingWorkItems.append(workItem)
         condition.signal()
         condition.unlock()
         return true
+    }
+
+    /// Runs every queued item on the calling thread. Entered with the lock
+    /// held and `workerCount == 0`; leaves the lock held.
+    ///
+    /// The lock is released around each item — items block on semaphores of
+    /// their own and may take arbitrarily long. New items queued meanwhile are
+    /// picked up on the next pass; they can only come from submitters racing
+    /// the same collapse, and running them here is what unblocks those
+    /// submitters.
+    private func drainPendingWorkItemsWhileLocked() {
+        while nextWorkItemIndex < pendingWorkItems.count {
+            let workItem = pendingWorkItems[nextWorkItemIndex]
+            pendingWorkItems[nextWorkItemIndex] = {}
+            nextWorkItemIndex += 1
+            if nextWorkItemIndex == pendingWorkItems.count {
+                pendingWorkItems.removeAll(keepingCapacity: true)
+                nextWorkItemIndex = 0
+            }
+            condition.unlock()
+            autoreleasepool {
+                workItem()
+            }
+            condition.lock()
+        }
     }
 
     /// Starts one worker, reporting whether the OS actually made the thread.
@@ -396,6 +509,12 @@ final class LargeStackThreadPool: @unchecked Sendable {
     /// `Thread`/`NSThread` is deliberately not used here: `start()` returns
     /// `Void` and swallows the failure this whole path exists to detect.
     private func spawnWorker() -> Bool {
+        if simulatesSpawnFailureForTesting {
+            if simulatedSpawnFailureDelayForTesting > 0 {
+                Thread.sleep(forTimeInterval: simulatedSpawnFailureDelayForTesting)
+            }
+            return false
+        }
         var threadAttributes = pthread_attr_t()
         guard pthread_attr_init(&threadAttributes) == 0 else { return false }
         defer { pthread_attr_destroy(&threadAttributes) }

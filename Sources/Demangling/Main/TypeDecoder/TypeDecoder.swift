@@ -18,19 +18,16 @@ struct TypeDecoderEngine<Builder: TypeBuilder, SomeNode: DemanglingNode> {
 
     private let builder: Builder
 
-    /// The frame count that used to bound the decode recursion, mirroring
-    /// ``swift::Demangle::TypeDecoder::MaxDepth``. Retained as a cycle backstop
-    /// only — see ``StackBudget`` for why the real limit is remaining stack.
-    private static var maxDepth: Int { StackBudget.absoluteDepthLimit }
-
-    /// The frame count this engine used before ``StackBudget`` existed, kept as
-    /// the fallback where a platform cannot report thread stack bounds.
-    private static var classicDecodeDepthLimit: Int { 1024 }
-
-    /// Captured at the start of each walk rather than at construction: a stack
-    /// floor is only meaningful on the thread that produced it, and the engine
-    /// is reusable.
-    private var stackBudget: StackBudget = .countingFrames(upTo: classicDecodeDepthLimit)
+    /// Maximum decode recursion depth.
+    ///
+    /// The C++ `TypeDecoder::MaxDepth` is 1024, calibrated for release-built
+    /// frames on an 8MB stack. This engine's unoptimized frames are enormous —
+    /// an 8MB thread overflowed between 120 and 130 levels of nested
+    /// `Optional`, roughly depth 250, or ~30KB of stack per depth unit — so
+    /// 1024 was pure decoration. 160 leaves ~35% headroom below the measured
+    /// floor, and still covers about 78 nesting levels, far past any real
+    /// type this engine is handed.
+    private static var maxDepth: Int { 160 }
 
     init(builder: Builder) {
         self.builder = builder
@@ -38,8 +35,7 @@ struct TypeDecoderEngine<Builder: TypeBuilder, SomeNode: DemanglingNode> {
 
     /// Given a demangle tree, attempt to turn it into a type.
     mutating func decodeMangledType(node: SomeNode, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        stackBudget = .forCurrentThread(fallbackDepthLimit: Self.classicDecodeDepthLimit)
-        return try decodeMangledType(node: node, depth: 0, forRequirement: forRequirement)
+        try decodeMangledType(node: node, depth: 0, forRequirement: forRequirement)
     }
 }
 
@@ -51,7 +47,7 @@ extension TypeDecoderEngine {
         depth: Int,
         forRequirement: Bool = true
     ) throws(TypeLookupError) -> BuiltType {
-        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
+        guard depth <= Self.maxDepth else {
             throw TypeLookupError("Mangled type is too complex")
         }
 
@@ -1025,7 +1021,7 @@ extension TypeDecoderEngine {
         depth: Int,
         results: inout [T]
     ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
-        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
+        guard depth <= Self.maxDepth else {
             throw TypeLookupError("Depth exceeded")
         }
 
@@ -1076,7 +1072,7 @@ extension TypeDecoderEngine {
         depth: Int,
         results: inout [T]
     ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
-        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
+        guard depth <= Self.maxDepth else {
             throw TypeLookupError("Depth exceeded")
         }
 
@@ -1141,11 +1137,17 @@ extension TypeDecoderEngine {
         parent: inout BuiltType?,
         typeAlias: inout Bool
     ) throws(TypeLookupError) {
-        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
+        guard depth <= Self.maxDepth else {
             throw TypeLookupError("Mangled type is too complex")
         }
 
         if node.kind == .type {
+            // A childless `.type` is constructible from public API
+            // (`Node.createTransient`, `NodeStoreBuilder.intern(kind:)`), so
+            // this must reject like `decodeMangledType` does, not trap.
+            guard node.hasChildren else {
+                throw TypeLookupError(node: node, message: "no children")
+            }
             return try decodeMangledTypeDecl(
                 node: node.children[0],
                 depth: depth + 1,
@@ -1210,7 +1212,7 @@ extension TypeDecoderEngine {
     }
 
     private func decodeMangledProtocolType(node: SomeNode, depth: Int) -> BuiltProtocolDecl? {
-        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
+        guard depth <= Self.maxDepth else {
             return nil
         }
 
@@ -1244,7 +1246,7 @@ extension TypeDecoderEngine {
         params: inout [FunctionParam<BuiltType>],
         hasParamFlags: inout Bool
     ) throws(TypeLookupError) {
-        guard depth <= Self.maxDepth, stackBudget.hasHeadroom(atDepth: depth) else {
+        guard depth <= Self.maxDepth else {
             return
         }
 
@@ -1517,26 +1519,22 @@ public final class TypeDecoder<Builder: TypeBuilder> {
 
     /// Given a demangle tree, attempt to turn it into a type.
     ///
-    /// Like the demangler, printer and remangler entry points, the walk runs on
-    /// a stack sized for real symbols. Without it this engine was the odd one
-    /// out: on the 512KB stack a `Task` runs on it ran out of budget after a
-    /// handful of nesting levels while printing the same tree from the same
-    /// thread handled a thousand.
+    /// Runs entirely on the calling thread: every `TypeBuilder` callback is
+    /// invoked where the caller is, so builders may hold actor-isolated or
+    /// otherwise thread-bound state. The cost of that contract is that stack
+    /// headroom is the caller's responsibility — the walk is bounded by a
+    /// depth limit calibrated for an 8MB stack, and a caller decoding
+    /// pathologically deep types from a small-stack thread should wrap the
+    /// call in `StackSafeExecutor.withLargeStack` itself.
     public func decodeMangledType(node: Node, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        let capturedBuilder = self.builder
-        return try StackSafeExecutor.executeWithUncheckedSendability { () throws(TypeLookupError) -> BuiltType in
-            var engine = TypeDecoderEngine<Builder, Node>(builder: capturedBuilder)
-            return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
-        }
+        var engine = TypeDecoderEngine<Builder, Node>(builder: builder)
+        return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
     }
 
     /// Store-backed variant: decodes straight from a `NodeStore` without
     /// materializing a `Node` tree (proposal 0001, Phase 2).
     public func decodeMangledType(node: NodeReference, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        let capturedBuilder = self.builder
-        return try StackSafeExecutor.executeWithUncheckedSendability { () throws(TypeLookupError) -> BuiltType in
-            var engine = TypeDecoderEngine<Builder, NodeReference>(builder: capturedBuilder)
-            return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
-        }
+        var engine = TypeDecoderEngine<Builder, NodeReference>(builder: builder)
+        return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
     }
 }

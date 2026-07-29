@@ -7,10 +7,11 @@ import Testing
 /// and node shapes that reach the printer without having come from the
 /// demangler.
 ///
-/// Both became reachable at the same time. `printRoot(_:)` re-derives the stack
-/// budget on every call, which is a statement that reusing a printer is
-/// supported; and `NodeStoreBuilder.intern(kind:...)`, `Node.createTransient`
-/// and `Node.Rewriter` all hand the printer trees the demangler never built.
+/// Both are real: `printRoot(_:)` resets every piece of walk state so the
+/// engine can be reused (the public static `print` builds a fresh engine per
+/// call, but the internal walk must not rely on that); and
+/// `NodeStoreBuilder.intern(kind:...)`, `Node.createTransient` and
+/// `Node.Rewriter` all hand the printer trees the demangler never built.
 @Suite
 struct NodePrinterRobustnessTests {
     // MARK: - Reuse
@@ -35,10 +36,10 @@ struct NodePrinterRobustnessTests {
 
         for optionSet in optionSets {
             let expected = trees.map { tree -> String in
-                var freshPrinter = NodePrinter<String>(options: optionSet.options)
+                var freshPrinter = DemanglingPrinter<String, Node>(options: optionSet.options)
                 return freshPrinter.printRoot(tree)
             }
-            var reusedPrinter = NodePrinter<String>(options: optionSet.options)
+            var reusedPrinter = DemanglingPrinter<String, Node>(options: optionSet.options)
             let actual = trees.map { reusedPrinter.printRoot($0) }
 
             #expect(actual == expected, "reused printer diverged with \(optionSet.name) options")

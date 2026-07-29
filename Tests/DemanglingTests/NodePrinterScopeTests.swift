@@ -66,14 +66,8 @@ struct NodePrinterScopeTests {
 
             let nodeTree = try demangleAsNode(mangled, internsSubtrees: false)
 
-            let nodePathTarget = StackSafeExecutor.execute { () -> ScopeRecordingTarget in
-                var nodePathPrinter = NodePrinter<ScopeRecordingTarget>(options: .default)
-                return nodePathPrinter.printRoot(nodeTree)
-            }
-            let referencePathTarget = StackSafeExecutor.execute { () -> ScopeRecordingTarget in
-                var referencePathPrinter = DemanglingPrinter<ScopeRecordingTarget, NodeReference>(options: .default)
-                return referencePathPrinter.printRoot(reference)
-            }
+            let nodePathTarget = NodePrinter<ScopeRecordingTarget>.print(nodeTree, using: .default)
+            let referencePathTarget = DemanglingPrinter<ScopeRecordingTarget, NodeReference>.print(reference, options: .default)
 
             #expect(referencePathTarget.text == nodePathTarget.text, "print divergence for \(mangled)")
             #expect(referencePathTarget.scopeEvents == nodePathTarget.scopeEvents, "scope divergence for \(mangled)")

@@ -101,9 +101,10 @@ struct LargeStackThreadPoolTests {
         #expect(workerCount > 0, "a 500-item burst should have created at least one worker")
     }
 
-    /// Printing re-enters demangling for nested mangled names. On a capped pool
-    /// a worker that submitted back into it would wait for a slot that only it
-    /// could free. Work started on a worker has to run inline instead.
+    /// Printing re-enters demangling for nested mangled names. A worker has
+    /// megabytes to spare at any realistic nesting point, so the remaining-
+    /// stack probe keeps the nested call inline — no second hop, and no
+    /// waiting on the pool the worker itself is running on.
     @Test func nestedCallsFromAWorkerRunInline() {
         final class ThreadIdentifierBox: @unchecked Sendable {
             var outerThread: mach_port_t = 0
@@ -150,27 +151,101 @@ struct LargeStackThreadPoolTests {
         #expect(box.observedThreads.first != box.callerThread)
     }
 
-    /// `withLargeStack` is a request, not a hint. The "does this thread already
-    /// have enough stack" short-circuit made it a no-op on the main thread's
-    /// 8MB, so wrapping a batch there bought nothing at all — the one case
-    /// where a caller most obviously reaches for it.
-    @Test func withLargeStackReachesAWorkerEvenFromALargeCallerStack() {
+    /// A thread that already has plenty of stack runs inline — no hop, no
+    /// semaphore wait. This is what keeps `po node` usable in LLDB (which only
+    /// runs the current thread, so a mandatory hop deadlocks expression
+    /// evaluation) and the main thread free of priority inversion. An earlier
+    /// design compared against the worker's own stack size, which no ordinary
+    /// thread clears, and made every main-thread call hop.
+    @Test func executionStaysInlineOnALargeCallerStack() {
         final class ObservationBox: @unchecked Sendable {
-            var ranOnPoolWorker = false
+            var executeThread: mach_port_t = 0
+            var withLargeStackThread: mach_port_t = 0
             var callerThread: mach_port_t = 0
-            var bodyThread: mach_port_t = 0
         }
         let box = ObservationBox()
 
         Self.runOnThread(stackSize: 8 * 1024 * 1024) {
             box.callerThread = pthread_mach_thread_np(pthread_self())
+            _ = StackSafeExecutor.execute { () -> String in
+                box.executeThread = pthread_mach_thread_np(pthread_self())
+                return ""
+            }
             StackSafeExecutor.withLargeStack {
-                box.ranOnPoolWorker = LargeStackThreadPool.isRunningOnPoolWorker
-                box.bodyThread = pthread_mach_thread_np(pthread_self())
+                box.withLargeStackThread = pthread_mach_thread_np(pthread_self())
             }
         }
 
-        #expect(box.ranOnPoolWorker, "withLargeStack must run its body on a pool worker")
-        #expect(box.bodyThread != box.callerThread)
+        #expect(box.executeThread == box.callerThread, "a caller with stack to spare must not hop")
+        #expect(box.withLargeStackThread == box.callerThread, "withLargeStack is satisfied by the caller's own large stack")
+    }
+
+    /// The complement: a small-stack caller must hop, and to a thread with the
+    /// full worker stack.
+    @Test func executionHopsToALargeStackFromASmallCallerStack() {
+        final class ObservationBox: @unchecked Sendable {
+            var callerThread: mach_port_t = 0
+            var bodyThread: mach_port_t = 0
+            var bodyStackSize = 0
+        }
+        let box = ObservationBox()
+
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize) {
+            box.callerThread = pthread_mach_thread_np(pthread_self())
+            _ = StackSafeExecutor.execute { () -> String in
+                box.bodyThread = pthread_mach_thread_np(pthread_self())
+                box.bodyStackSize = pthread_get_stacksize_np(pthread_self())
+                return ""
+            }
+        }
+
+        #expect(box.bodyThread != box.callerThread, "a 512KB caller must hop")
+        #expect(box.bodyStackSize >= StackSafeExecutor.largeStackThreadSize)
+    }
+
+    /// When the OS refuses to create any worker, no submitter may hang.
+    ///
+    /// The dangerous interleaving: two submitters both reserve a worker slot
+    /// and both fail to spawn. The first to roll back still sees the other's
+    /// phantom reservation, concludes a worker survives, queues its item and
+    /// blocks on it. Only the second roll-back can observe the true zero — so
+    /// it must drain the queue on its own thread before refusing, or the first
+    /// submitter waits forever on a pool that cannot act.
+    @Test func spawnFailureNeverStrandsASubmission() {
+        let pool = LargeStackThreadPool()
+        pool.simulatesSpawnFailureForTesting = true
+        // Holds every submitter in the reserved-but-not-yet-failed state at
+        // once, so the roll-backs genuinely race instead of serializing.
+        pool.simulatedSpawnFailureDelayForTesting = 0.25
+
+        let submitterCount = 8
+        let completionCounter = Counter()
+        let allSubmittersFinished = DispatchSemaphore(value: 0)
+
+        for _ in 0 ..< submitterCount {
+            Thread.detachNewThread {
+                let itemRan = DispatchSemaphore(value: 0)
+                let accepted = pool.trySubmit(allowingOverflow: true) {
+                    completionCounter.increment()
+                    itemRan.signal()
+                }
+                if accepted {
+                    // Pre-fix, this wait is where the first-to-roll-back
+                    // submitter hung forever.
+                    let outcome = itemRan.wait(timeout: .now() + 30)
+                    #expect(outcome == .success, "an accepted item must run even when no worker exists")
+                } else {
+                    completionCounter.increment()
+                }
+                allSubmittersFinished.signal()
+            }
+        }
+
+        for _ in 0 ..< submitterCount {
+            let outcome = allSubmittersFinished.wait(timeout: .now() + 60)
+            #expect(outcome == .success, "a submitter hung against a pool with no workers")
+        }
+        #expect(completionCounter.current == submitterCount, "every item must run exactly once, somewhere")
+        #expect(pool.currentWorkerCount == 0, "simulated spawn failure must leave no phantom workers")
     }
 }

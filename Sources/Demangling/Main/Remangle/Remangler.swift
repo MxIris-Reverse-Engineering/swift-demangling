@@ -14,9 +14,16 @@ struct Remangler {
     /// Capacity of inline substitution array (avoids heap allocation for common case)
     private static let inlineSubstCapacity = 16
 
-    /// The frame count this engine used before ``StackBudget`` existed, kept as
-    /// the fallback where a platform cannot report thread stack bounds.
-    static let classicMangleDepthLimit = 1024
+    /// Maximum mangling recursion depth.
+    ///
+    /// The C++ `Remangler::MaxDepth` is 1024, calibrated for release-built
+    /// frames on an 8MB stack; unoptimized frames are an order of magnitude
+    /// fatter, and this engine measured overflow of an 8MB thread between
+    /// depth 565 and 605 (140 vs 150 levels of nested `Optional`, at four
+    /// depth units and roughly six real frames per level). 384 leaves ~30%
+    /// headroom below that floor — about 94 nesting levels, over twice the
+    /// deepest real-world symbol measured (41 levels).
+    static let maxDepth = 384
 
     /// Maximum number of words to track (matches C++ MaxNumWords = 26)
     private static let maxNumWords = 26
@@ -26,11 +33,6 @@ struct Remangler {
     let usePunycode: Bool
 
     let flavor: ManglingFlavor
-
-    /// Bounds the walk by remaining stack rather than by frame count.
-    /// Re-derived at every ``mangle(_:)`` so a reused remangler never
-    /// inherits a spent budget.
-    private var stackBudget: StackBudget = .countingFrames(upTo: Remangler.classicMangleDepthLimit)
 
     private var substMerging: SubstitutionMerging = .init()
 
@@ -428,30 +430,42 @@ struct Remangler {
     // MARK: - Public API
 
     /// Remangle a node tree into a mangled string
+    ///
+    /// Every piece of walk state is reset, not just the buffer. `words`
+    /// stores offsets *into* the buffer, so clearing one but not the other
+    /// made the second use of a remangler index into an empty string and
+    /// trap; the substitution tables would have emitted back-references into
+    /// the previous tree's output.
     mutating func mangle(_ node: Node) throws(ManglingError) -> String {
-        stackBudget = .forCurrentThread(fallbackDepthLimit: Self.classicMangleDepthLimit)
         clearBuffer()
+        words.removeAll(keepingCapacity: true)
+        substWordsInIdent.removeAll(keepingCapacity: true)
+        hashHash = Array(repeating: nil, count: Self.hashHashCapacity)
+        inlineSubstitutions.removeAll(keepingCapacity: true)
+        overflowSubstitutions.removeAll(keepingCapacity: true)
+        substMerging = .init()
         try mangle(node, depth: 0)
         return buffer
     }
 
     // MARK: - Core Mangling
 
-    /// Bails with ``ManglingError/tooComplex(_:)`` when the walk is about to run
-    /// out of stack.
+    /// Bails with ``ManglingError/tooComplex(_:)`` once the walk exceeds
+    /// ``maxDepth`` frames.
     ///
     /// Called from every recursion in this engine that is reachable without
     /// passing back through ``mangle(_:depth:)`` — a call-graph audit found six
-    /// such cycles, which is why a single check on `mangle` was never enough.
-    private func checkStackBudget(_ node: Node, depth: Int) throws(ManglingError) {
-        if !stackBudget.hasHeadroom(atDepth: depth) {
+    /// such cycles, which is why the C++ original's single check on `mangle`
+    /// was never enough.
+    private func checkDepthLimit(_ node: Node, depth: Int) throws(ManglingError) {
+        if depth > Self.maxDepth {
             throw .tooComplex(node)
         }
     }
 
     /// Main entry point for mangling a single node
     private mutating func mangle(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
 
         // Dispatch to specific handler based on node kind
         switch node.kind {
@@ -1503,7 +1517,7 @@ extension Remangler {
 
     /// Mangle generic arguments from a context chain
     private mutating func mangleGenericArgs(_ node: Node, separator: inout Character, depth: Int, fullSubstitutionMap: Bool = false) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         var fullSubst = fullSubstitutionMap
 
         switch node.kind {
@@ -2428,7 +2442,7 @@ extension Remangler {
 
     /// Mangle any nominal type (generic or not)
     private mutating func mangleAnyNominalType(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
 
         // Check if this is a specialized type
         if isSpecialized(node) {
@@ -2631,7 +2645,7 @@ extension Remangler {
     }
 
     private mutating func mangleConcreteProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         try mangleType(node[_child: 0], depth: depth + 1)
         try mangle(node[_child: 1], depth: depth + 1)
         if node.numberOfChildren > 2 {
@@ -2648,7 +2662,7 @@ extension Remangler {
     }
 
     private mutating func mangleAnyProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         // Dispatch to specific conformance handler
         switch node.kind {
         case .concreteProtocolConformance:
@@ -2953,7 +2967,7 @@ extension Remangler {
     }
 
     private mutating func manglePackProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformanceList(node[_child: 0], depth: depth + 1)
         append("HX")
     }
@@ -4189,7 +4203,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceOpaque(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try mangleType(node[_child: 1], depth: depth + 1)
@@ -4580,7 +4594,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceRoot(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         try mangleType(node[_child: 0], depth: depth + 1)
 
         try manglePureProtocol(node[_child: 1], depth: depth + 1)
@@ -4590,7 +4604,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceInherited(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try manglePureProtocol(node[_child: 1], depth: depth + 1)
@@ -4600,7 +4614,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceAssociated(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try mangleDependentAssociatedConformance(node[_child: 1], depth: depth + 1)
@@ -5123,7 +5137,7 @@ extension Remangler {
     }
 
     private mutating func mangleAnyProtocolConformanceList(_ node: Node, depth: Int) throws(ManglingError) {
-        try checkStackBudget(node, depth: depth)
+        try checkDepthLimit(node, depth: depth)
         var firstElem = true
         for child in node.children {
             try mangleAnyProtocolConformance(child, depth: depth + 1)
