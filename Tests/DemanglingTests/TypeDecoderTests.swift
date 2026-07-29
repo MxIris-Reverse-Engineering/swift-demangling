@@ -238,7 +238,7 @@ struct TypeDecoderTests {
 /// format approximates the Swift AST type printer: nominal types use just the
 /// type name (module stripped), generics use `<>`, sugar types use `?`/`[]`,
 /// metatypes use `T.Type` with optional `@repr` prefix.
-private struct StringTypeBuilder: TypeBuilder {
+struct StringTypeBuilder: TypeBuilder {
     typealias BuiltType = String
     typealias BuiltTypeDecl = String
     typealias BuiltProtocolDecl = String

@@ -1516,15 +1516,27 @@ public final class TypeDecoder<Builder: TypeBuilder> {
     }
 
     /// Given a demangle tree, attempt to turn it into a type.
+    ///
+    /// Like the demangler, printer and remangler entry points, the walk runs on
+    /// a stack sized for real symbols. Without it this engine was the odd one
+    /// out: on the 512KB stack a `Task` runs on it ran out of budget after a
+    /// handful of nesting levels while printing the same tree from the same
+    /// thread handled a thousand.
     public func decodeMangledType(node: Node, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        var engine = TypeDecoderEngine<Builder, Node>(builder: builder)
-        return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
+        let capturedBuilder = self.builder
+        return try StackSafeExecutor.executeWithUncheckedSendability { () throws(TypeLookupError) -> BuiltType in
+            var engine = TypeDecoderEngine<Builder, Node>(builder: capturedBuilder)
+            return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
+        }
     }
 
     /// Store-backed variant: decodes straight from a `NodeStore` without
     /// materializing a `Node` tree (proposal 0001, Phase 2).
     public func decodeMangledType(node: NodeReference, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
-        var engine = TypeDecoderEngine<Builder, NodeReference>(builder: builder)
-        return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
+        let capturedBuilder = self.builder
+        return try StackSafeExecutor.executeWithUncheckedSendability { () throws(TypeLookupError) -> BuiltType in
+            var engine = TypeDecoderEngine<Builder, NodeReference>(builder: capturedBuilder)
+            return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
+        }
     }
 }

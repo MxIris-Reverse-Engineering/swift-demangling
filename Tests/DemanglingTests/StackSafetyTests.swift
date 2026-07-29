@@ -29,6 +29,12 @@ struct StackSafetyTests {
     /// from one.
     static let cooperativeWorkerStackSize = 512 * 1024
 
+    /// What the main thread gets on Darwin. Comfortably above any "does this
+    /// thread have enough stack" threshold, which is exactly why it needs its
+    /// own coverage: a threshold that lets it run inline gives it a *lower*
+    /// depth ceiling than the 512KB thread that gets moved to a worker.
+    static let mainThreadStackSize = 8 * 1024 * 1024
+
     /// Large enough that building and releasing the probe trees themselves can
     /// never be what fails.
     static let hostStackSize = 256 * 1024 * 1024
@@ -78,6 +84,67 @@ struct StackSafetyTests {
 
         // `mangleAsString` emits the `_$s` form; compare past the prefix.
         #expect(remangled.stripManglePrefix == mangled.stripManglePrefix)
+    }
+
+    // MARK: - Independence from the calling thread
+
+    /// Printing must not depend on which thread produced it.
+    ///
+    /// Work only moved to a large-stack worker when the current thread had less
+    /// than a fixed amount of stack left. The main thread's 8MB always cleared
+    /// that bar, so it kept its own — much lower — ceiling, while a 512KB
+    /// cooperative worker was moved to a 64MB worker and printed the same tree
+    /// in full. A pure-looking `node.print()` returning `<<too complex>>` on the
+    /// main thread and the complete type from inside a `Task` is not a
+    /// behaviour any caller can reason about.
+    @Test func printedOutputIsIndependentOfTheCallingThreadStackSize() {
+        final class OutputBox: @unchecked Sendable {
+            var printedByStackSize: [Int: String] = [:]
+        }
+        let box = OutputBox()
+        let mangled = Self.deeplyNestedOptionalSymbol(nestingDepth: 1000)
+        let stackSizes = [Self.cooperativeWorkerStackSize, Self.mainThreadStackSize]
+
+        for stackSize in stackSizes {
+            Self.runOnThread(stackSize: stackSize) {
+                guard let tree = try? demangleAsNode(mangled, internsSubtrees: false) else { return }
+                box.printedByStackSize[stackSize] = tree.print(using: .default)
+            }
+        }
+
+        let outputs = stackSizes.compactMap { box.printedByStackSize[$0] }
+        #expect(outputs.count == stackSizes.count, "every thread should have produced output")
+        #expect(Set(outputs).count == 1, "print result differed by calling thread stack size")
+        #expect(outputs.allSatisfy { !$0.contains("<<too complex>>") })
+    }
+
+    /// The type decoder is the third recursive engine, and the only one whose
+    /// public entry point never moved its walk onto a large-stack worker: on a
+    /// 512KB cooperative worker — what any `Task` runs on — it gave up after a
+    /// handful of nesting levels while printing and remangling the same tree on
+    /// the same thread handled a thousand.
+    @Test func decodesDeeplyNestedTypeFromACooperativeWorkerStack() {
+        final class ResultBox: @unchecked Sendable {
+            var decoded: String?
+            var failureDescription: String?
+        }
+        let box = ResultBox()
+        let nestingDepth = 200
+        let mangled = Self.deeplyNestedOptionalSymbol(nestingDepth: nestingDepth)
+
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize) {
+            do {
+                let node = try demangleAsNode(mangled, internsSubtrees: false)
+                let decoder = TypeDecoder(builder: StringTypeBuilder())
+                box.decoded = try decoder.decodeMangledType(node: node)
+            } catch {
+                box.failureDescription = "\(error)"
+            }
+        }
+
+        let expectedType = String(repeating: "Optional<", count: nestingDepth) + "Int" + String(repeating: ">", count: nestingDepth)
+        #expect(box.failureDescription == nil, "decoding failed: \(box.failureDescription ?? "")")
+        #expect(box.decoded == expectedType)
     }
 
     // MARK: - Never crash
