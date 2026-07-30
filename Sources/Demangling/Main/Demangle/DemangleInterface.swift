@@ -22,11 +22,11 @@ public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicRefe
     return try StackSafeExecutor.execute(demangleBlock)
 }
 
-/// Asynchronous variant of ``demangleAsNode(_:isType:symbolicReferenceResolver:)``.
+/// Asynchronous variant of ``demangleAsNode(_:isType:symbolicReferenceResolver:internsSubtrees:)``.
 ///
-/// Always runs on a dedicated 8MB-stack `Thread` and suspends the calling task
-/// via a continuation, so Swift Concurrency cooperative workers are not blocked
-/// while demangling deeply nested types. Prefer this overload in high-throughput
+/// Suspends the calling task instead of blocking a cooperative worker when
+/// the walk has to move to a large-stack thread; with enough stack on the
+/// calling thread it runs inline. Prefer this overload in high-throughput
 /// async pipelines.
 public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool = true) async throws(DemanglingError) -> Node {
     let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
@@ -60,15 +60,24 @@ private func demangleAsNode<C: Collection & Sendable>(_ mangled: C, isType: Bool
 }
 
 /// Fully cache-free demangle for transient trees (proposal 0001, Phase 3):
-/// neither leaves nor subtrees touch `NodeCache.shared`, so bulk demangling
-/// through `NodeStoreBuilder` leaves no trace in global state.
+/// neither leaves nor subtrees are interned into `NodeCache.shared`, so bulk
+/// demangling through `NodeStoreBuilder` does not grow the global cache.
 ///
 /// Exported via `@_spi(Internals)` for bulk-indexing consumers
 /// (MachOSwiftSection's `SymbolIndexStore`) that classify each symbol on the
 /// transient tree before interning it into a `NodeStoreBuilder`, so the whole
-/// pipeline stays off the global cache. The returned tree is NOT canonical:
-/// structurally equal nodes are distinct instances, so `===`-based sharing
-/// assumptions and `NodeCache` identity guarantees do not apply.
+/// pipeline stays off the global cache.
+///
+/// The returned tree is NOT canonical, but neither is it instance-distinct:
+/// parameterless kinds (`.asyncAnnotation`, `.throwsAnnotation`,
+/// `.labelList`, ...) resolve to the process-wide `NodeFactory` singletons
+/// shared by every tree ever demangled, and the demangler's substitution
+/// back-references reuse one instance for repeated occurrences within the
+/// tree. So neither direction of an identity assumption holds: structurally
+/// equal nodes are not guaranteed distinct, and `NodeCache`'s
+/// structurally-equal-implies-identical guarantee does not apply either.
+/// Per-occurrence logic (deduplication, counting, parent maps) must not key
+/// by `ObjectIdentifier`/`===` — use structural keys.
 @_spi(Internals)
 public func demangleAsNodeTransient(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil) throws(DemanglingError) -> Node {
     let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {

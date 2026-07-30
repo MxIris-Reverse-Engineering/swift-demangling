@@ -260,6 +260,10 @@ extension NodeReference: DemanglingNode {
     @inlinable
     public var printCacheIdentity: NodeReference { self }
 
+    /// Freshly constructed on every access — see ``materialize()`` for the
+    /// identity caveat this brings to identity-keyed consumers (printer scope
+    /// hooks and `NodePrintContext` deliver nodes through this property on
+    /// the store path).
     @inlinable
     public var materializedNode: Node { materialize() }
 }

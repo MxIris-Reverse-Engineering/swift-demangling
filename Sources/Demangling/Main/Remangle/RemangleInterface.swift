@@ -20,9 +20,9 @@ public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: Mangl
 
 /// Asynchronous variant of ``mangleAsString(_:usePunycode:flavor:)``.
 ///
-/// Always runs on a dedicated 8MB-stack `Thread` and suspends the calling task
-/// via a continuation, so Swift Concurrency cooperative workers are not blocked
-/// while remangling deeply nested types. Prefer this overload in high-throughput
+/// Suspends the calling task instead of blocking a cooperative worker when
+/// the walk has to move to a large-stack thread; with enough stack on the
+/// calling thread it runs inline. Prefer this overload in high-throughput
 /// async pipelines.
 public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: ManglingFlavor = .default) async throws(ManglingError) -> String {
     let mangleBlock: @Sendable () throws(ManglingError) -> String = {

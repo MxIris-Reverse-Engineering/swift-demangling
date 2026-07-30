@@ -137,6 +137,14 @@ public struct NodeReference: Sendable {
     ///
     /// The returned tree is freshly constructed and does not interact with the
     /// global `NodeCache`; intern it explicitly if canonical instances are needed.
+    ///
+    /// - Important: identity is not stable across calls — every call returns
+    ///   a new instance, so two materializations of the same reference are
+    ///   never `===`, unlike the `Node` path where `NodeCache` interning
+    ///   hands out one canonical instance. Key long-lived state by the
+    ///   `NodeReference` itself (store identity + index) or by a structural
+    ///   key (e.g. the remangled string) — never by `ObjectIdentifier` of a
+    ///   materialized node.
     public func materialize() -> Node {
         store.materializeNode(at: nodeIndex.rawValue)
     }
