@@ -52,6 +52,17 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// a position where the latch is clear would drop it) — so such fragments
     /// must not enter ``printCache``.
     private var specializationPrefixVisitCount: Int = 0
+    /// Depth of scopes that temporarily override ``options``. Today the only
+    /// such scope is ``printExtendedExistentialTypeShape(_:)`` forcing
+    /// `.displayWhereClauses` on (an option flip inherited from the C++
+    /// printer). The fragment cache is keyed by node identity alone, so a
+    /// fragment rendered under overridden options is not interchangeable with
+    /// one rendered under the surrounding options: while this is non-zero,
+    /// ``printName(_:asPrefixContext:)`` bypasses the cache entirely — reads
+    /// as well as writes. Blocking only writes would not be enough: a
+    /// fragment cached *outside* the override (without its where clause) must
+    /// not be replayed *inside* it either.
+    private var optionsOverrideDepth: Int = 0
     /// Memoizes the rendered fragment for each shared substitution node.
     /// The demangler returns the same ``SomeNode`` instance for every
     /// back-reference (``A23_`` etc.), so one mangling can produce a DAG
@@ -101,6 +112,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         printDepth = 0
         truncationCount = 0
         specializationPrefixVisitCount = 0
+        optionsOverrideDepth = 0
         _ = printName(root)
         return target
     }
@@ -116,9 +128,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         }
         // Only memoize prints that don't depend on caller-side state. A
         // `dependentMemberTypeDepth > 0` chain or `asPrefixContext` changes
-        // the rendered output for the same node, so those calls bypass the
-        // cache to stay correct.
-        let canCache = !asPrefixContext && dependentMemberTypeDepth == 0
+        // the rendered output for the same node, and so does a temporary
+        // options override (`optionsOverrideDepth > 0`), so those calls
+        // bypass the cache to stay correct.
+        let canCache = !asPrefixContext && dependentMemberTypeDepth == 0 && optionsOverrideDepth == 0
         if canCache, let cached = printCache[name.printCacheIdentity] {
             target.append(cached)
             return nil
@@ -1503,8 +1516,25 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printExtendedExistentialTypeShape(_ name: SomeNode) {
-        let savedDisplayWhereClauses = options.contains(.displayWhereClauses)
-        options.insert(.displayWhereClauses)
+        // Printing the requirement signature is useless without its where
+        // clause, so the C++ printer forces `DisplayWhereClauses` on for this
+        // subtree; the flip itself is faithful to upstream. Upstream has no
+        // fragment cache, so flipping is all it needs; here the flip must
+        // also suspend the cache (`optionsOverrideDepth`), otherwise a
+        // signature node shared between this subtree and the surrounding walk
+        // replays with — or without — its where clause depending on which
+        // position happened to render first.
+        let overridesDisplayWhereClauses = !options.contains(.displayWhereClauses)
+        if overridesDisplayWhereClauses {
+            options.insert(.displayWhereClauses)
+            optionsOverrideDepth += 1
+        }
+        defer {
+            if overridesDisplayWhereClauses {
+                options.remove(.displayWhereClauses)
+                optionsOverrideDepth -= 1
+            }
+        }
         // Children live at 0 and 1 — that is where `demangleExtendedExistentialShape`
         // puts them, and where `createWithChildren` puts them in the C++
         // demangler. The C++ printer reads 1 and 2, which prints the requirement
@@ -1529,9 +1559,6 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             _ = printName(shapeType)
         } else {
             target.write("<null node pointer>")
-        }
-        if !savedDisplayWhereClauses {
-            options.remove(.displayWhereClauses)
         }
     }
 

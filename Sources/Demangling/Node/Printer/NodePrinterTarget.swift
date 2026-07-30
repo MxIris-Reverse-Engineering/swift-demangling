@@ -2,7 +2,25 @@ public protocol NodePrinterTarget: Sendable {
     init()
     var count: Int { get }
     mutating func write(_ content: String)
-    mutating func write(_ content: String, context: NodePrintContext?)
+    /// Writes `content` together with the semantic context of the node it
+    /// came from, so rich targets can attach per-component annotations.
+    ///
+    /// The context is delivered lazily: building a `NodePrintContext` on the
+    /// store path materializes a `Node` subtree, and only targets that
+    /// actually use the context (rich targets) should pay that cost. Targets
+    /// that ignore it (`String`, the default implementation) never evaluate
+    /// the autoclosure, keeping the plain-text store path materialization-free.
+    ///
+    /// - Important: the parameter is `@autoclosure () -> NodePrintContext?`,
+    ///   **not** `NodePrintContext?`. An implementation written against the
+    ///   earlier eager signature does not satisfy this requirement, so the
+    ///   forwarding default below silently takes its place: the printed text
+    ///   stays byte-identical and every context annotation disappears.
+    ///   Nothing warns about this — Swift has no diagnostic for a near-miss
+    ///   witness when a default exists. If a rich target stops receiving
+    ///   contexts, check this signature first (same trap as
+    ///   ``pushTypeReferenceScope(_:)``).
+    mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?)
     /// Append the entire contents of another target. Required so
     /// `NodePrinter` can splice memoized fragments into the output without
     /// losing semantic context (a plain `write(_:String)` would drop any
@@ -34,7 +52,7 @@ public protocol NodePrinterTarget: Sendable {
 }
 
 extension NodePrinterTarget {
-    public mutating func write(_ content: String, context: NodePrintContext?) {
+    public mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
         write(content)
     }
 

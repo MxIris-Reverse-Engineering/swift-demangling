@@ -203,9 +203,9 @@ struct DefectRegressionTests {
                 text += content
             }
 
-            mutating func write(_ content: String, context: NodePrintContext?) {
-                if let context, context.state == .printModule {
-                    moduleContextNodeTexts.append(context.node?.text)
+            mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
+                if let evaluatedContext = context(), evaluatedContext.state == .printModule {
+                    moduleContextNodeTexts.append(evaluatedContext.node?.text)
                 }
                 write(content)
             }
@@ -280,5 +280,94 @@ struct DefectRegressionTests {
 
         #expect(actualFirst == expectedFirst)
         #expect(actualSecond == expectedSecond, "a reused remangler emitted different output than a fresh one")
+    }
+
+    // MARK: - Printer cache vs options override (C)
+
+    /// `printExtendedExistentialTypeShape` temporarily forces
+    /// `.displayWhereClauses` on (an option flip inherited from the C++
+    /// printer), but the fragment cache is keyed by node identity alone. A
+    /// signature node shared between the shape's subtree and the surrounding
+    /// walk therefore replayed with — or without — its where clause depending
+    /// on which position rendered first. Both directions are pinned here; the
+    /// fix suspends the cache while an options override is active.
+    @Test func whereClauseOverrideStaysOutOfSharedCacheFragments() throws {
+        let integerType = try #require(
+            demangleAsNode("$sSiD", internsSubtrees: false).first(of: .type)
+        )
+        let genericSignature = try #require(
+            demangleAsNode("$sSUss17FixedWidthIntegerRzrlEyxqd__cSzRd__lufCSu_SiTg5", internsSubtrees: false)
+                .first(of: .dependentGenericSignature)
+        )
+        let extendedExistentialShape = Node.create(
+            kind: .extendedExistentialTypeShape,
+            children: [genericSignature, integerType]
+        )
+
+        // Baselines, each printed in its own walk (fresh cache per walk).
+        // `.interface` excludes `.displayWhereClauses`; the shape printer
+        // force-enables it for its own subtree.
+        let signatureAlone = genericSignature.print(using: .interface)
+        let shapeAlone = extendedExistentialShape.print(using: .interface)
+        try #require(!signatureAlone.contains(" where "), "premise: .interface suppresses the where clause outside a shape")
+        try #require(shapeAlone.contains(" where "), "premise: the shape printer forces the where clause on")
+
+        // Same walk, same signature instance visible both outside and inside
+        // the shape — exactly what hash-consing produces for real symbols.
+        // `.typeList` prints its children back to back, so the correct output
+        // is the concatenation of the two baselines in either order.
+        let signatureFirstRoot = Node.create(kind: .typeList, children: [genericSignature, extendedExistentialShape])
+        #expect(
+            signatureFirstRoot.print(using: .interface) == signatureAlone + shapeAlone,
+            "a signature cached without its where clause was replayed inside the shape"
+        )
+
+        let shapeFirstRoot = Node.create(kind: .typeList, children: [extendedExistentialShape, genericSignature])
+        #expect(
+            shapeFirstRoot.print(using: .interface) == shapeAlone + signatureAlone,
+            "a signature cached with its where clause leaked it outside the shape"
+        )
+    }
+
+    // MARK: - Transient-tree instance sharing (D)
+
+    /// `demangleAsNodeTransient` once documented "structurally equal nodes
+    /// are distinct instances" — never true: parameterless kinds resolve to
+    /// process-wide `NodeFactory` singletons regardless of `internsLeaves`,
+    /// and substitution back-references reuse instances within a tree. The
+    /// docs now say so; this pins the actual behavior so they stay honest.
+    @Test func transientTreesShareFactorySingletonsByDesign() throws {
+        // `main.foo(inner: () async -> ()) async` carries two
+        // `.asyncAnnotation` nodes: one on the parameter's function type, one
+        // on foo's own type.
+        let transientTree = try demangleAsNodeTransient("$s4main3foo5inneryyyYac_tYaF")
+        let asyncAnnotations = transientTree.all(of: .asyncAnnotation)
+        try #require(asyncAnnotations.count == 2, "premise: expected two .asyncAnnotation nodes, saw \(asyncAnnotations.count)")
+
+        #expect(asyncAnnotations[0] === asyncAnnotations[1])
+        #expect(asyncAnnotations[0] === NodeFactory.asyncAnnotation)
+    }
+
+    // MARK: - Materialization identity across representations (E)
+
+    /// On the `Node` path, `NodeCache` interning hands out one canonical
+    /// instance for structurally equal trees. `NodeReference.materialize()`
+    /// documents the opposite: a fresh, un-interned instance per call. This
+    /// pins both halves of that documented divergence so identity-keyed
+    /// consumers keep getting steered toward structural keys (or the
+    /// `NodeReference` itself) rather than `ObjectIdentifier`.
+    @Test func materializationIsFreshPerCallWhileInternedNodesAreCanonical() throws {
+        let firstNodeTree = try demangleAsNode("$sSaySiGD")
+        let secondNodeTree = try demangleAsNode("$sSaySiGD")
+        #expect(firstNodeTree === secondNodeTree, "interned Node path: one canonical instance across demangles")
+
+        var storeBuilder = NodeStoreBuilder()
+        let rootIndex = try storeBuilder.demangle("$sSaySiGD")
+        let store = storeBuilder.freeze()
+        let reference = store.reference(at: rootIndex)
+        let firstMaterialization = reference.materialize()
+        let secondMaterialization = reference.materialize()
+        #expect(firstMaterialization !== secondMaterialization, "store path: fresh instance per materialization, as documented")
+        #expect(firstMaterialization == secondMaterialization, "structural equality is unaffected")
     }
 }
