@@ -1531,8 +1531,15 @@ public final class TypeDecoder<Builder: TypeBuilder> {
         return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
     }
 
-    /// Store-backed variant: decodes straight from a `NodeStore` without
-    /// materializing a `Node` tree (proposal 0001, Phase 2).
+    /// Store-backed variant: decodes straight from a `NodeStore` (proposal
+    /// 0001, Phase 2).
+    ///
+    /// The walk itself reads the arena, but the `TypeBuilder` handoff points
+    /// materialize a `Node` subtree per nominal declaration they reach — and
+    /// there is no cross-call memo, so a type nested `k` declarations deep
+    /// re-materializes its context chain at every level, O(k²) total
+    /// (measured 11.4× slower than the `Node` path at depth 48). Known and
+    /// deferred; see `Documentations/KnownIssues.md`.
     public func decodeMangledType(node: NodeReference, forRequirement: Bool = true) throws(TypeLookupError) -> BuiltType {
         var engine = TypeDecoderEngine<Builder, NodeReference>(builder: builder)
         return try engine.decodeMangledType(node: node, forRequirement: forRequirement)
