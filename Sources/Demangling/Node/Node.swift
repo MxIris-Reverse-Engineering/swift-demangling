@@ -10,7 +10,7 @@ import SwiftStdlibToolbox
 /// storage into a single discriminated union, mirroring the C++ Swift runtime's
 /// approach where `Text`/`Index`/`InlineChildren`/`Children` share a `union`.
 /// This saves ~24 bytes per node compared to storing them separately.
-public final class Node: Sendable, Codable {
+public final class Node: Sendable {
     /// Legacy contents type preserved for API compatibility.
     public enum Contents: Hashable, Sendable, Codable {
         case none
@@ -22,7 +22,7 @@ public final class Node: Sendable, Codable {
     /// Mirrors the C++ Swift runtime's union where Text/Index/InlineChildren/Children
     /// are mutually exclusive.
     @usableFromInline
-    enum Payload: Sendable, Codable {
+    enum Payload: Sendable {
         case none
         case index(UInt64)
         case text(String)
@@ -151,11 +151,19 @@ public final class Node: Sendable, Codable {
     /// A deep copy of this subtree: every node is rebuilt, nothing is shared
     /// with the original.
     ///
+    /// Source-level sharing is preserved, not expanded: interning and
+    /// substitution back-references make demangled trees DAGs, and a subtree
+    /// instance referenced from several parents is rebuilt exactly once (the
+    /// rebuilds are memoized by source identity). The copy therefore has the
+    /// same shape and node count as the original graph — without the memo, a
+    /// 48-node shared graph from a real symbol expanded into 131,070 nodes.
+    ///
     /// Walked with an explicit stack. This is public API over trees of
     /// arbitrary depth, `NodeBuilder` runs it while holding its lock, and it
     /// sits outside every engine, so no depth parameter can ever reach it — the
     /// same reason ``Node/deinit`` tears trees down iteratively.
     public func copy() -> Node {
+        var copiedNodesBySourceIdentity: [ObjectIdentifier: Node] = [:]
         var frames: [RebuildFrame] = [RebuildFrame(source: self)]
         var completedNode: Node?
 
@@ -169,14 +177,30 @@ public final class Node: Sendable, Codable {
                 let nextChild = sourceChildren[frame.nextChildIndex]
                 frame.nextChildIndex += 1
                 frames.append(frame)
-                frames.append(RebuildFrame(source: nextChild))
+                if let alreadyCopiedChild = copiedNodesBySourceIdentity[ObjectIdentifier(nextChild)] {
+                    completedNode = alreadyCopiedChild
+                } else {
+                    frames.append(RebuildFrame(source: nextChild))
+                }
                 continue
             }
-            completedNode = Node(kind: frame.source.kind, contents: frame.source.contents, inlineChildren: frame.rebuiltChildren)
+            let rebuiltNode = Node(kind: frame.source.kind, contents: frame.source.contents, inlineChildren: frame.rebuiltChildren)
+            copiedNodesBySourceIdentity[ObjectIdentifier(frame.source)] = rebuiltNode
+            completedNode = rebuiltNode
         }
 
         // The loop only ends once the root frame has been completed.
         return completedNode ?? self
+    }
+
+    /// A new instance with this node's kind, contents, and (shared) children.
+    ///
+    /// O(1): only the top-level node is rebuilt — the children are the same
+    /// instances, which is safe because nodes are immutable outside their own
+    /// `NodeBuilder`. This is how the builder detaches every node it hands
+    /// out from the instance it keeps mutating.
+    fileprivate func shallowCopy() -> Node {
+        Node(kind: kind, contents: contents, inlineChildren: children)
     }
 }
 
@@ -350,11 +374,15 @@ extension Node {
     /// Returns a new tree with the descendant node replaced.
     /// If `old` is not found in the tree, returns a copy of self.
     ///
-    /// Walked with an explicit stack for the same reason as ``copy()``.
+    /// Walked with an explicit stack for the same reason as ``copy()``, and
+    /// memoized by source identity for the same reason too: a shared subtree
+    /// instance is rebuilt once and the result reused at every occurrence,
+    /// so the rebuild costs the graph's node count, not its path count.
     func replacingDescendant(_ old: Node, with new: Node) -> Node {
         if self === old {
             return new
         }
+        var rebuiltNodesBySourceIdentity: [ObjectIdentifier: Node] = [:]
         var frames: [RebuildFrame] = [RebuildFrame(source: self)]
         var completedNode: Node?
 
@@ -370,12 +398,16 @@ extension Node {
                 frames.append(frame)
                 if nextChild === old {
                     completedNode = new
+                } else if let alreadyRebuiltChild = rebuiltNodesBySourceIdentity[ObjectIdentifier(nextChild)] {
+                    completedNode = alreadyRebuiltChild
                 } else {
                     frames.append(RebuildFrame(source: nextChild))
                 }
                 continue
             }
-            completedNode = Node(kind: frame.source.kind, contents: frame.source.contents, inlineChildren: frame.rebuiltChildren)
+            let rebuiltNode = Node(kind: frame.source.kind, contents: frame.source.contents, inlineChildren: frame.rebuiltChildren)
+            rebuiltNodesBySourceIdentity[ObjectIdentifier(frame.source)] = rebuiltNode
+            completedNode = rebuiltNode
         }
 
         return completedNode ?? self
@@ -396,20 +428,43 @@ extension Node {
 /// builder.addChild(element2)
 /// let node = builder.build()
 /// ```
+///
+/// ### Every node the builder hands out is frozen
+///
+/// The instance the builder mutates is never exposed: ``node`` returns a
+/// detached snapshot, ``build()`` detaches the builder from the node it
+/// returns, and the seeding ``init(_:)`` never adopts the caller's instance.
+/// Later mutations therefore cannot reach any node already handed out — which
+/// is what makes cyclic `Node` graphs unconstructible. (Previously `build()`
+/// returned the live instance, so `addChild(build())` created a node that was
+/// its own child, and every unbounded traversal in the library — remangling,
+/// hashing, interning — spun or grew forever on it.) Since a handed-out node
+/// can never gain children, no node can become its own descendant.
 public final class NodeBuilder: @unchecked Sendable {
     private let _lock: UnsafeMutablePointer<os_unfair_lock>
     private var _node: Node
 
-    /// The current node being built.
+    /// A detached snapshot of the current node being built.
+    ///
+    /// The snapshot shares the builder's current children (nodes are immutable
+    /// outside the builder, so sharing is safe) but is a distinct instance:
+    /// later builder mutations never affect it, and feeding it back into
+    /// ``addChild(_:)`` cannot create a cycle.
     public var node: Node {
-        withLock { _node }
+        withLock { _node.shallowCopy() }
     }
 
-    /// Creates a builder with a copy of the given node.
+    /// Creates a builder seeded with the given node's kind, contents, and
+    /// children.
+    ///
+    /// The given node itself is never adopted or mutated; its children are
+    /// shared with the seed, not deep-copied — safe because nodes are
+    /// immutable outside their own builder, and O(1) instead of a whole-tree
+    /// rebuild.
     public init(_ node: Node) {
         self._lock = .allocate(capacity: 1)
         self._lock.initialize(to: os_unfair_lock())
-        self._node = node.copy()
+        self._node = node.shallowCopy()
     }
 
     /// Creates a builder with a new node.
@@ -492,59 +547,59 @@ public final class NodeBuilder: @unchecked Sendable {
 
     /// Returns a new node with the child added.
     public func addingChild(_ child: Node) -> Node {
-        withLock { _node.addingChild(child) }
+        withLock { detached(_node.addingChild(child)) }
     }
 
     /// Returns a new node with the children added.
     public func addingChildren(_ children: [Node]) -> Node {
-        withLock { _node.addingChildren(children) }
+        withLock { detached(_node.addingChildren(children)) }
     }
 
     /// Returns a new node with the child inserted.
     public func insertingChild(_ child: Node, at index: Int) -> Node {
-        withLock { _node.insertingChild(child, at: index) }
+        withLock { detached(_node.insertingChild(child, at: index)) }
     }
 
     /// Returns a new node with the child removed.
     public func removingChild(at index: Int) -> Node {
-        withLock { _node.removingChild(at: index) }
+        withLock { detached(_node.removingChild(at: index)) }
     }
 
     /// Returns a new node with the child replaced.
     public func withChild(_ child: Node, at index: Int) -> Node {
-        withLock { _node.withChild(child, at: index) }
+        withLock { detached(_node.withChild(child, at: index)) }
     }
 
     /// Returns a new node with the specified children.
     public func withChildren(_ children: [Node]) -> Node {
-        withLock { _node.withChildren(children) }
+        withLock { detached(_node.withChildren(children)) }
     }
 
     /// Returns a new node with children reversed.
     public func reversingChildren() -> Node {
-        withLock { _node.reversingChildren() }
+        withLock { detached(_node.reversingChildren()) }
     }
 
     /// Returns a new node with the first N children reversed.
     public func reversingFirst(_ count: Int) -> Node {
-        withLock { _node.reversingFirst(count) }
+        withLock { detached(_node.reversingFirst(count)) }
     }
 
     /// Returns a new node with the descendant replaced.
     public func replacingDescendant(_ old: Node, with new: Node) -> Node {
-        withLock { _node.replacingDescendant(old, with: new) }
+        withLock { detached(_node.replacingDescendant(old, with: new)) }
     }
 
     // MARK: - Transformations
 
     /// Returns a new node with a different kind.
     public func changingKind(_ newKind: Node.Kind, additionalChildren: [Node] = []) -> Node {
-        withLock { _node.changeKind(newKind, additionalChildren: additionalChildren) }
+        withLock { detached(_node.changeKind(newKind, additionalChildren: additionalChildren)) }
     }
 
     /// Returns a new node with the child at index replaced or removed.
     public func changingChild(_ newChild: Node?, at index: Int) -> Node {
-        withLock { _node.changeChild(newChild, at: index) }
+        withLock { detached(_node.changeChild(newChild, at: index)) }
     }
 
     /// Returns a copy of the current node.
@@ -553,8 +608,25 @@ public final class NodeBuilder: @unchecked Sendable {
     }
 
     /// Finalizes and returns the built node.
-    /// After calling this, the builder should not be used.
+    ///
+    /// The returned node is frozen: the builder detaches from it, so the
+    /// builder remains usable and further mutations affect only subsequent
+    /// ``build()`` results — never a node already returned. In particular,
+    /// `builder.addChild(builder.build())` produces a parent/child pair, not
+    /// a self-referential cycle.
     public func build() -> Node {
-        withLock { _node }
+        withLock {
+            let builtNode = _node
+            _node = builtNode.shallowCopy()
+            return builtNode
+        }
+    }
+
+    /// Guards the non-mutating helpers: a few of them return `self` on
+    /// invalid input (e.g. an out-of-range index), which here would leak the
+    /// live instance the builder keeps mutating — the exact hole that made
+    /// cycles constructible through ``build()``.
+    private func detached(_ result: Node) -> Node {
+        result === _node ? _node.shallowCopy() : result
     }
 }

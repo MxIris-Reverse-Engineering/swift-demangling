@@ -38,7 +38,33 @@ extension Node: CustomStringConvertible {
     /// Walked with an explicit stack: `description` is reachable from a
     /// debugger, a log statement or an assertion message on any tree from any
     /// thread, which is the one place a per-level frame is least affordable.
+    ///
+    /// Shared interior subtrees are expanded once and labeled: interning and
+    /// substitution back-references make demangled trees DAGs, and re-expanding
+    /// a subtree at every occurrence multiplies along nesting — a real 120
+    /// character symbol with 64 unique nodes dumped as a 366MB string. The
+    /// first occurrence of a multiply-referenced interior node is tagged
+    /// `(shared #N)` and expanded; later occurrences print `(see #N)` and
+    /// stop, so the dump costs the graph's size, not its path count. Leaves
+    /// are always printed in place — one line either way, and eliding, say,
+    /// every repeated `Swift` module node would only hurt readability.
     private func appendDebugDescription(to output: inout String) {
+        // First pass: count how many parent slots reference each instance,
+        // walking each unique node once.
+        var referenceCounts: [ObjectIdentifier: Int] = [:]
+        var countedNodes: Set<ObjectIdentifier> = []
+        var uncountedNodes: [Node] = [self]
+        while let node = uncountedNodes.popLast() {
+            guard countedNodes.insert(ObjectIdentifier(node)).inserted else { continue }
+            for child in node.children {
+                referenceCounts[ObjectIdentifier(child), default: 0] += 1
+                uncountedNodes.append(child)
+            }
+        }
+
+        // Second pass: the dump itself.
+        var sharedLabels: [ObjectIdentifier: Int] = [:]
+        var nextSharedLabel = 1
         var pendingNodes: [(node: Node, depth: Int)] = [(self, 0)]
 
         while let pending = pendingNodes.popLast() {
@@ -51,6 +77,16 @@ extension Node: CustomStringConvertible {
                 output.append(", index=\(index)")
             case .text(let name):
                 output.append(", text=\"\(name)\"")
+            }
+            let identifier = ObjectIdentifier(pending.node)
+            if !pending.node.children.isEmpty, referenceCounts[identifier, default: 0] > 1 {
+                if let existingLabel = sharedLabels[identifier] {
+                    output.append(" (see #\(existingLabel))\n")
+                    continue // Already expanded at its first occurrence.
+                }
+                sharedLabels[identifier] = nextSharedLabel
+                output.append(" (shared #\(nextSharedLabel))")
+                nextSharedLabel += 1
             }
             output.append("\n")
             // Reversed so the stack pops them back into source order.

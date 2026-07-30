@@ -103,22 +103,48 @@ struct DefectRegressionTests {
 
     // MARK: - Self-referential type chains (#11)
 
-    /// `NodeBuilder.build()` returns its live node, so `addChild(build())`
-    /// creates a node that is its own child. The `.type`-unwrapping loops in
-    /// `isSimpleType` / `needSpaceBeforeType` followed that chain with no step
-    /// bound: a cycle spun forever, silently — worse to diagnose than the
-    /// recursion crash it replaced.
-    @Test func selfReferentialTypeChainDoesNotSpinForever() {
+    /// `NodeBuilder.build()` used to return its live node, so
+    /// `addChild(build())` created a node that was its own child — and every
+    /// unbounded walk in the library (the `.type`-unwrapping loops here, plus
+    /// `isSpecialized` / `getUnspecialized`, hashing, interning) spun or grew
+    /// forever on the cycle. The builder now detaches every node it hands out
+    /// (`build()`, the `node` snapshot, and the non-mutating helpers), so the
+    /// sequences that used to close a loop build ordinary acyclic shapes, and
+    /// cycles are unconstructible from public API.
+    @Test func selfReferentialCyclesAreNotConstructible() {
         let builder = NodeBuilder(kind: .type)
-        let cyclicNode = builder.build()
-        builder.addChild(cyclicNode)
-        #expect(cyclicNode.children.first === cyclicNode, "the premise: a self-cycle is constructible")
+        let builtNode = builder.build()
+        builder.addChild(builtNode)
 
+        // The old failure: builtNode.children.first === builtNode.
+        #expect(builtNode.children.isEmpty, "a node handed out by build() must stay frozen")
+        let rebuiltNode = builder.build()
+        #expect(rebuiltNode !== builtNode)
+        #expect(rebuiltNode.children.first === builtNode, "the mutation lands on the next build, as a plain child")
+
+        // Feeding the snapshot property back in cannot close a loop either.
+        builder.addChild(builder.node)
+        let snapshotFedNode = builder.build()
+        #expect(snapshotFedNode.children.count == 2)
+        #expect(snapshotFedNode.children[1] !== snapshotFedNode)
+
+        // Cross-builder feeding — the a ↔ b shape from the defect report —
+        // exchanges frozen snapshots, so both results stay acyclic and every
+        // formerly cycle-vulnerable walk terminates.
+        let firstBuilder = NodeBuilder(kind: .structure)
+        let secondBuilder = NodeBuilder(kind: .extension)
+        secondBuilder.addChild(firstBuilder.node)
+        firstBuilder.addChild(secondBuilder.node)
+        let firstTree = firstBuilder.build()
+        let secondTree = secondBuilder.build()
         let finished = Self.completesWithinTimeout {
-            _ = cyclicNode.isSimpleType
-            _ = cyclicNode.needSpaceBeforeType
+            _ = firstTree.isSimpleType
+            _ = firstTree.needSpaceBeforeType
+            _ = isSpecialized(firstTree)
+            _ = getUnspecialized(secondTree)
+            _ = firstTree.hashValue
         }
-        #expect(finished, "the type-unwrapping walk never terminated on a cyclic node")
+        #expect(finished, "a formerly cycle-vulnerable walk never terminated")
     }
 
     // MARK: - Bounded work on shared DAGs (#13)
