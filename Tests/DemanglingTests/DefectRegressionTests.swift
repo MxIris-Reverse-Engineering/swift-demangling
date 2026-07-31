@@ -140,11 +140,42 @@ struct DefectRegressionTests {
         let finished = Self.completesWithinTimeout {
             _ = firstTree.isSimpleType
             _ = firstTree.needSpaceBeforeType
+            _ = firstTree.isProtocol
             _ = isSpecialized(firstTree)
             _ = getUnspecialized(secondTree)
             _ = firstTree.hashValue
         }
         #expect(finished, "a formerly cycle-vulnerable walk never terminated")
+    }
+
+    /// The `.type`-unwrapping predicates are public, so the tree reaching them
+    /// need not have come from the demangler, and none of them sits inside an
+    /// engine's stack guard. A hand-built chain far deeper than anything the
+    /// demangler emits must answer rather than overflow the stack.
+    @Test func typeUnwrappingPredicatesAreBoundedOnAHandBuiltChain() {
+        var chain = Node.create(kind: .protocol, children: [
+            Node.create(kind: .module, text: "Swift"),
+            Node.create(kind: .identifier, text: "Sendable"),
+        ])
+        for _ in 0 ..< 100_000 {
+            chain = Node.create(kind: .type, children: [chain])
+        }
+
+        // Past the unwrap limit the answer is the conservative `false`, not a
+        // crash — the limit is unreachable on demangled input.
+        #expect(chain.isProtocol == false)
+        #expect(chain.isSimpleType == false)
+        #expect(chain.needSpaceBeforeType == false)
+
+        // Within the limit the wrappers stay transparent, which is the only
+        // depth real symbols ever reach.
+        let singlyWrapped = Node.create(kind: .type, children: [
+            Node.create(kind: .protocol, children: [
+                Node.create(kind: .module, text: "Swift"),
+                Node.create(kind: .identifier, text: "Sendable"),
+            ]),
+        ])
+        #expect(singlyWrapped.isProtocol)
     }
 
     // MARK: - Bounded work on shared DAGs (#13)

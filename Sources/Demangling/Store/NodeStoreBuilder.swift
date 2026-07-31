@@ -8,6 +8,14 @@
 /// receive the same `NodeStore.NodeIndex`. Interior-node keys use child
 /// indices, which is exact because children are always interned before their
 /// parent (the same bottom-up scheme as `NodeCache.internTreeUnsafe`).
+///
+/// That invariant is what makes `NodeReference.==` — a store-identity and
+/// index compare — **structural equality within one arena**, and therefore
+/// what makes `Set` / `Dictionary` of references deduplicate. Batch every tree
+/// through one builder and that holds; give each tree its own arena (which is
+/// what `NodeReference(interning:)` does per call) and it cannot. See
+/// ``NodeReference`` for the boundary and `Documentations/NodeStoreArena.md`
+/// for the measurements.
 public struct NodeStoreBuilder: ~Copyable, Sendable {
     private var nodes: ContiguousArray<CompactNode> = []
     private var edges: ContiguousArray<UInt32> = []

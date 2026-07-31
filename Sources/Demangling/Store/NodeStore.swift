@@ -66,6 +66,11 @@ public final class NodeStore: Sendable {
 
     /// Returns a reference to the node at the given index.
     ///
+    /// References minted here are directly comparable with `==` and usable as
+    /// `Set` / `Dictionary` keys: this store is hash-consed, so equal indices
+    /// mean equal structure. That equivalence is per-store — for references
+    /// spanning stores use `structurallyEquals(_:)` / `structuralHash(into:)`.
+    ///
     /// - Precondition: `nodeIndex` is within this store's bounds. A
     ///   `NodeIndex` is a bare offset with no record of which store minted it,
     ///   so an index from a *different* store that happens to be in range
