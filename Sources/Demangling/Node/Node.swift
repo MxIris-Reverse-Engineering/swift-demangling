@@ -33,7 +33,26 @@ public final class Node: Sendable {
 
     public let kind: Kind
 
-    /// Unified payload storage. Only modified during demangling for child mutations.
+    /// Unified payload storage.
+    ///
+    /// `var` rather than `let`, and the reason is ``deinit``, not construction:
+    /// tearing a tree down iteratively means detaching children as they are
+    /// moved to the work list (`payload = .none` in `moveChildrenOut`), and a
+    /// `let` cannot be assigned in `deinit`. Dropping that would put the
+    /// recursion back in the *runtime* — measured to overflow a 512KB stack at
+    /// around 620 levels, where no engine-side depth budget can reach it.
+    ///
+    /// So there are exactly two writers, and `nonisolated(unsafe)` is sound
+    /// because neither can race:
+    ///
+    /// - `NodeBuilder`, while assembling a node it has not handed out yet, and
+    ///   only under its `os_unfair_lock`.
+    /// - `deinit`, which by definition runs when the last reference is going
+    ///   away, so no other thread can still reach the node.
+    ///
+    /// `Demangler` is deliberately **not** a writer — it builds through
+    /// `createNode(...)` and never mutates a node in place. The `fileprivate`
+    /// mutating helpers below have no callers outside this file.
     @usableFromInline
     nonisolated(unsafe) var payload: Payload
 
