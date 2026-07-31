@@ -167,58 +167,37 @@ struct SharedDAGTraversalTests {
         #expect(unsharedTree.sharedStructureDescription == dump)
     }
 
-    // MARK: - Codable
+    // MARK: - Serialization
 
-    @Test func codableRoundTripsARealSymbol() throws {
-        let originalTree = try demangleAsNode("$s10Foundation4DataV5countSivg")
+    /// `Node` is intentionally not `Codable`. A mangled symbol already *is* the
+    /// serialized form of a tree — smaller, stable across releases, and the
+    /// format the rest of the toolchain speaks — so round-tripping goes through
+    /// the remangler rather than through a bespoke node encoding.
+    @Test func remanglingIsTheSerializationRoundTrip() throws {
+        let mangledName = "$s10Foundation4DataV5countSivg"
+        let originalTree = try demangleAsNode(mangledName)
 
-        let encodedData = try JSONEncoder().encode(originalTree)
-        let decodedTree = try JSONDecoder().decode(Node.self, from: encodedData)
+        // The remangler emits the `_$s` spelling; the demangler accepts both,
+        // so the round trip is closed even though the prefix is not identical.
+        let serialized = try Demangling.mangleAsString(originalTree)
+        #expect(serialized.stripManglePrefix == mangledName.stripManglePrefix)
 
-        #expect(decodedTree == originalTree)
-        #expect(decodedTree.print(using: .default) == originalTree.print(using: .default))
+        let restoredTree = try demangleAsNode(serialized)
+        #expect(restoredTree == originalTree)
+        #expect(restoredTree.print(using: .default) == originalTree.print(using: .default))
     }
 
-    @Test func codableOutputIsLinearInGraphSizeAndDecodePreservesSharing() throws {
-        let sharedGraph = Self.makeSharedPairGraph(depth: 40)
-        let uniqueCount = Self.uniqueNodeCount(of: sharedGraph)
+    /// A shared graph survives the mangle/demangle round trip without being
+    /// expanded along its path count — the property the flat `Codable` format
+    /// existed to provide, now carried by the mangled form itself.
+    @Test func remanglingPreservesSharingWithoutExpanding() throws {
+        let originalTree = try demangleAsNode("$s7SwiftUI15ModifiedContentVyxq_GAA0D0AAMc")
+        let originalUniqueCount = Self.uniqueNodeCount(of: originalTree)
 
-        let encodedData = try JSONEncoder().encode(sharedGraph)
-        #expect(encodedData.count < 50_000, "encoded \(uniqueCount) unique nodes as \(encodedData.count) bytes")
+        let serialized = try Demangling.mangleAsString(originalTree)
+        let restoredTree = try demangleAsNode(serialized)
 
-        let decodedGraph = try JSONDecoder().decode(Node.self, from: encodedData)
-        #expect(decodedGraph == sharedGraph)
-        #expect(Self.uniqueNodeCount(of: decodedGraph) == uniqueCount, "decode must rebuild the sharing, not expand it")
-    }
-
-    @Test func codableSurvivesADeepChain() throws {
-        // The synthesized conformance recursed once per level and overflowed
-        // the stack; the flat format is iterative on both passes.
-        var deepChain = Node.create(kind: .identifier, text: "leaf")
-        for _ in 0 ..< 50_000 {
-            deepChain = Node.create(kind: .type, children: [deepChain])
-        }
-
-        let encodedData = try JSONEncoder().encode(deepChain)
-        let decodedChain = try JSONDecoder().decode(Node.self, from: encodedData)
-        #expect(decodedChain == deepChain)
-    }
-
-    @Test func codableRejectsForwardAndSelfReferences() throws {
-        // A self-referential row: decoding must throw, not build a cycle.
-        let selfReferentialJSON = Data("""
-        {"nodes": [{"kind": "type", "contents": {"none": {}}, "children": [0]}], "root": 0}
-        """.utf8)
-        #expect(throws: DecodingError.self) {
-            _ = try JSONDecoder().decode(Node.self, from: selfReferentialJSON)
-        }
-
-        let forwardReferenceJSON = Data("""
-        {"nodes": [{"kind": "type", "contents": {"none": {}}, "children": [1]},
-                   {"kind": "tuple", "contents": {"none": {}}, "children": []}], "root": 1}
-        """.utf8)
-        #expect(throws: DecodingError.self) {
-            _ = try JSONDecoder().decode(Node.self, from: forwardReferenceJSON)
-        }
+        #expect(restoredTree == originalTree)
+        #expect(Self.uniqueNodeCount(of: restoredTree) == originalUniqueCount)
     }
 }

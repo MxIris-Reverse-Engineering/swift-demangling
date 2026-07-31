@@ -43,7 +43,7 @@ review 实测数据（均为纯公开 API 或真实 mangled 字符串触发）�
 | `Node.Rewriter.rewrite` | 同上；`visit` 升级为「每唯一实例一次」的纯函数契约 |
 | `Node.description` | 保持逐次展开（与 Swift runtime dump 逐字节一致），改用 8MB 输出上限兜底病态 DAG |
 | `Node.sharedStructureDescription` | 新增 `@_spi(Internals)` 视图：共享内部子树首现标 `(shared #N)` 展开、复现 `(see #N)` 不展开；叶子豁免 |
-| `Node: Codable` | 换为扁平节点表格式（迭代、保共享、环不可表示）；**破坏性格式变更** |
+| `Node: Codable` | **整体移除**（连带 `Node.Children` 的 conformance）；序列化改走 remangle 出的 mangled string |
 | `TypeDecoder`（注释） | store 路径入口如实描述每 decl 物化与 O(k²)，指向 KnownIssues |
 | `KnownIssues.md` | 关闭原第 3 条（环），新增第 3–5 条 |
 
@@ -103,16 +103,26 @@ dump 是 496,018 字节**，超过 1MB 的符号 0 个，超过 100KB 的 652 �
 `sharedStructureDescription` 是 5,389 字节。DFS 待办栈只按树形（每层每分支一项）增长，
 爆炸的只有输出，所以对输出计费就够了。
 
-### 3. Codable：扁平节点表
+### 3. Codable：整体移除
 
-`{"nodes": [postorder 行], "root": 索引}`，children 以表索引引用。三个性质一次拿到：
-两趟都是迭代（深树安全）、每唯一节点恰好编码一次（体积按图线性）、解码校验
-`childIndex < 自身索引` 使环**不可表示**。解码走普通构造，不过 `NodeCache`
-（任意外部输入不得 pin 全局缓存）。
+本条一度实现为扁平节点表（`{"nodes": [postorder 行], "root": 索引}`，children 以表
+索引引用），以同时拿到迭代编解码、按图线性的体积、以及环不可表示。该方案也已推翻——
+**`Node` 不再是 `Codable`**，`Node+Codable.swift` 删除，`Node.Children` 的
+conformance 连带移除（它直接持有 `Node`，`Node` 不可编码后无法合成）。
+`Node.Contents` 与 `Node.Kind` 的 conformance 保留：它们不含 `Node`，各自独立可用。
 
-**取舍五（破坏性格式变更，不做旧格式回退解码）**：合成格式在深树上爆栈、在共享树上
-指数展开——能安全解码的存量数据本就只有浅而无共享的小树；为它维护一条仍会爆栈的
-递归回退路径得不偿失。判断此 API 无实际存量数据（库内外均无使用点），直接切换。
+**取舍五（不自造节点编码，序列化就用 mangled string）**：这个 API 从一开始就是多余的
+——一个 mangled symbol **本身就是**这棵树的序列化形式，而且在每一条上都更好：体积远小于
+任何节点表编码；格式由 Swift ABI 定义，跨版本稳定，不像自造格式那样需要版本号和迁移
+路径；round trip 天然保共享（重新 demangle 会重建 interning，不会按路径展开）；而且它
+是工具链其余部分（编译器、runtime、LLDB、符号化管线）本来就在说的语言。存下
+`try mangleAsString(node)`，读回时 `try demangleAsNode(_:)`，仅此而已。
+
+顺带解决了扁平格式遗留的两个问题：它与合成格式互不兼容却没有版本标记，将来再改一次
+仍会重演；以及在 `Node` 这样一个公共类型上，任何自造编码都会变成需要长期维护的兼容
+包袱。注意 remangler 输出 `_$s` 前缀而常见输入是 `$s`，demangler 两种都接受，round trip
+仍然闭合（`stripManglePrefix` 可用于规范化比较）；极少数节点树无法 remangle，`canMangle`
+可以先判定。
 
 ## 影响面
 
@@ -122,18 +132,26 @@ dump 是 496,018 字节**，超过 1MB 的符号 0 个，超过 100KB 的 652 �
 - **`description`**：格式与 Swift runtime dump 保持逐字节一致（语料 4,522,325 个符号
   零不匹配）；仅当单次 dump 超过 8MB 时截断并标注，真实语料中无一触发。标记视图需改用
   `@_spi(Internals) sharedStructureDescription`。
-- **`Codable`**：新旧格式互不兼容。
+- **`Codable`**：`Node` 与 `Node.Children` 不再 `Codable`（相对 main 与相对上一轮的
+  扁平格式都是破坏性变更）。序列化改用 `mangleAsString` / `demangleAsNode`。
 - **性能**：`copy` / `rewrite` / `replacingDescendant` 在共享图上从指数降为线性；
   `NodeBuilder.init(_:)` 从 O(树) 降为 O(1)。
 - 测试：`DefectRegressionTests` 的环测试改写为「不可构造」断言；新增
   `SharedDAGTraversalTests`（10 项：copy/播种/替换/重写的保共享与计价、
   `sharedStructureDescription` 标记、`description` 在 2^40 路径图上的字节上限、
-  无共享树两视图一致、Codable 往返/深链/防环/线性体积）。
+  无共享树两视图一致、remangle 序列化往返与保共享）。
 
 ## 迁移/升级注意事项
 
 - 依赖 `build()` 返回值与后续 `builder.node` 为同一实例的代码（即旧的活引用行为）
   不再成立——这正是被修复的缺陷本身。
-- 用旧版本编码的 `Node` JSON/plist 数据无法用本版本解码，需用旧版本读出后重编码。
+- 用旧版本编码的 `Node` JSON/plist 数据无法用本版本解码——`Node` 已不再 `Codable`。
+  需用旧版本读出，改存 `try mangleAsString(node)` 的字符串；读回时
+  `try demangleAsNode(_:)`。
+- 自定义 `NodePrinterTarget` 必须显式实现 `write(_:context:)` 与
+  `pushTypeReferenceScope(_:)`（两者都不再有默认实现）。照旧签名
+  （`NodePrintContext?` / `Node?`）写的实现现在是编译错误而不是静默失效——把参数
+  改成 `@autoclosure () -> …` 即可；只输出纯文本的 target 照 `String` 的
+  conformance 转发一行了事。
 - `Rewriter` 子类若在 `visit` 里做按出现次数的计数或位置相关变换，行为改变
   （旧行为在共享树上本就未定义）；改用 `preorder()` 遍历统计出现次数。

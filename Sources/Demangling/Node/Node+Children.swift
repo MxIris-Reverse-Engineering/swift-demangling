@@ -10,9 +10,9 @@
 ///   - 3+ children: identical (heap-backed)
 
 extension Node {
-    public struct Children: Sendable, Codable {
+    public struct Children: Sendable {
         @usableFromInline
-        enum Storage: Sendable, Codable {
+        enum Storage: Sendable {
             case zero
             case one(Node)
             case two(Node, Node)

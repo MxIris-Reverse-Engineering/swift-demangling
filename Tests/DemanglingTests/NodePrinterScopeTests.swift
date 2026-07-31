@@ -35,6 +35,13 @@ struct NodePrinterScopeTests {
             text.write(content)
         }
 
+        // This target only records scopes, but the requirement carries no
+        // default, so it forwards explicitly rather than silently losing the
+        // hook to one.
+        mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
+            write(content)
+        }
+
         mutating func append(_ other: ScopeRecordingTarget) {
             text.append(other.text)
             scopeEvents.append(contentsOf: other.scopeEvents)

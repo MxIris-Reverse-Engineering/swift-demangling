@@ -262,15 +262,26 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
 
     // MARK: - Open-Addressing Interning Tables
 
-    private static func mix(_ currentHash: Int, _ value: Int) -> Int {
+    /// Mixing runs in explicit `UInt64`, not `Int`.
+    ///
+    /// The constants here and in ``hashOfTextBytes(_:)`` do not fit a 32-bit
+    /// `Int`, and this package ships for watchOS, where `Int` is 32 bits — as
+    /// `Int` literals they are a hard compile error there (`integer literal
+    /// overflows when stored into 'Int'`), which a 64-bit host build never
+    /// surfaces. Widths are therefore pinned rather than left to the platform,
+    /// and the digest is truncated back to `Int` only at the end. Every
+    /// consumer masks with a power-of-two table mask, so truncation — and the
+    /// negative values it can produce — is harmless, and slot distribution is
+    /// identical on both word sizes.
+    private static func mix(_ currentHash: UInt64, _ value: UInt64) -> UInt64 {
         (currentHash &* 0x9E3779B1) &+ value
     }
 
     private static func hash(of compact: CompactNode) -> Int {
-        var combined = Int(compact.kindAndPayloadKind)
-        combined = mix(combined, Int(compact.payloadWord0))
-        combined = mix(combined, Int(compact.payloadWord1))
-        return mix(combined, 0)
+        var combined = UInt64(compact.kindAndPayloadKind)
+        combined = mix(combined, UInt64(compact.payloadWord0))
+        combined = mix(combined, UInt64(compact.payloadWord1))
+        return Int(truncatingIfNeeded: mix(combined, 0))
     }
 
     private mutating func internCanonicalCompact(_ compact: CompactNode) -> UInt32 {
@@ -308,11 +319,11 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private static func hashOfManyChildren(kindAndPayloadKind: UInt16, childIndices: some Sequence<UInt32>) -> Int {
-        var combined = Int(kindAndPayloadKind)
+        var combined = UInt64(kindAndPayloadKind)
         for childIndex in childIndices {
-            combined = Self.mix(combined, Int(childIndex))
+            combined = Self.mix(combined, UInt64(childIndex))
         }
-        return Self.mix(combined, 0)
+        return Int(truncatingIfNeeded: Self.mix(combined, 0))
     }
 
     private func manyChildrenNodeMatches(_ existingIndex: UInt32, kindAndPayloadKind: UInt16, childIndices: [UInt32]) -> Bool {
@@ -375,12 +386,13 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private static func hashOfTextBytes(_ bytes: some Sequence<UInt8>) -> Int {
-        // FNV-1a
-        var combined = Int(bitPattern: 0xCBF2_9CE4_8422_2325 as UInt)
+        // FNV-1a, in explicit UInt64 — see ``mix(_:_:)`` for why the width is
+        // pinned rather than left as `Int`.
+        var combined: UInt64 = 0xCBF2_9CE4_8422_2325
         for byte in bytes {
-            combined = (combined ^ Int(byte)) &* 0x100_0000_01B3
+            combined = (combined ^ UInt64(byte)) &* 0x100_0000_01B3
         }
-        return combined
+        return Int(truncatingIfNeeded: combined)
     }
 
     private func textLocationMatches(_ location: TextLocation, utf8Bytes: [UInt8]) -> Bool {

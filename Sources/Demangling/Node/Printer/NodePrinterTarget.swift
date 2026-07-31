@@ -7,19 +7,23 @@ public protocol NodePrinterTarget: Sendable {
     ///
     /// The context is delivered lazily: building a `NodePrintContext` on the
     /// store path materializes a `Node` subtree, and only targets that
-    /// actually use the context (rich targets) should pay that cost. Targets
-    /// that ignore it (`String`, the default implementation) never evaluate
-    /// the autoclosure, keeping the plain-text store path materialization-free.
+    /// actually use the context (rich targets) should pay that cost. A target
+    /// that ignores it never evaluates the autoclosure, keeping the plain-text
+    /// store path materialization-free — see `String`'s forwarding conformance
+    /// for the shape a plain-text target wants.
     ///
     /// - Important: the parameter is `@autoclosure () -> NodePrintContext?`,
-    ///   **not** `NodePrintContext?`. An implementation written against the
-    ///   earlier eager signature does not satisfy this requirement, so the
-    ///   forwarding default below silently takes its place: the printed text
-    ///   stays byte-identical and every context annotation disappears.
-    ///   Nothing warns about this — Swift has no diagnostic for a near-miss
-    ///   witness when a default exists. If a rich target stops receiving
-    ///   contexts, check this signature first (same trap as
-    ///   ``pushTypeReferenceScope(_:)``).
+    ///   **not** `NodePrintContext?`, and this requirement deliberately has
+    ///   **no default implementation**. A forwarding default used to live in
+    ///   the protocol extension, which made the difference invisible: an
+    ///   implementation written against the earlier eager signature is not a
+    ///   witness, so the default silently took its place, the printed text
+    ///   stayed byte-identical and every context annotation disappeared, with
+    ///   no diagnostic — Swift has no warning for a near-miss witness when a
+    ///   default exists. Without the default, that same near-miss is a
+    ///   conformance error at the definition site. The cost is that every
+    ///   target must spell this method out, including plain-text ones; that is
+    ///   the intended trade.
     mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?)
     /// Append the entire contents of another target. Required so
     /// `NodePrinter` can splice memoized fragments into the output without
@@ -35,29 +39,26 @@ public protocol NodePrinterTarget: Sendable {
     ///
     /// The node is delivered lazily: store-backed printing must materialize
     /// a `Node` to service this hook, and only targets that actually use
-    /// scope identity (rich targets) should pay that cost. Targets that
-    /// ignore scopes (`String`, the default implementation) never evaluate
-    /// the autoclosure, keeping the plain-text store path allocation-free.
+    /// scope identity (rich targets) should pay that cost. A target that
+    /// ignores scopes never evaluates the autoclosure, keeping the plain-text
+    /// store path allocation-free.
     ///
     /// - Important: the parameter is `@autoclosure () -> Node?`, **not**
-    ///   `Node?`. An implementation written against the earlier `Node?`
-    ///   signature does not satisfy this requirement, so the no-op default
-    ///   below silently takes its place: the printed text stays byte-identical
-    ///   and every scope event disappears. Nothing warns about this — Swift has
-    ///   no diagnostic for a near-miss witness when a default exists — and a
-    ///   text-comparison snapshot test cannot see it either. If a rich target
-    ///   stops receiving scopes, check this signature first.
+    ///   `Node?`, and like ``write(_:context:)`` this requirement has **no
+    ///   default implementation** — for the same reason. A no-op default used
+    ///   to absorb an implementation written against the earlier `Node?`
+    ///   signature, so scope events vanished with byte-identical text and no
+    ///   diagnostic, which a text-comparison snapshot test cannot see either.
+    ///   A near-miss is now a conformance error instead.
     mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?)
     mutating func popTypeReferenceScope()
 }
 
 extension NodePrinterTarget {
-    public mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
-        write(content)
-    }
-
-    public mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
-
+    /// Kept as a default: it takes no argument, so there is no near-miss
+    /// signature for it to absorb — the hazard that removed the defaults for
+    /// ``write(_:context:)`` and ``pushTypeReferenceScope(_:)`` cannot arise
+    /// here.
     public mutating func popTypeReferenceScope() {}
 
     public mutating func writeSpace(_ count: Int = 1) {
@@ -69,4 +70,14 @@ extension NodePrinterTarget {
     }
 }
 
-extension String: NodePrinterTarget {}
+/// The reference plain-text target. Both hooks forward without evaluating
+/// their autoclosure, so printing a store-backed tree into a `String`
+/// materializes no `Node`; copy this shape for any other target that does not
+/// care about semantic context.
+extension String: NodePrinterTarget {
+    public mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
+        write(content)
+    }
+
+    public mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
+}

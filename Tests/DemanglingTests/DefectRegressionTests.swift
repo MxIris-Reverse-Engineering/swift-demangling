@@ -240,6 +240,10 @@ struct DefectRegressionTests {
                 text += other.text
                 moduleContextNodeTexts += other.moduleContextNodeTexts
             }
+
+            // Scopes are not what this target records, but the requirement
+            // carries no default, so ignoring it has to be explicit.
+            mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
         }
 
         let mangled = "$sSaySiGD"
