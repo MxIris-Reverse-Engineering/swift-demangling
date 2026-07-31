@@ -461,6 +461,43 @@ struct NodeReferenceInterningConvenienceTests {
         #expect(store.reference(at: firstIndex).structurallyEquals(store.reference(at: secondIndex)))
     }
 
+    /// Pins the property that makes store-identity `==` the right choice:
+    /// inside one arena it *is* structural equality, so hashed collections
+    /// deduplicate normally. Read this before concluding that `NodeReference`
+    /// "cannot deduplicate" — that only holds when every element brought its
+    /// own arena, which is what `init(interning:)` does by design.
+    @Test func hashedCollectionsDeduplicateWithinOneArena() throws {
+        var builder = NodeStoreBuilder()
+        var indices: [NodeStore.NodeIndex] = []
+        for _ in 0 ..< 100 {
+            indices.append(try builder.demangle("$sSaySiGD"))
+        }
+        let store = builder.freeze()
+
+        let references = indices.map { store.reference(at: $0) }
+        #expect(Set(references).count == 1, "hash-consing must collapse identical trees to one index")
+        #expect(Dictionary(grouping: references, by: { $0 }).count == 1)
+    }
+
+    /// The mirror image, so the boundary is explicit rather than folklore:
+    /// one arena per reference means no two are `==`, while the structural
+    /// pair still reports them equal.
+    @Test func separateArenasAreUnequalButStructurallyEqual() throws {
+        let tree = try demangleAsNodeTransient("$sSaySiGD")
+        let references = (0 ..< 10).map { _ in NodeReference(interning: tree) }
+
+        #expect(Set(references).count == 10, "each interning call mints its own arena")
+        for reference in references.dropFirst() {
+            #expect(reference != references[0])
+            #expect(reference.structurallyEquals(references[0]))
+
+            var firstHasher = Hasher(), otherHasher = Hasher()
+            references[0].structuralHash(into: &firstHasher)
+            reference.structuralHash(into: &otherHasher)
+            #expect(firstHasher.finalize() == otherHasher.finalize())
+        }
+    }
+
     /// The documented use for `structurallyEquals(_ node: Node)` is finding an
     /// externally demangled `Node` among `NodeReference` dictionary keys. That
     /// only works if the two representations also *hash* alike: a key whose

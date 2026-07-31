@@ -1,9 +1,34 @@
 /// A lightweight handle to a node stored in a `NodeStore`.
 ///
-/// Sixteen bytes as a value: a store reference plus a node index. Because
-/// stores are fully hash-consed, equality is O(1) — two references are equal
-/// exactly when they address the same index of the same store, which within
-/// one store coincides with structural equality.
+/// Sixteen bytes as a value: a store reference plus a node index.
+///
+/// ## Equality is per-arena, and that is the whole design
+///
+/// `==` compares store identity and index, so it answers in O(1). That is not
+/// a weaker form of structural equality — **within one store it is exactly
+/// structural equality**, because a `NodeStoreBuilder` hash-conses on insert:
+/// two structurally identical trees interned into the same arena resolve to
+/// the same index, and `Set` / `Dictionary` deduplicate them (pinned by
+/// `NodeReferenceInterningConvenienceTests.hashedCollectionsDeduplicateWithinOneArena`:
+/// 100 copies of one symbol collapse to a one-element `Set`). Since bulk
+/// indexing — the case this type exists for — puts every tree in one arena,
+/// that is the case that matters.
+///
+/// Across *different* stores `==` is false even for identical trees, and this
+/// is deliberate: making it structural would turn a pointer-and-integer
+/// comparison into a two-tree walk on every hash bucket probe, which is the
+/// cost this 16-byte handle exists to avoid. Reach for the explicit pair when
+/// arenas differ:
+///
+/// - ``structurallyEquals(_:)-(NodeReference)`` / ``structurallyEquals(_:)-(Node)``
+/// - ``structuralHash(into:)`` — agrees with `Node.hash(into:)`, so a value
+///   type may key a dictionary by node structure while storing a reference.
+///
+/// So: same arena → use `==` freely; mixed arenas → use the structural pair.
+/// A `Set` that fails to deduplicate is the signature of one arena per
+/// element, which ``init(interning:)`` produces by design — see its note.
+/// Rationale and measurements: `Documentations/NodeStoreArena.md` (§「为什么
+/// 不能直接用固有的 `Hashable`」).
 public struct NodeReference: Sendable {
     public let store: NodeStore
     public let nodeIndex: NodeStore.NodeIndex
@@ -14,15 +39,37 @@ public struct NodeReference: Sendable {
         self.nodeIndex = nodeIndex
     }
 
-    /// Interns a single `Node` tree into a fresh private store and
+    /// Interns a single `Node` tree into a **fresh private store** and
     /// references its root.
     ///
     /// This is the convenience path for holding one externally built tree
     /// (for example a transient demangle or a synthesized `Node`) in
     /// compact form: the reference keeps its private store alive, so the
-    /// value is self-contained and `Sendable`. For bulk interning, drive a
-    /// `NodeStoreBuilder` directly so trees share one arena and its
-    /// deduplication.
+    /// value is self-contained and `Sendable`.
+    ///
+    /// - Important: one call, one arena — so this is the wrong tool for a
+    ///   batch. Deduplication and compactness are both properties *of an
+    ///   arena*, and giving every tree its own arena forfeits both:
+    ///
+    ///   ```swift
+    ///   // WRONG: N arenas, so no two elements are ever ==, and the Set
+    ///   // keeps all N. Measured on 300 references over 3 unique symbols:
+    ///   // 300 entries, 59,700 bytes retained.
+    ///   let unique = Set(symbols.map { NodeReference(interning: try demangleAsNode($0)) })
+    ///
+    ///   // RIGHT: one arena, hash-consed on insert, so identical trees land
+    ///   // on one index and `==` is structural. Same 300 trees: 3 entries,
+    ///   // 541 bytes.
+    ///   var builder = NodeStoreBuilder()
+    ///   let indices = try symbols.map { try builder.demangle($0) }
+    ///   let store = builder.freeze()
+    ///   let unique = Set(indices.map { store.reference(at: $0) })
+    ///   ```
+    ///
+    ///   If references from separate arenas genuinely have to be compared or
+    ///   keyed together, use ``structurallyEquals(_:)-(NodeReference)`` and
+    ///   ``structuralHash(into:)`` rather than `==` / `hash(into:)`. See the
+    ///   note on ``NodeReference`` itself.
     public init(interning node: Node) {
         var builder = NodeStoreBuilder()
         let rootNodeIndex = builder.intern(node)
@@ -306,10 +353,31 @@ extension NodeReference: CustomStringConvertible {
 // MARK: - Hashable
 
 extension NodeReference: Hashable {
+    /// Store identity plus index — O(1), and **structural equality whenever
+    /// both sides come from the same arena**, which is the intended use.
+    ///
+    /// A `NodeStoreBuilder` hash-conses on insert, so within one store
+    /// "same index" and "same structure" are the same statement; `Set` and
+    /// `Dictionary` therefore deduplicate normally there. This is not an
+    /// oversight to be "fixed" by walking the trees: that would replace a
+    /// pointer-and-integer compare with a full traversal on every bucket
+    /// probe, in the type whose entire purpose is to be a 16-byte handle.
+    ///
+    /// Two references from *different* stores are unequal even when the trees
+    /// are identical. Compare those with
+    /// ``structurallyEquals(_:)-(NodeReference)`` and key them with
+    /// ``structuralHash(into:)``. A `Set` that does not deduplicate means one
+    /// arena per element — see ``init(interning:)``,
+    /// `NodeReferenceInterningConvenienceTests.separateArenasAreUnequalButStructurallyEqual`
+    /// for that boundary spelled out, and `Documentations/NodeStoreArena.md`
+    /// for the rationale in full.
     public static func == (lhs: NodeReference, rhs: NodeReference) -> Bool {
         lhs.store === rhs.store && lhs.nodeIndex == rhs.nodeIndex
     }
 
+    /// Matches ``==``: keyed by arena identity and index, not by structure.
+    /// For structure-keyed hashing that agrees with `Node.hash(into:)`, use
+    /// ``structuralHash(into:)``.
     public func hash(into hasher: inout Hasher) {
         hasher.combine(ObjectIdentifier(store))
         hasher.combine(nodeIndex)
