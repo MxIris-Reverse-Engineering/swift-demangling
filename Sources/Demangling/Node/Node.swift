@@ -46,7 +46,7 @@ public final class Node: Sendable {
     /// because neither can race:
     ///
     /// - `NodeBuilder`, while assembling a node it has not handed out yet, and
-    ///   only under its `os_unfair_lock`.
+    ///   only inside its `Mutex`.
     /// - `deinit`, which by definition runs when the last reference is going
     ///   away, so no other thread can still reach the node.
     ///
@@ -459,9 +459,14 @@ extension Node {
 /// its own child, and every unbounded traversal in the library — remangling,
 /// hashing, interning — spun or grew forever on it.) Since a handed-out node
 /// can never gain children, no node can become its own descendant.
-public final class NodeBuilder: @unchecked Sendable {
-    private let _lock: UnsafeMutablePointer<os_unfair_lock>
-    private var _node: Node
+/// Concurrency: the node under construction lives inside a ``Mutex``, so this
+/// type is `Sendable` outright rather than `@unchecked` — the unsafety is the
+/// mutex's, and it is reviewed once there instead of at every builder method.
+public final class NodeBuilder: Sendable {
+    /// The node under construction. A `Mutex` hands its value out only inside
+    /// a locked closure, so there is no way to reach it unsynchronized — every
+    /// accessor below goes through ``withLock(_:)`` or ``withLockDetaching(_:)``.
+    private let _node: Mutex<Node>
 
     /// A detached snapshot of the current node being built.
     ///
@@ -470,7 +475,7 @@ public final class NodeBuilder: @unchecked Sendable {
     /// later builder mutations never affect it, and feeding it back into
     /// ``addChild(_:)`` cannot create a cycle.
     public var node: Node {
-        withLock { _node.shallowCopy() }
+        withLock { $0.shallowCopy() }
     }
 
     /// Creates a builder seeded with the given node's kind, contents, and
@@ -481,27 +486,35 @@ public final class NodeBuilder: @unchecked Sendable {
     /// immutable outside their own builder, and O(1) instead of a whole-tree
     /// rebuild.
     public init(_ node: Node) {
-        self._lock = .allocate(capacity: 1)
-        self._lock.initialize(to: os_unfair_lock())
-        self._node = node.shallowCopy()
+        self._node = Mutex(node.shallowCopy())
     }
 
     /// Creates a builder with a new node.
     public init(kind: Node.Kind, contents: Node.Contents = .none, children: [Node] = []) {
-        self._lock = .allocate(capacity: 1)
-        self._lock.initialize(to: os_unfair_lock())
-        self._node = Node(kind: kind, contents: contents, children: children)
+        self._node = Mutex(Node(kind: kind, contents: contents, children: children))
     }
 
-    deinit {
-        _lock.deinitialize(count: 1)
-        _lock.deallocate()
+    /// `withLockUnchecked` rather than `withLock`: the closures below mutate
+    /// `Node` in place and hand back either the builder itself or a node, none
+    /// of which crosses an isolation domain, so the `sending` constraints buy
+    /// nothing here.
+    private func withLock<T>(_ body: (inout Node) -> T) -> T {
+        _node.withLockUnchecked(body)
     }
 
-    private func withLock<T>(_ body: () -> T) -> T {
-        os_unfair_lock_lock(_lock)
-        defer { os_unfair_lock_unlock(_lock) }
-        return body()
+    /// Runs a non-mutating helper under the lock and detaches its result.
+    ///
+    /// A few of those helpers return the receiver unchanged on invalid input
+    /// (e.g. an out-of-range index), which here would hand out the live
+    /// instance the builder keeps mutating — the exact hole that made cycles
+    /// constructible through ``build()``. The check has to happen inside the
+    /// critical section, since that is the only place the live node is
+    /// identifiable.
+    private func withLockDetaching(_ body: (Node) -> Node) -> Node {
+        _node.withLockUnchecked { liveNode in
+            let result = body(liveNode)
+            return result === liveNode ? liveNode.shallowCopy() : result
+        }
     }
 
     // MARK: - Mutating Operations
@@ -509,56 +522,56 @@ public final class NodeBuilder: @unchecked Sendable {
     /// Adds a child node.
     @discardableResult
     public func addChild(_ child: Node) -> Self {
-        withLock { _node.addChild(child) }
+        withLock { $0.addChild(child) }
         return self
     }
 
     /// Adds multiple child nodes.
     @discardableResult
     public func addChildren(_ children: [Node]) -> Self {
-        withLock { _node.addChildren(children) }
+        withLock { $0.addChildren(children) }
         return self
     }
 
     /// Inserts a child node at the specified index.
     @discardableResult
     public func insertChild(_ child: Node, at index: Int) -> Self {
-        withLock { _node.insertChild(child, at: index) }
+        withLock { $0.insertChild(child, at: index) }
         return self
     }
 
     /// Removes the child at the specified index.
     @discardableResult
     public func removeChild(at index: Int) -> Self {
-        withLock { _node.removeChild(at: index) }
+        withLock { $0.removeChild(at: index) }
         return self
     }
 
     /// Sets a child at the specified index.
     @discardableResult
     public func setChild(_ child: Node, at index: Int) -> Self {
-        withLock { _node.setChild(child, at: index) }
+        withLock { $0.setChild(child, at: index) }
         return self
     }
 
     /// Replaces all children with the specified nodes.
     @discardableResult
     public func setChildren(_ children: [Node]) -> Self {
-        withLock { _node.setChildren(children) }
+        withLock { $0.setChildren(children) }
         return self
     }
 
     /// Reverses all children.
     @discardableResult
     public func reverseChildren() -> Self {
-        withLock { _node.reverseChildren() }
+        withLock { $0.reverseChildren() }
         return self
     }
 
     /// Reverses the first N children.
     @discardableResult
     public func reverseFirst(_ count: Int) -> Self {
-        withLock { _node.reverseFirst(count) }
+        withLock { $0.reverseFirst(count) }
         return self
     }
 
@@ -566,64 +579,64 @@ public final class NodeBuilder: @unchecked Sendable {
 
     /// Returns a new node with the child added.
     public func addingChild(_ child: Node) -> Node {
-        withLock { detached(_node.addingChild(child)) }
+        withLockDetaching { $0.addingChild(child) }
     }
 
     /// Returns a new node with the children added.
     public func addingChildren(_ children: [Node]) -> Node {
-        withLock { detached(_node.addingChildren(children)) }
+        withLockDetaching { $0.addingChildren(children) }
     }
 
     /// Returns a new node with the child inserted.
     public func insertingChild(_ child: Node, at index: Int) -> Node {
-        withLock { detached(_node.insertingChild(child, at: index)) }
+        withLockDetaching { $0.insertingChild(child, at: index) }
     }
 
     /// Returns a new node with the child removed.
     public func removingChild(at index: Int) -> Node {
-        withLock { detached(_node.removingChild(at: index)) }
+        withLockDetaching { $0.removingChild(at: index) }
     }
 
     /// Returns a new node with the child replaced.
     public func withChild(_ child: Node, at index: Int) -> Node {
-        withLock { detached(_node.withChild(child, at: index)) }
+        withLockDetaching { $0.withChild(child, at: index) }
     }
 
     /// Returns a new node with the specified children.
     public func withChildren(_ children: [Node]) -> Node {
-        withLock { detached(_node.withChildren(children)) }
+        withLockDetaching { $0.withChildren(children) }
     }
 
     /// Returns a new node with children reversed.
     public func reversingChildren() -> Node {
-        withLock { detached(_node.reversingChildren()) }
+        withLockDetaching { $0.reversingChildren() }
     }
 
     /// Returns a new node with the first N children reversed.
     public func reversingFirst(_ count: Int) -> Node {
-        withLock { detached(_node.reversingFirst(count)) }
+        withLockDetaching { $0.reversingFirst(count) }
     }
 
     /// Returns a new node with the descendant replaced.
     public func replacingDescendant(_ old: Node, with new: Node) -> Node {
-        withLock { detached(_node.replacingDescendant(old, with: new)) }
+        withLockDetaching { $0.replacingDescendant(old, with: new) }
     }
 
     // MARK: - Transformations
 
     /// Returns a new node with a different kind.
     public func changingKind(_ newKind: Node.Kind, additionalChildren: [Node] = []) -> Node {
-        withLock { detached(_node.changeKind(newKind, additionalChildren: additionalChildren)) }
+        withLockDetaching { $0.changeKind(newKind, additionalChildren: additionalChildren) }
     }
 
     /// Returns a new node with the child at index replaced or removed.
     public func changingChild(_ newChild: Node?, at index: Int) -> Node {
-        withLock { detached(_node.changeChild(newChild, at: index)) }
+        withLockDetaching { $0.changeChild(newChild, at: index) }
     }
 
     /// Returns a copy of the current node.
     public func copy() -> Node {
-        withLock { _node.copy() }
+        withLock { $0.copy() }
     }
 
     /// Finalizes and returns the built node.
@@ -634,18 +647,10 @@ public final class NodeBuilder: @unchecked Sendable {
     /// `builder.addChild(builder.build())` produces a parent/child pair, not
     /// a self-referential cycle.
     public func build() -> Node {
-        withLock {
-            let builtNode = _node
-            _node = builtNode.shallowCopy()
+        withLock { liveNode in
+            let builtNode = liveNode
+            liveNode = builtNode.shallowCopy()
             return builtNode
         }
-    }
-
-    /// Guards the non-mutating helpers: a few of them return `self` on
-    /// invalid input (e.g. an out-of-range index), which here would leak the
-    /// live instance the builder keeps mutating — the exact hole that made
-    /// cycles constructible through ``build()``.
-    private func detached(_ result: Node) -> Node {
-        result === _node ? _node.shallowCopy() : result
     }
 }

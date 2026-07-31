@@ -110,6 +110,7 @@ let package = Package(
             name: "Demangling",
             dependencies: [
                 .product(name: "FoundationToolbox", package: "FrameworkToolbox"),
+                .product(name: "SwiftStdlibToolbox", package: "FrameworkToolbox"),
             ],
         ),
         .target(

@@ -344,6 +344,15 @@ public enum StackSafeExecutor {
 ///
 /// Nesting deeper than ``burstWorkerLimit`` simultaneously blocked callers is
 /// still possible in principle; those submissions queue as before.
+///
+/// Concurrency: this is the one type here that keeps `@unchecked Sendable`
+/// rather than moving its state into a `Mutex`, and the reason is the
+/// primitive, not the pattern. Workers park on `condition.wait()` until a
+/// submission signals them, so the pool needs a *condition variable*, and a
+/// mutex offers no way to wait on one — `NSCondition` is lock and condition in
+/// one object, so the state it guards has to live beside it rather than inside
+/// it. (`NodeCache` and `NodeBuilder` only ever needed mutual exclusion, which
+/// is why they did move.)
 final class LargeStackThreadPool: @unchecked Sendable {
     static let shared = LargeStackThreadPool()
 
