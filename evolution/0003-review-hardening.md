@@ -41,7 +41,8 @@ review 实测数据（均为纯公开 API 或真实 mangled 字符串触发）�
 | `NodeBuilder`（`Node.swift`） | 冻结移交不变量：`node` 返回分离快照、`build()` 返回后与该节点脱钩、`init(_:)` 浅播种、非变异 helper 加 `detached` 防护 |
 | `Node.copy()` / `replacingDescendant` | 按源实例身份记忆化，保共享 |
 | `Node.Rewriter.rewrite` | 同上；`visit` 升级为「每唯一实例一次」的纯函数契约 |
-| `Node.description` | 共享内部子树首现标 `(shared #N)` 展开、复现 `(see #N)` 不展开；叶子豁免 |
+| `Node.description` | 保持逐次展开（与 Swift runtime dump 逐字节一致），改用 8MB 输出上限兜底病态 DAG |
+| `Node.sharedStructureDescription` | 新增 `@_spi(Internals)` 视图：共享内部子树首现标 `(shared #N)` 展开、复现 `(see #N)` 不展开；叶子豁免 |
 | `Node: Codable` | 换为扁平节点表格式（迭代、保共享、环不可表示）；**破坏性格式变更** |
 | `TypeDecoder`（注释） | store 路径入口如实描述每 decl 物化与 O(k²)，指向 KnownIssues |
 | `KnownIssues.md` | 关闭原第 3 条（环），新增第 3–5 条 |
@@ -81,10 +82,26 @@ interning（`main` 已默认开启）与替换回引使 demangle 产物是共享
 共享深图上遍历成本等于路径数，这与上游 C++（同样按替换共享节点、靠深度上限兜底）一致，
 属逻辑树的固有属性，不改。
 
-**取舍四（`description` 标记而非截断）**：输出上限用「共享内部子树只展开一次」实现，
-而不是武断的行数上限——dump 因此按图大小线性有界，且共享标记对调试 interning 反而
-是增量信息。叶子豁免标记（每个重复叶子标记本身就占一行，纯噪声）。无共享的树输出
-逐字节不变。
+**取舍四（`description` 字节上限，标记视图另开入口）**：本条曾按「共享内部子树只展开
+一次」实现输出上限，理由是 dump 因此按图大小线性有界。该实现已推翻——它漏看了
+`description` 的格式是一份**对外契约**：语料一致性测试（`DemanglingTestingSupport/
+DemanglingTests.swift`）拿它和 Swift runtime 的 node dump 逐字节比对，而 runtime 是
+逐次展开的。实测代价是 4,522,325 个符号里 **1,433,597 条不匹配（31.7%）**，整个测试
+套件变红。
+
+现在的取舍是把两件事解耦：
+
+- `description` 恢复逐次展开，病态 DAG 用 **8MB 输出字节上限**兜底，超限即停并追加
+  `... (truncated: …)`。上限只影响病态输入的尾部，不改变任何正常符号的一个字节。
+- 标记视图移到 `@_spi(Internals) Node.sharedStructureDescription`，调试 interning 时
+  仍然可用，且仍按图大小线性有界。
+
+上限取 8MB 的依据：全量 dyld shared cache 语料（4,522,325 个符号）逐次展开的**最大
+dump 是 496,018 字节**，超过 1MB 的符号 0 个，超过 100KB 的 652 个（0.014%）——真实
+符号离上限有 16 倍余量，实践中永不触发。而它确实挡得住病态图：depth 40 的共享对图
+（2^40 ≈ 10^12 条路径）0.17 秒停在 8,388,716 字节，同一张图的
+`sharedStructureDescription` 是 5,389 字节。DFS 待办栈只按树形（每层每分支一项）增长，
+爆炸的只有输出，所以对输出计费就够了。
 
 ### 3. Codable：扁平节点表
 
@@ -102,13 +119,16 @@ interning（`main` 已默认开启）与替换回引使 demangle 产物是共享
 - **`NodeBuilder` 语义**：`node` 每次访问返回不同实例（旧代码若依赖其身份稳定需调整，
   未发现使用点）；`build()` 后 builder 仍可用；`init(_:)` 播种共享子树而非深拷贝
   （根级变异隔离不变）。
-- **`description`**：仅共享树新增 `(shared #N)` / `(see #N)` 标记；无共享树逐字节不变。
+- **`description`**：格式与 Swift runtime dump 保持逐字节一致（语料 4,522,325 个符号
+  零不匹配）；仅当单次 dump 超过 8MB 时截断并标注，真实语料中无一触发。标记视图需改用
+  `@_spi(Internals) sharedStructureDescription`。
 - **`Codable`**：新旧格式互不兼容。
 - **性能**：`copy` / `rewrite` / `replacingDescendant` 在共享图上从指数降为线性；
   `NodeBuilder.init(_:)` 从 O(树) 降为 O(1)。
 - 测试：`DefectRegressionTests` 的环测试改写为「不可构造」断言；新增
-  `SharedDAGTraversalTests`（9 项：copy/播种/替换/重写的保共享与计价、description
-  标记与格式保持、Codable 往返/深链/防环/线性体积）。
+  `SharedDAGTraversalTests`（10 项：copy/播种/替换/重写的保共享与计价、
+  `sharedStructureDescription` 标记、`description` 在 2^40 路径图上的字节上限、
+  无共享树两视图一致、Codable 往返/深链/防环/线性体积）。
 
 ## 迁移/升级注意事项
 

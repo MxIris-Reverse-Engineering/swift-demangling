@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import Demangling
+@_spi(Internals) @testable import Demangling
 
 /// Regressions for the shared-DAG traversal defects from the node-store
 /// review: interning and substitution back-references make demangled trees
@@ -10,6 +10,11 @@ import Testing
 /// 120-character symbol dumped a 366MB `description`. These tests pin the
 /// memoized behavior: traversal cost tracks the graph's node count, never its
 /// path count.
+///
+/// `description` is the one exception, and deliberately so: its format is
+/// compared byte for byte against the Swift runtime's node dump by the corpus
+/// conformance oracle, so it expands every occurrence and is bounded by a byte
+/// budget instead. `sharedStructureDescription` carries the memoized view.
 @Suite
 struct SharedDAGTraversalTests {
     /// Nested pairs of the same instance: depth 40 means 2^40 ≈ 10^12 paths,
@@ -125,24 +130,41 @@ struct SharedDAGTraversalTests {
 
     // MARK: - description
 
-    @Test func descriptionExpandsSharedInteriorSubtreesOnce() {
+    @Test func sharedStructureDescriptionExpandsSharedInteriorSubtreesOnce() {
         let sharedGraph = Self.makeSharedPairGraph(depth: 40)
 
         // 2^40 paths: an unmemoized dump would be terabytes. The labeled dump
         // is linear in the graph — comfortably under a few hundred lines.
-        let dump = sharedGraph.description
+        let dump = sharedGraph.sharedStructureDescription
         #expect(dump.utf8.count < 50_000, "dump was \(dump.utf8.count) bytes")
         #expect(dump.contains("(shared #1)"))
         #expect(dump.contains("(see #1)"))
     }
 
+    /// `description` expands every occurrence, matching the Swift runtime's own
+    /// dump — which is what the corpus conformance oracle compares against — so
+    /// a DAG is bounded by a byte budget rather than by eliding. The walk must
+    /// stop at the budget rather than run the graph's path count to completion.
+    @Test func descriptionIsBoundedOnAPathologicalGraph() {
+        let sharedGraph = Self.makeSharedPairGraph(depth: 40)
+
+        let dump = sharedGraph.description
+        #expect(dump.utf8.count < 9 * 1024 * 1024, "dump was \(dump.utf8.count) bytes")
+        #expect(dump.contains("truncated"))
+        // The elision belongs to the other view only.
+        #expect(!dump.contains("(shared #"))
+        #expect(!dump.contains("(see #"))
+    }
+
     @Test func descriptionOfAnUnsharedTreeIsUnchanged() throws {
-        // No interior sharing → no labels, the familiar plain dump.
+        // No interior sharing → the two views agree, and both are the familiar
+        // plain dump.
         let unsharedTree = try demangleAsNode("$s4main3fooyySiF", internsSubtrees: false)
         let dump = unsharedTree.description
         #expect(!dump.contains("(shared #"))
         #expect(!dump.contains("(see #"))
         #expect(dump.contains("kind=Global"))
+        #expect(unsharedTree.sharedStructureDescription == dump)
     }
 
     // MARK: - Codable
