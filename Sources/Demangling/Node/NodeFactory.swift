@@ -294,13 +294,30 @@ public final class NodeCache: Sendable {
     /// so it is on the hot path for the deepest trees the library ever sees, and
     /// as a whole-tree walk it sits outside every engine's stack guard.
     ///
+    /// The walk memoizes canonical results by source-instance identity for its
+    /// own duration. The `SubtreeKey` probe alone is not enough: it keys by the
+    /// probed node's *original* child identities, so it only short-cuts while
+    /// those children are already canonical. As soon as canonicalization
+    /// replaces a child anywhere below — structural duplicates inside the tree,
+    /// or overlap with previously interned structure, the normal case for every
+    /// tree after the first — every repeated instance probe-misses and, without
+    /// the memo, re-descends its whole subtree once per *path*: 2^N on a
+    /// doubling DAG, reachable straight through default `demangleAsNode`
+    /// because substitution back-references repeat instances (evolution 0006).
+    ///
     /// - Precondition: the caller holds the mutex — that is what the `inout
     ///   Storage` stands for.
     private static func internTree(_ node: Node, in cacheStorage: inout Storage) -> Node {
         var frames: [InternFrame] = []
         var completedChild: Node?
+        var canonicalBySourceIdentity: [ObjectIdentifier: Node] = [:]
 
         func canonicalizeWithoutDescending(_ candidate: Node) -> Node? {
+            // A source instance this walk already canonicalized repeats its
+            // result — this is what keeps the walk priced by node count.
+            if let alreadyCanonicalized = canonicalBySourceIdentity[ObjectIdentifier(candidate)] {
+                return alreadyCanonicalized
+            }
             // Leaf node: intern it
             if candidate.children.isEmpty {
                 return Self.internLeaf(kind: candidate.kind, contents: candidate.contents, in: &cacheStorage)
@@ -309,7 +326,9 @@ public final class NodeCache: Sendable {
             // children are already canonical, so a hit is authoritative without descending.
             // This also makes re-interning an already-canonical subtree O(children).
             if let existingIndex = cacheStorage.subtrees.firstIndex(of: SubtreeKey(node: candidate)) {
-                return cacheStorage.subtrees[existingIndex].node
+                let canonical = cacheStorage.subtrees[existingIndex].node
+                canonicalBySourceIdentity[ObjectIdentifier(candidate)] = canonical
+                return canonical
             }
             return nil
         }
@@ -350,6 +369,7 @@ public final class NodeCache: Sendable {
                 ? Node(kind: frame.node.kind, contents: frame.node.contents, children: frame.internedChildren)
                 : frame.node
             let canonical = cacheStorage.subtrees.insert(SubtreeKey(node: candidate)).memberAfterInsert.node
+            canonicalBySourceIdentity[ObjectIdentifier(frame.node)] = canonical
 
             if frames.isEmpty {
                 return canonical

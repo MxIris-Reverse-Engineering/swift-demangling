@@ -1030,39 +1030,64 @@ extension Demangler {
             cachedParentId = id
             return id
         }
-        return setParentForOpaqueReturnTypeNodesImpl(visited: visited, getParentId: getParentId)
+        var rewrittenBySourceIdentity: [ObjectIdentifier: Node] = [:]
+        return setParentForOpaqueReturnTypeNodesImpl(
+            visited: visited,
+            getParentId: getParentId,
+            rewrittenBySourceIdentity: &rewrittenBySourceIdentity
+        )
     }
 
+    /// Memoized by source-instance identity for one post-pass: substitution
+    /// back-references repeat instances, so the raw demangled subtree is a DAG,
+    /// and an unmemoized walk costs the path count — 2^N on a doubling DAG,
+    /// which made even `internsSubtrees: false` demangling exponential in a
+    /// crafted symbol's sharing depth (evolution 0006). Rewriting a repeated
+    /// instance once and reusing the result also preserves subtree sharing in
+    /// the rewritten tree, matching `copy()`/`Rewriter` semantics. The rewrite
+    /// is a pure function of the subtree (`getParentId` is fixed per pass), so
+    /// the memo cannot change what any occurrence produces.
     private func setParentForOpaqueReturnTypeNodesImpl(
         visited: Node,
-        getParentId: () -> String
+        getParentId: () -> String,
+        rewrittenBySourceIdentity: inout [ObjectIdentifier: Node]
     ) -> Node {
+        if let alreadyRewritten = rewrittenBySourceIdentity[ObjectIdentifier(visited)] {
+            return alreadyRewritten
+        }
+
+        let rewritten: Node
         if visited.kind == .opaqueReturnType {
             if visited.children.last?.kind == .opaqueReturnTypeParent {
-                return visited
+                rewritten = visited
+            } else {
+                rewritten = visited.addingChild(createNode(kind: .opaqueReturnTypeParent, contents: .text(getParentId())))
             }
-            return visited.addingChild(createNode(kind: .opaqueReturnTypeParent, contents: .text(getParentId())))
+        } else {
+            switch visited.kind {
+            case .function,
+                 .variable,
+                 .subscript:
+                rewritten = visited
+            default:
+                var changed = false
+                var newChildren = [Node]()
+                newChildren.reserveCapacity(visited.children.count)
+                for child in visited.children {
+                    let newChild = setParentForOpaqueReturnTypeNodesImpl(
+                        visited: child,
+                        getParentId: getParentId,
+                        rewrittenBySourceIdentity: &rewrittenBySourceIdentity
+                    )
+                    if newChild !== child { changed = true }
+                    newChildren.append(newChild)
+                }
+                rewritten = changed ? visited.withChildren(newChildren) : visited
+            }
         }
 
-        switch visited.kind {
-        case .function,
-             .variable,
-             .subscript: return visited
-        default: break
-        }
-
-        var changed = false
-        var newChildren = [Node]()
-        newChildren.reserveCapacity(visited.children.count)
-        for child in visited.children {
-            let newChild = setParentForOpaqueReturnTypeNodesImpl(visited: child, getParentId: getParentId)
-            if newChild !== child { changed = true }
-            newChildren.append(newChild)
-        }
-        if changed {
-            return visited.withChildren(newChildren)
-        }
-        return visited
+        rewrittenBySourceIdentity[ObjectIdentifier(visited)] = rewritten
+        return rewritten
     }
 
     private mutating func demanglePlainFunction() throws(DemanglingError) -> Node {

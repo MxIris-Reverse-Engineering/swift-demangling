@@ -151,23 +151,45 @@ extension Node {
 }
 
 extension Node {
+    /// Walked with an explicit deduped stack rather than the `Sequence`
+    /// traversal: substitution back-references and interning make demangled
+    /// trees DAGs, and the path-based traversal repeats a shared instance once
+    /// per path — 2^N on a doubling DAG. Both the `dependentGenericParamCount`
+    /// existence guard and the max-combine collection below are idempotent per
+    /// instance, so visiting each unique node once answers identically at node
+    /// count (evolution 0006).
     public func findGenericParamsDepth() -> [UInt64: UInt64]? {
-        guard kind == .dependentGenericType, first(of: .dependentGenericParamCount) != nil else { return nil }
+        guard kind == .dependentGenericType else { return nil }
 
+        var containsGenericParamCount = false
         var depths: [UInt64: UInt64] = [:]
 
-        for child in self {
-            guard child.kind == .dependentGenericParamType else { continue }
-            guard let depth = child.children.at(0)?.index else { continue }
-            guard let index = child.children.at(1)?.index else { continue }
+        var pendingNodes: [Node] = [self]
+        var visitedNodes: Set<ObjectIdentifier> = []
+        while let currentNode = pendingNodes.popLast() {
+            guard visitedNodes.insert(ObjectIdentifier(currentNode)).inserted else { continue }
 
-            if let currentDepth = depths[index] {
-                depths[index] = Swift.max(currentDepth, depth)
-            } else {
-                depths[index] = depth
+            switch currentNode.kind {
+            case .dependentGenericParamCount:
+                containsGenericParamCount = true
+            case .dependentGenericParamType:
+                guard let depth = currentNode.children.at(0)?.index else { break }
+                guard let index = currentNode.children.at(1)?.index else { break }
+                if let currentDepth = depths[index] {
+                    depths[index] = Swift.max(currentDepth, depth)
+                } else {
+                    depths[index] = depth
+                }
+            default:
+                break
+            }
+
+            for child in currentNode.children {
+                pendingNodes.append(child)
             }
         }
 
+        guard containsGenericParamCount else { return nil }
         return depths
     }
 

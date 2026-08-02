@@ -219,20 +219,50 @@ extension Sequence where Element: DemanglingNode {
 extension DemanglingNode where Self: Sequence, Self.Element == Self {
     /// The declaration identifier carried by this subtree, if any.
     /// Mirrors the historical `Node.identifier` lookup order.
+    ///
+    /// One deduped preorder pass replaces the historical chain of three
+    /// `first(of:)` scans: the traversal machinery is path-based by design, so
+    /// on a shared DAG the (typically fruitless) operator scan alone cost the
+    /// path count — 2^N — before the identifier scan even started. Visiting
+    /// each unique node once preserves every "first match in preorder" answer,
+    /// because a repeat visit of a shared instance cannot contain anything its
+    /// first visit did not (evolution 0006).
     public var identifier: String? {
         if let node = children.at(1), node.kind == .identifier {
             return node.text
         } else if let node = children.at(1), node.kind == .privateDeclName {
             return node.children.at(1)?.text
-        } else if let node = first(of: .prefixOperator, .postfixOperator, .infixOperator) {
-            return node.text
-        } else if let node = first(of: .identifier) {
-            return node.text
-        } else if let node = first(of: .privateDeclName) {
-            return node.children.at(1)?.text
-        } else {
-            return nil
         }
+
+        var firstIdentifier: Self?
+        var firstPrivateDeclName: Self?
+        var pendingNodes: [Self] = [self]
+        var visitedNodes: Set<PrintCacheIdentity> = []
+        while let currentNode = pendingNodes.popLast() {
+            guard visitedNodes.insert(currentNode.printCacheIdentity).inserted else { continue }
+
+            switch currentNode.kind {
+            case .prefixOperator, .postfixOperator, .infixOperator:
+                // Highest-priority group: the historical lookup preferred any
+                // operator anywhere over an identifier found earlier.
+                return currentNode.text
+            case .identifier:
+                if firstIdentifier == nil { firstIdentifier = currentNode }
+            case .privateDeclName:
+                if firstPrivateDeclName == nil { firstPrivateDeclName = currentNode }
+            default:
+                break
+            }
+
+            // Reversed push keeps the pop order preorder (leftmost first).
+            for child in currentNode.children.reversed() {
+                pendingNodes.append(child)
+            }
+        }
+
+        if let firstIdentifier { return firstIdentifier.text }
+        if let firstPrivateDeclName { return firstPrivateDeclName.children.at(1)?.text }
+        return nil
     }
 }
 

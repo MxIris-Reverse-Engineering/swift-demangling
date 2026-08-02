@@ -315,6 +315,103 @@ struct DefectRegressionTests {
         #expect(finished, "SubstitutionEntry.deepEquals expanded the DAG instead of memoizing visited pairs")
     }
 
+    // MARK: - NodeCache tree interning and demangler post-pass on shared DAGs
+
+    /// `NodeCache.internTree` was the one whole-tree canonicalization walk of
+    /// nine with no per-walk identity memo. Its `SubtreeKey` probe short-cuts
+    /// only while the probed node's own children are already canonical; as
+    /// soon as canonicalization replaces a child anywhere below (structural
+    /// duplicates inside the tree, or overlap with previously interned
+    /// structure — the normal case for every tree after the first in a bulk
+    /// run), every repeated instance probe-misses and re-descends its whole
+    /// subtree once per *path*: 2^N on a doubling DAG (measured 4× per 2
+    /// levels, 5.4s at 18 levels, through public `Node.interned()` and through
+    /// default `demangleAsNode` alike). Memoized by source-instance identity,
+    /// 60 doubling levels finish in milliseconds; pre-fix they were 2^60
+    /// subtree descents — never.
+    @Test func nodeCacheInterningFinishesOnADoublingDag() {
+        let firstCopy = Self.doublingGenericType(levels: 60)
+        let secondCopy = Self.doublingGenericType(levels: 60)
+
+        let finished = Self.completesWithinTimeout {
+            let firstCanonical = firstCopy.interned()
+            let secondCanonical = secondCopy.interned()
+            // Canonicalization semantics must be intact: both instance-distinct
+            // copies collapse to the same canonical instance.
+            #expect(firstCanonical === secondCanonical)
+        }
+        #expect(finished, "NodeCache.internTree re-descended the DAG once per path instead of memoizing by instance")
+    }
+
+    /// The demangler's `setParentForOpaqueReturnTypeNodes` post-pass walks the
+    /// whole function-type subtree on every plain-function symbol, and
+    /// substitution back-references make that subtree a DAG — unmemoized, the
+    /// walk costs the path count, so even `internsSubtrees: false` demangling
+    /// of a substitution-shared symbol was exponential (1.04s at 18 levels for
+    /// a 131-character valid symbol, ×4 per 2 levels; the interning pass then
+    /// added its own 2^N on top). The symbol here is produced by the library's
+    /// own remangler from a 60-level doubling DAG, so a ~450-character string
+    /// hung `demangleAsNode` outright.
+    @Test func demangleAsNodeFinishesOnASubstitutionSharedSymbol() throws {
+        let sharedDag = Self.doublingGenericType(levels: 60)
+        let symbol = try mangleAsString(Self.functionTaking(sharedDag, sharedDag))
+
+        let finished = Self.completesWithinTimeout {
+            let transient = try? demangleAsNode(symbol, internsSubtrees: false)
+            #expect(transient != nil)
+            let firstCanonical = try? demangleAsNode(symbol)
+            let secondCanonical = try? demangleAsNode(symbol)
+            #expect(firstCanonical != nil)
+            // Repeat demangling must still collapse to one canonical instance.
+            #expect(firstCanonical === secondCanonical)
+        }
+        #expect(finished, "demangling a substitution-shared symbol re-walked the DAG once per path")
+    }
+
+    /// `Node.findGenericParamsDepth()` scanned its subtree with the path-based
+    /// `Sequence` traversal — both the `dependentGenericParamCount` existence
+    /// guard and the collection loop — so on a shared DAG the query cost the
+    /// path count. Both the guard and the max-combine collection are
+    /// idempotent per instance, so a deduped walk answers identically at node
+    /// count.
+    @Test func findGenericParamsDepthFinishesOnADoublingDag() {
+        let root = Node.create(kind: .dependentGenericType, children: [
+            Node.create(kind: .dependentGenericSignature, children: [
+                Node.create(kind: .dependentGenericParamCount, index: 1),
+            ]),
+            Node.create(kind: .type, child: Node.create(kind: .tuple, children: [
+                Node.create(kind: .tupleElement, child: Node.create(kind: .type, child: Node.create(kind: .dependentGenericParamType, children: [
+                    Node.create(kind: .index, index: 0),
+                    Node.create(kind: .index, index: 0),
+                ]))),
+                Node.create(kind: .tupleElement, child: Self.doublingGenericType(levels: 60)),
+            ])),
+        ])
+
+        let finished = Self.completesWithinTimeout {
+            let depths = root.findGenericParamsDepth()
+            // The answer itself must be unchanged by the deduped walk.
+            #expect(depths == [0: 0])
+        }
+        #expect(finished, "findGenericParamsDepth re-enumerated the DAG once per path instead of once per node")
+    }
+
+    /// `identifier` chained three `first(of:)` scans; the operator scan never
+    /// matches a type subtree, so it exhausted the full path-based traversal
+    /// before the identifier scan even started — 2^N on a shared DAG. One
+    /// deduped preorder pass preserves every "first match in preorder" answer:
+    /// a repeat visit of a shared instance cannot contain anything its first
+    /// visit did not.
+    @Test func identifierLookupFinishesOnADoublingDag() {
+        let sharedDag = Self.doublingGenericType(levels: 60)
+
+        let finished = Self.completesWithinTimeout {
+            // First `.identifier` in preorder is the generic head's name.
+            #expect(sharedDag.identifier == "G")
+        }
+        #expect(finished, "identifier's operator scan re-enumerated the DAG once per path instead of once per node")
+    }
+
     // MARK: - Rich-target context on the store path (#14)
 
     /// `NodePrintContext.node` was `name as? Node`, which is always nil for a

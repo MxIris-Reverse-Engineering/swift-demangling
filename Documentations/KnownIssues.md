@@ -9,6 +9,8 @@
 - **2026-07-30 更新**：原第 3 条（调用方构造的环状 `Node`）已修复并移除——`NodeBuilder`
   现在对外只交付冻结节点，环从公开 API 不可构造（见 `evolution/0003-review-hardening.md`）。
   同轮新增第 3–5 条（打印缓存回放越过深度上限、2MB 探针窗口、TypeDecoder store 路径 O(k²)）。
+- **2026-08-02 更新**：evolution 0006 的横向排查（按路径计价的整树遍历）新增第 6 条
+  （TypeDecoder 在共享 DAG 上按出现次数解码）。
 
 ---
 
@@ -100,3 +102,26 @@ decl 嵌套深度通常在个位数，影响温和，但与该路径「零物化
 
 **修法方向**：engine 内加 per-decode 的「store 索引 → 物化 `Node`」缓存；或让 decl
 handoff 直接携带 `NodeReference`，把物化推迟到 `TypeBuilder` 真正需要处。
+
+## 6. TypeDecoder 在共享 DAG 上按出现次数解码，深度上限约束不了总工作量
+
+`TypeDecoderEngine.decodeMangledType` 沿子节点递归构建 `BuiltType`，没有按实例身份的
+memo；唯一的守卫 `maxDepth = 160` 只封顶**单条根到叶路径**的长度，不封顶路径条数。
+替换反向引用让 demangle 输出本身是 DAG——同一子树实例出现在 k 条路径上就被解码 k 次，
+`TypeBuilder` 回调也随之被调 k 次；构造的深共享 DAG 可以在不触碰深度上限的前提下把
+回调次数推到指数级。这正是 printer 用 `printCache`、remangler 用 `deepEquals` 成对
+memo 已经封掉的同一暴露面（evolution 0006 的横向排查发现），TypeDecoder 两者皆无。
+`main` 既有（当时上限 1024，更宽），非 node-store PR 引入。
+
+**影响面**：仅 `TypeDecoder` 公开入口喂入共享 DAG 时；纯耗时/回调次数问题，产出的
+类型值不受影响。真实符号共享深度浅，语料下无可测差异。
+
+**暂缓理由**：其一，沿用上方 TypeDecoder 范围的暂缓决策（下游当前未使用）。其二，
+与其余遍历不同，这里的修复**不是**纯机械加 memo：`TypeBuilder` 回调是用户代码，按
+唯一实例去重意味着有状态 builder 的回调从「每次出现一次」变为「每个实例一次」——
+与 `Node.Rewriter` 当年同款的公开契约语义变更（那次是刻意为之并文档化的），需要
+单独决策与迁移说明，不适合混进无行为变化的修复批次。
+
+**修法方向**：engine 内加「实例身份 → BuiltType」的 per-decode 缓存并在文档中声明
+回调按唯一实例触发（对齐 `Rewriter` 的纯函数要求）；或保守方案——保持逐出现语义，
+但加一个按已解码节点数计数的总量上限，超限抛 `TypeLookupError`。
