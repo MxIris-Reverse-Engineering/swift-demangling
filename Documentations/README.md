@@ -13,7 +13,7 @@
 
 ## 其他位置的文档
 
-- `evolution/` — 演进提案（设计意图 + 决策日志）。`0001-node-store-arena.md` 是 `NodeStoreArena.md` 的提案原文；`0002-stack-safety.md` 是 `StackSafety.md` 的提案原文；`0003-review-hardening.md` 是 PR #6 review 收尾轮——冻结移交的 `NodeBuilder`（环不可构造）、整树重建的按图计价（memo 保共享）、`description` 与 runtime dump 的逐字节一致（外加 8MB 输出上限）、移除 `Node: Codable`（序列化用 mangled string）、以及让近似签名的 `NodePrinterTarget` 实现变成编译错误。
+- `evolution/` — 演进提案（设计意图 + 决策日志）。`0001-node-store-arena.md` 是 `NodeStoreArena.md` 的提案原文；`0002-stack-safety.md` 是 `StackSafety.md` 的提案原文；`0003-review-hardening.md` 是 PR #6 review 收尾轮——冻结移交的 `NodeBuilder`（环不可构造）、整树重建的按图计价（memo 保共享）、`description` 与 runtime dump 的逐字节一致（外加 8MB 输出上限）、移除 `Node: Codable`（序列化用 mangled string）、以及让近似签名的 `NodePrinterTarget` 实现变成编译错误；`0004-32bit-store-guards.md` 修复 Store 越界守卫的 `Int(UInt32.max)` 写法在 watchOS（32 位 `Int`）上被常量折叠成无条件 trap 的问题，并以源码扫描回归测试禁止该转换家族再次进入 `Sources/`。
 - `docs/AlignmentGaps.md` — 与上游 Swift 编译器 `Demangling` 源码的对齐缺口追踪。
 - `AGENTS.md` / `CLAUDE.md`（仓库根） — 面向编码 agent 的架构速查。
 - `README.md`（仓库根） — 面向使用者的英文说明与用法示例。

@@ -431,4 +431,45 @@ struct DefectRegressionTests {
         #expect(firstMaterialization !== secondMaterialization, "store path: fresh instance per materialization, as documented")
         #expect(firstMaterialization == secondMaterialization, "structural equality is unaffected")
     }
+
+    // MARK: - 32-bit Int portability
+
+    /// `Int(UInt32.max)` overflows wherever `Int` is 32 bits — watchOS
+    /// `arm64_32` and `armv7k`, both inside `Package.swift`'s declared
+    /// platforms — and it does so at constant-folding time: the compiler
+    /// reduces the enclosing function body to an unconditional
+    /// `assertionFailure` while the build stays green with no diagnostic
+    /// (verified against the emitted SIL for both targets). Three store-buffer
+    /// guards shipped that spelling, so on watchOS the first node inserted
+    /// into any store killed the process. The portable spelling is a
+    /// heterogeneous comparison (`count <= UInt32.max`), which compares
+    /// mathematically without converting either side — the same idiom as the
+    /// standard library's `KeyPath` offset check and swift-syntax's
+    /// `AbsoluteSyntaxInfo`. This sweep keeps the whole conversion family out
+    /// of the library source; no host-side runtime test can catch it, because
+    /// the expression is well-behaved wherever the suite runs.
+    @Test func librarySourceAvoidsWordSizeDependentIntegerConversions() throws {
+        let librarySourcesDirectory = URL(fileURLWithPath: #filePath) // …/Tests/DemanglingTests/DefectRegressionTests.swift
+            .deletingLastPathComponent() // …/Tests/DemanglingTests
+            .deletingLastPathComponent() // …/Tests
+            .deletingLastPathComponent() // package root
+            .appendingPathComponent("Sources")
+        let forbiddenConversions = ["Int(UInt32.max)", "Int(UInt64.max)", "Int(UInt.max)"]
+        let fileEnumerator = try #require(FileManager.default.enumerator(at: librarySourcesDirectory, includingPropertiesForKeys: nil))
+
+        var violations: [String] = []
+        for case let fileLocation as URL in fileEnumerator where fileLocation.pathExtension == "swift" {
+            let fileContents = try String(contentsOf: fileLocation, encoding: .utf8)
+            for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                // Comment lines may name the forbidden spelling to explain it.
+                guard !trimmedLine.hasPrefix("//") else { continue }
+                for forbiddenConversion in forbiddenConversions where trimmedLine.contains(forbiddenConversion) {
+                    violations.append("\(fileLocation.lastPathComponent):\(lineOffset + 1): \(trimmedLine)")
+                }
+            }
+        }
+
+        #expect(violations.isEmpty, "word-size-dependent conversions found — compare against the unsigned bound directly (heterogeneous comparison) instead:\n\(violations.sorted().joined(separator: "\n"))")
+    }
 }

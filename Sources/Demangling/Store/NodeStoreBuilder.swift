@@ -262,7 +262,15 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func appendNode(_ compact: CompactNode) -> UInt32 {
-        precondition(nodes.count < Int(UInt32.max), "NodeStore node buffer exceeded UInt32 index space")
+        // Heterogeneous comparison, deliberately: spelled `Int(UInt32.max)`,
+        // this guard overflowed at constant-folding time wherever `Int` is
+        // 32 bits (watchOS arm64_32/armv7k) and the compiler reduced this
+        // whole function body to an unconditional trap — with the build
+        // staying green. `Int` vs `UInt32` compares mathematically on every
+        // word size; on 32-bit it is vacuously true, which is correct, since
+        // a count bounded by `Int.max` cannot exceed the UInt32 index space
+        // there. Same for the edges/text guards below.
+        precondition(nodes.count < UInt32.max, "NodeStore node buffer exceeded UInt32 index space")
         let newIndex = UInt32(nodes.count)
         nodes.append(compact)
         return newIndex
@@ -354,7 +362,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         while true {
             let existing = manyChildrenSlots[slot]
             if existing == Self.emptySlot {
-                precondition(edges.count + childIndices.count <= Int(UInt32.max), "NodeStore edges buffer exceeded UInt32 index space")
+                precondition(edges.count + childIndices.count <= UInt32.max, "NodeStore edges buffer exceeded UInt32 index space")
                 let edgesOffset = UInt32(edges.count)
                 edges.append(contentsOf: childIndices)
                 let newIndex = appendNode(CompactNode(
@@ -419,7 +427,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         while true {
             let existing = textSlots[slot]
             if existing == Self.emptySlot {
-                precondition(textBytes.count + utf8Bytes.count <= Int(UInt32.max), "NodeStore text buffer exceeded UInt32 offset space")
+                precondition(textBytes.count + utf8Bytes.count <= UInt32.max, "NodeStore text buffer exceeded UInt32 offset space")
                 let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Bytes.count))
                 textBytes.append(contentsOf: utf8Bytes)
                 textSlots[slot] = UInt32(uniqueTexts.count)
