@@ -16,14 +16,20 @@ struct Remangler {
 
     /// Maximum mangling recursion depth.
     ///
-    /// The C++ `Remangler::MaxDepth` is 1024, calibrated for release-built
-    /// frames on an 8MB stack; unoptimized frames are an order of magnitude
-    /// fatter, and this engine measured overflow of an 8MB thread between
-    /// depth 565 and 605 (140 vs 150 levels of nested `Optional`, at four
-    /// depth units and roughly six real frames per level). 384 leaves ~30%
-    /// headroom below that floor — about 94 nesting levels, over twice the
-    /// deepest real-world symbol measured (41 levels).
-    static let maxDepth = 384
+    /// Upstream's `Remangler::MaxDepth`. Restored after a brief lowering to
+    /// 384 on the `feature/node-store` branch: that value came from an
+    /// unoptimized-build measurement (an 8MB thread overflowed between depth
+    /// 565 and 605, at four depth units and ~six real frames per nesting
+    /// level) plus a corpus scan that put the deepest real symbol at 41
+    /// levels. The corpus figure did not hold up — downstream consumers hit
+    /// the sibling printer limit on ordinary SwiftUI-class modules — so all
+    /// three engine limits went back to upstream's rather than keep a
+    /// calibration whose premise was disproved.
+    ///
+    /// Reachable at all only because `hashForNode` ↔ `entryForNode` is
+    /// iterative; while that recursion sat outside `mangle(_:depth:)`'s
+    /// counter it overflowed first. Upstream has the identical hole.
+    static let maxDepth = 1024
 
     /// Maximum number of words to track (matches C++ MaxNumWords = 26)
     private static let maxNumWords = 26

@@ -167,8 +167,13 @@ public final class Node: Sendable {
         self.payload = Self.mergedPayload(contents: contents, children: inlineChildren)
     }
 
-    /// A deep copy of this subtree: every node is rebuilt, nothing is shared
-    /// with the original.
+    /// A deep copy of this subtree: every node is rebuilt, so the copy shares
+    /// no instance with the original.
+    ///
+    /// "Every node" means every *unique* node, not every occurrence — see the
+    /// next paragraph. A caller that copies a tree in order to key
+    /// per-occurrence state by `ObjectIdentifier` will not get one instance
+    /// per position; that shape has to be built explicitly.
     ///
     /// Source-level sharing is preserved, not expanded: interning and
     /// substitution back-references make demangled trees DAGs, and a subtree

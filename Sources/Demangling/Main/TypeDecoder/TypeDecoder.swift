@@ -20,14 +20,20 @@ struct TypeDecoderEngine<Builder: TypeBuilder, SomeNode: DemanglingNode> {
 
     /// Maximum decode recursion depth.
     ///
-    /// The C++ `TypeDecoder::MaxDepth` is 1024, calibrated for release-built
-    /// frames on an 8MB stack. This engine's unoptimized frames are enormous —
-    /// an 8MB thread overflowed between 120 and 130 levels of nested
-    /// `Optional`, roughly depth 250, or ~30KB of stack per depth unit — so
-    /// 1024 was pure decoration. 160 leaves ~35% headroom below the measured
-    /// floor, and still covers about 78 nesting levels, far past any real
-    /// type this engine is handed.
-    private static var maxDepth: Int { 160 }
+    /// Upstream's `TypeDecoder::MaxDepth`. Restored after a brief lowering to
+    /// 160 on the `feature/node-store` branch, which was the sharpest of the
+    /// three cuts (6.4×) and the only one no corpus test exercised — the
+    /// 4.5M-symbol oracle never invokes this engine. Its premise (that real
+    /// input stays far below the limit) was disproved for the sibling printer
+    /// by downstream `<<too complex>>` reports, so it was not left standing
+    /// here either.
+    ///
+    /// The debug-build stack concern behind the lowering is real: this
+    /// engine's unoptimized frames are ~30KB per depth unit, and an 8MB
+    /// thread overflowed around depth 250. That is a stack-safety problem to
+    /// solve as one (`Documentations/KnownIssues.md`), not by capping the
+    /// decoder below what real types need.
+    private static var maxDepth: Int { 1024 }
 
     init(builder: Builder) {
         self.builder = builder
@@ -647,7 +653,12 @@ extension TypeDecoderEngine {
                     typeChildIndex += 1
                 }
 
-                // Decode the element type
+                // Decode the element type. Two shapes leave nothing at
+                // `typeChildIndex`: an empty `.tupleElement`, and one holding
+                // only a `.tupleElementName` (the label consumed index 0).
+                guard typeChildIndex < element.children.count else {
+                    throw TypeLookupError(node: element, message: "tuple element has no type child")
+                }
                 try decodeTypeSequenceElement(
                     node: element.children[typeChildIndex],
                     depth: depth + 1
@@ -989,8 +1000,20 @@ extension TypeDecoderEngine {
         depth: Int,
         resultCallback: (BuiltType) throws(TypeLookupError) -> Void
     ) throws(TypeLookupError) {
+        // Every sibling decode entry carries this; this one was missed.
+        guard depth <= Self.maxDepth else {
+            throw TypeLookupError("Mangled type is too complex")
+        }
+
         var node = node
         if node.kind == .type {
+            // The same childless `.type` that `decodeMangledType` and
+            // `decodeMangledTypeDecl` reject — constructible from public API
+            // (`Node.createTransient`, `NodeStoreBuilder.intern(kind:)`) — so
+            // it has to throw here too rather than trap.
+            guard node.hasChildren else {
+                throw TypeLookupError(node: node, message: "no children")
+            }
             node = node.children[0]
         }
 

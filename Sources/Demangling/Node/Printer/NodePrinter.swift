@@ -20,15 +20,25 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// Bails the print recursion with `<<too complex>>` once a single
     /// root-to-leaf path would exceed this many ``printName`` frames.
     ///
-    /// The C++ ``NodePrinter`` uses 768, calibrated for release-built frames
-    /// on the 8MB stack every thread that demangles is given upstream. This
-    /// library is also built unoptimized, where one ``printName`` level was
-    /// measured at ~11.6KB of stack (725 levels survived an 8MB thread, 745
-    /// overflowed it) — at 768 the stack dies before the counter fires. 512
-    /// levels ≈ 5.9MB fits the ``StackSafeExecutor`` thread with headroom,
-    /// and the deepest real-world symbol measured (a SwiftUI `View.Body`
-    /// typealias) is 41 levels.
-    public static var maxPrintDepth: Int { 512 }
+    /// This is upstream's value, and it is upstream's for a reason: the limit
+    /// exists to stop pathological input, not to bound real symbols.
+    ///
+    /// It was briefly lowered to 512 on the `feature/node-store` branch,
+    /// reasoning from an unoptimized-build stack measurement (~11.6KB per
+    /// ``printName`` level; 725 levels survived an 8MB thread, 745 overflowed
+    /// it) and from a corpus scan that put the deepest real-world symbol at 41
+    /// levels. **That corpus figure was wrong.** Downstream consumers reported
+    /// `<<too complex>>` on ordinary SwiftUI and similarly generic-heavy
+    /// modules under the 512 limit — real symbols do exceed it, so the limit
+    /// was truncating correct output. Restored to 768.
+    ///
+    /// The debug-build stack risk the lowering was meant to address is real
+    /// and remains: at 768 levels an unoptimized build can exhaust an 8MB
+    /// thread before the counter fires. That is tracked as a stack-safety
+    /// issue (`Documentations/KnownIssues.md`), not paid for by silently
+    /// truncating output a release build renders fine. Do not lower this
+    /// again without corpus evidence gathered from downstream workloads.
+    public static var maxPrintDepth: Int { 768 }
 
     /// Bound for ``findSugar(_:depth:)``, the only print recursion that does
     /// not converge on ``printName(_:asPrefixContext:)``. Sugar wrappers are a
@@ -75,7 +85,16 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// this (so ``swift demangle`` itself hangs on the same input).
     private var printCache: [SomeNode.PrintCacheIdentity: Target] = [:]
 
-    public init(options: DemangleOptions = .default) {
+    /// Internal, matching ``printRoot(_:)``.
+    ///
+    /// This used to be `public` while `printRoot` was not, which made the type
+    /// constructible from outside the module and then useless — the instance
+    /// had no reachable way to run a walk. Printing is deliberately
+    /// static-only (see the type doc): every public entry routes through
+    /// `StackSafeExecutor`, so a tree's surviving depth never depends on the
+    /// calling thread's remaining stack. Keeping the initializer public would
+    /// only advertise an instance API that cannot be driven.
+    init(options: DemangleOptions = .default) {
         self.target = .init()
         self.specializationPrefixPrinted = false
         self.options = options
@@ -1535,19 +1554,28 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                 optionsOverrideDepth -= 1
             }
         }
-        // Children live at 0 and 1 — that is where `demangleExtendedExistentialShape`
-        // puts them, and where `createWithChildren` puts them in the C++
-        // demangler. The C++ printer reads 1 and 2, which prints the requirement
-        // signature in the type position and leaves the type itself null; this
-        // port deliberately diverges from it, because `<null node pointer>` is
-        // not usable output for a tool that displays symbols.
+        // Indices 1 and 2 are upstream's, and they are upstream's off-by-one:
+        // `demangleExtendedExistentialShape` builds the children at 0 and 1 —
+        // as does `createWithChildren` in the C++ demangler — so reading 1 and
+        // 2 prints the requirement signature in the type position and leaves
+        // the type itself `<null node pointer>`. Both the two-child and the
+        // one-child shape come out that way.
+        //
+        // **Do not "fix" this to read 0 and 1.** This port's contract is
+        // reproducing the Swift compiler's demangler, so matching
+        // `swift demangle` byte for byte outranks producing nicer output here;
+        // a consumer diffing against the toolchain must see what the toolchain
+        // sees. Reading 0 and 1 has been proposed in review and rejected —
+        // recorded under "adjudicated non-defects" in
+        // `Documentations/KnownIssues.md`. If upstream ever fixes its printer,
+        // follow it there rather than ahead of it.
         var genericSignature: SomeNode?
         var shapeType: SomeNode?
         if name.children.count == 2 {
-            genericSignature = name.children.at(0)
-            shapeType = name.children.at(1)
+            genericSignature = name.children.at(1)
+            shapeType = name.children.at(2)
         } else {
-            shapeType = name.children.at(0)
+            shapeType = name.children.at(1)
         }
         target.write("existential shape for ")
         if let genericSignature {

@@ -73,9 +73,16 @@ public final class NodeStore: Sendable {
     ///
     /// - Precondition: `nodeIndex` is within this store's bounds. A
     ///   `NodeIndex` is a bare offset with no record of which store minted it,
-    ///   so an index from a *different* store that happens to be in range
-    ///   resolves silently to whatever node lives there. Only the bound can be
-    ///   checked; keeping indices with their store is the caller's job.
+    ///   so only the bound can be checked here; keeping indices with their
+    ///   store is the caller's job.
+    ///
+    ///   Passing a foreign index is undefined behavior, not a checked error,
+    ///   and it has two shapes. If it lands in range it resolves to whatever
+    ///   node lives at that offset — silently wrong, but well-formed. It can
+    ///   also *trap*: the node it resolves to carries edge and text offsets
+    ///   minted against the other store, and those are not bounds-checked, so
+    ///   reading its children or text can index past this store's buffers.
+    ///   Do not write recovery code against the silent case alone.
     public func reference(at nodeIndex: NodeIndex) -> NodeReference {
         precondition(Int(nodeIndex.rawValue) < nodes.count, "NodeIndex out of range for this store")
         return NodeReference(store: self, nodeIndex: nodeIndex)
@@ -95,15 +102,7 @@ public final class NodeStore: Sendable {
 
     // MARK: - Materialization
 
-    /// Rebuilds a `Node` tree for the subtree rooted at the given raw index.
-    ///
-    /// The returned tree is freshly constructed and does not interact with the
-    /// global `NodeCache`. The store is hash-consed, so a subtree referenced
-    /// from multiple parents is a single index; the memo rebuilds each index
-    /// once and reuses the instance, preserving the store's DAG shape.
-    /// Expanding instead would multiply node count for symbols with heavy
-    /// substitution sharing and defeat the printer's per-instance memoization.
-    /// Child indices of the node at `rawIndex`, in order.
+    /// Child indices of the given node, in order.
     private func childIndices(of compact: CompactNode) -> [UInt32] {
         switch compact.payloadKind {
         case .none, .index, .text:
@@ -143,6 +142,13 @@ public final class NodeStore: Sendable {
     }
 
     /// Rebuilds a standalone `Node` tree for one store index.
+    ///
+    /// The returned tree is freshly constructed and does not interact with the
+    /// global `NodeCache`. The store is hash-consed, so a subtree referenced
+    /// from multiple parents is a single index; the memo rebuilds each index
+    /// once and reuses the instance, preserving the store's DAG shape.
+    /// Expanding instead would multiply node count for symbols with heavy
+    /// substitution sharing and defeat the printer's per-instance memoization.
     ///
     /// Walked with an explicit stack. This is reached from the remangling
     /// bridge and from rich printer targets, both of which hand the result

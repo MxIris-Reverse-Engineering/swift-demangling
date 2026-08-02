@@ -41,6 +41,46 @@ struct DefectRegressionTests {
         }
     }
 
+    /// The sibling site the guard above did not sweep to:
+    /// `decodeTypeSequenceElement` unwrapped `.type` with the same unchecked
+    /// `children[0]`, so the identical childless node still killed the process
+    /// when it arrived through a tuple element instead of a bound-generic
+    /// argument. Fixing one occurrence of a shape and not searching for the
+    /// rest is the failure this pins.
+    @Test func typeDecoderRejectsAChildlessTypeInsideATupleElement() {
+        let tuple = Node.createTransient(kind: .tuple, children: [
+            Node.createTransient(kind: .tupleElement, children: [Node.createTransient(kind: .type)]),
+        ])
+
+        let decoder = TypeDecoder(builder: StringTypeBuilder())
+        #expect(throws: TypeLookupError.self) {
+            _ = try decoder.decodeMangledType(node: tuple)
+        }
+    }
+
+    /// The tuple branch indexed `element.children[typeChildIndex]` with no
+    /// bound check, and two shapes overrun it: an empty `.tupleElement` (the
+    /// index stays at 0 with nothing there) and one holding only a
+    /// `.tupleElementName` (the label consumes index 0 and the index advances
+    /// past the end).
+    @Test func typeDecoderRejectsTupleElementsWithoutATypeChild() {
+        let emptyElement = Node.createTransient(kind: .tuple, children: [
+            Node.createTransient(kind: .tupleElement),
+        ])
+        let labelOnlyElement = Node.createTransient(kind: .tuple, children: [
+            Node.createTransient(kind: .tupleElement, children: [
+                Node.createTransient(kind: .tupleElementName, text: "label"),
+            ]),
+        ])
+
+        for malformedTuple in [emptyElement, labelOnlyElement] {
+            let decoder = TypeDecoder(builder: StringTypeBuilder())
+            #expect(throws: TypeLookupError.self) {
+                _ = try decoder.decodeMangledType(node: malformedTuple)
+            }
+        }
+    }
+
     // MARK: - Structural equality transitivity (#8)
 
     /// `NodeStoreBuilder.internText` deduplicates by raw UTF-8 bytes, so the
@@ -412,6 +452,49 @@ struct DefectRegressionTests {
         #expect(finished, "identifier's operator scan re-enumerated the DAG once per path instead of once per node")
     }
 
+    /// `first(of:)` and `contains(_:)` are short-circuit queries: they answer
+    /// "which one comes first" and "is there one at all", so how many times a
+    /// shared instance occurs cannot change the answer. Evolution 0006 deduped
+    /// `identifier` — whose stated justification was that a fruitless
+    /// `first(of:)` scan alone cost the path count — but left `first(of:)` and
+    /// `contains(_:)` themselves path-priced, so every other caller kept the
+    /// exposure. Measured before this fix on the doubling DAG below: 0.005s at
+    /// 10 levels, 1.15s at 18, 4.64s at 20, 18.2s at 22 — exactly ×4 per two
+    /// levels, with no bound.
+    ///
+    /// `all(of:)`, `filter(of:)` and the `preorder()` family stay path-based
+    /// on purpose: they enumerate the logical tree, where occurrence counts
+    /// are the correct answer (`KnownIssues.md` N6).
+    @Test func shortCircuitKindQueriesFinishOnADoublingDag() {
+        let sharedDag = Self.doublingGenericType(levels: 60)
+
+        let finished = Self.completesWithinTimeout {
+            // Nothing here is a `.functionType`, so neither query can
+            // short-circuit — the whole graph gets walked either way.
+            #expect(!sharedDag.contains(.functionType))
+            #expect(sharedDag.first(of: .functionType) == nil)
+            // Answers that do exist must stay the preorder-first ones.
+            #expect(sharedDag.first(of: .identifier)?.text == "G")
+            #expect(sharedDag.contains(.identifier))
+        }
+        #expect(finished, "a short-circuit kind query re-enumerated the DAG once per path instead of once per node")
+    }
+
+    /// The same queries over the store representation. They are one generic
+    /// implementation shared by both, so a fix that reached only `Node` would
+    /// leave `NodeReference` exposed.
+    @Test func shortCircuitKindQueriesFinishOnADoublingDagStore() {
+        let (store, rootIndex) = Self.doublingDagStore(levels: 60)
+        let rootReference = store.reference(at: rootIndex)
+
+        let finished = Self.completesWithinTimeout {
+            #expect(!rootReference.contains(.functionType))
+            #expect(rootReference.first(of: .functionType) == nil)
+            #expect(rootReference.contains(.identifier))
+        }
+        #expect(finished, "the store path re-enumerated the DAG once per path instead of once per node")
+    }
+
     // MARK: - Rich-target context on the store path (#14)
 
     /// `NodePrintContext.node` was `name as? Node`, which is always nil for a
@@ -530,9 +613,14 @@ struct DefectRegressionTests {
             demangleAsNode("$sSUss17FixedWidthIntegerRzrlEyxqd__cSzRd__lufCSu_SiTg5", internsSubtrees: false)
                 .first(of: .dependentGenericSignature)
         )
+        // The signature sits at index 1 because that is where the printer
+        // reads it from — upstream's off-by-one, kept deliberately (see
+        // `NodePrinterRobustnessTests.printsExtendedExistentialTypeShapeTheWayUpstreamDoes`).
+        // This test is about the option-override cache interaction, so all it
+        // needs is that the signature actually gets printed inside the shape.
         let extendedExistentialShape = Node.create(
             kind: .extendedExistentialTypeShape,
-            children: [genericSignature, integerType]
+            children: [integerType, genericSignature]
         )
 
         // Baselines, each printed in its own walk (fresh cache per walk).
@@ -615,9 +703,21 @@ struct DefectRegressionTests {
     /// heterogeneous comparison (`count <= UInt32.max`), which compares
     /// mathematically without converting either side — the same idiom as the
     /// standard library's `KeyPath` offset check and swift-syntax's
-    /// `AbsoluteSyntaxInfo`. This sweep keeps the whole conversion family out
-    /// of the library source; no host-side runtime test can catch it, because
-    /// the expression is well-behaved wherever the suite runs.
+    /// `AbsoluteSyntaxInfo`. No host-side runtime test can catch this, because
+    /// the expression is well-behaved wherever the suite runs — hence a source
+    /// scan.
+    ///
+    /// - Note: the scan matches **three literal spellings**, and that is its
+    ///   whole scope by design. It does not see `Int(someUInt32)`,
+    ///   `numericCast`, or a sum like `a.count + b.count <= UInt32.max`. Those
+    ///   are a different hazard: they convert a *runtime* value, so they trap
+    ///   only when the value actually exceeds the platform `Int` — a real but
+    ///   ordinarily unreachable condition (an index above `Int32.max` needs a
+    ///   store of over two billion nodes, and `NodeStore.NodeIndex.init` is
+    ///   not public, so one cannot be conjured). What this test exists for is
+    ///   the *constant* spelling, which is categorically worse: it is folded
+    ///   at compile time into an unconditional trap, with no diagnostic and no
+    ///   input required to reach it. Adjudicated as `KnownIssues.md` N5.
     @Test func librarySourceAvoidsWordSizeDependentIntegerConversions() throws {
         let librarySourcesDirectory = URL(fileURLWithPath: #filePath) // …/Tests/DemanglingTests/DefectRegressionTests.swift
             .deletingLastPathComponent() // …/Tests/DemanglingTests

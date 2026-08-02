@@ -9,6 +9,13 @@
 /// indices, which is exact because children are always interned before their
 /// parent (the same bottom-up scheme as `NodeCache.internTreeUnsafe`).
 ///
+/// "Structurally equal" here means equal **byte for byte** in any text a node
+/// carries — `internText` compares raw UTF-8, not canonical equivalence, so
+/// NFC and NFD spellings of one identifier are two entries. That is deliberate
+/// (it is what keeps `NodeReference`'s cross-representation equality
+/// transitive) and is the single place where an index compare is stricter than
+/// `Node.==`. See ``NodeReference`` for the full boundary.
+///
 /// That invariant is what makes `NodeReference.==` — a store-identity and
 /// index compare — **structural equality within one arena**, and therefore
 /// what makes `Set` / `Dictionary` of references deduplicate. Batch every tree

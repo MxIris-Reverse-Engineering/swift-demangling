@@ -193,21 +193,57 @@ let rewritten = rewriter.rewrite(originalTree)
 Implement `NodePrinterTarget` to direct output to custom destinations:
 
 ```swift
-struct AttributedStringTarget: NodePrinterTarget {
-    var count: Int { /* ... */ }
+struct HighlightedTarget: NodePrinterTarget {
+    /// Every printed fragment with the semantic state it came from.
+    private(set) var fragments: [(text: String, state: NodePrintState?)] = []
+    /// The type reference the current writes belong to (innermost wins).
+    private var typeReferenceScopes: [Node?] = []
 
-    init() { /* ... */ }
+    var count: Int { fragments.reduce(0) { $0 + $1.text.count } }
 
-    mutating func write(_ content: String) { /* ... */ }
+    init() {}
 
-    mutating func write(_ content: String, context: NodePrintContext?) {
-        // Use context.state (.printIdentifier, .printKeyword, .printType, etc.)
-        // and context.parentKind to apply syntax highlighting
+    mutating func write(_ content: String) {
+        fragments.append((content, nil))
+    }
+
+    // Note `@autoclosure`: the context is built lazily, so a target that
+    // ignores it never pays for it. This requirement has no default
+    // implementation — an eager `context: NodePrintContext?` parameter is a
+    // near-miss that fails to compile instead of silently doing nothing.
+    mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
+        // context()?.state is .printIdentifier, .printKeyword, .printType, …
+        // and context()?.parentKind gives the enclosing node kind.
+        fragments.append((content, context()?.state))
+    }
+
+    // Required so the printer can splice memoized fragments into the output
+    // without dropping the annotations they carry.
+    mutating func append(_ other: Self) {
+        fragments.append(contentsOf: other.fragments)
+    }
+
+    // Also defaultless, for the same near-miss reason as write(_:context:).
+    mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {
+        typeReferenceScopes.append(node())
+    }
+
+    mutating func popTypeReferenceScope() {
+        typeReferenceScopes.removeLast()
     }
 }
 
-let attributed = NodePrinter<AttributedStringTarget>.print(node, using: .default)
+let highlighted = NodePrinter<HighlightedTarget>.print(node, using: .default)
 ```
+
+Both rich-target hooks (`write(_:context:)` and `pushTypeReferenceScope(_:)`)
+take their payload as an `@autoclosure` and deliberately ship **without**
+default implementations: a forwarding default would silently absorb an
+implementation written against the older eager signature, leaving the printed
+text byte-identical while every annotation vanished. Spelling both methods out
+is required even for plain-text targets — `String`'s own conformance is the
+minimal shape to copy. `popTypeReferenceScope()` keeps its default, since a
+method with no arguments has no near-miss to absorb.
 
 ### Type Decoding
 

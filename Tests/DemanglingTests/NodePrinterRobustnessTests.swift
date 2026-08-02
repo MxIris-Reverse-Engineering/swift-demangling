@@ -80,27 +80,37 @@ struct NodePrinterRobustnessTests {
         #expect(suspendNode.print(using: .default).contains("suspend resume partial function for"))
     }
 
-    /// The shape printer read its children at indices 1 and 2 while the
-    /// demangler builds them at 0 and 1, so the requirement signature was
-    /// printed in the type position and the type itself came out as
-    /// `<null node pointer>`. The C++ printer has the same off-by-one; this
-    /// port deliberately diverges, because `<null node pointer>` is not usable
-    /// output for a tool that displays symbols.
-    @Test func printsExtendedExistentialTypeShapeFromItsActualChildren() throws {
+    /// `printExtendedExistentialTypeShape` reads its children at 1 and 2 while
+    /// the demangler builds them at 0 and 1, so the type position always comes
+    /// out as `<null node pointer>`. That off-by-one is upstream's, and this
+    /// port keeps it: reproducing `swift demangle` byte for byte outranks
+    /// producing nicer output, because a consumer diffing against the toolchain
+    /// must see what the toolchain sees.
+    ///
+    /// This test exists to make the divergence loud if anyone "fixes" the
+    /// indices to 0 and 1 — which has been proposed in review and rejected
+    /// (`Documentations/KnownIssues.md`, adjudicated non-defects). It pins
+    /// upstream's behavior, not desirable behavior.
+    @Test func printsExtendedExistentialTypeShapeTheWayUpstreamDoes() throws {
         let intType = try #require(demangleAsNode("$sSiD", internsSubtrees: false).first(of: .type))
 
+        // One child: the printer reads index 1, which does not exist.
         let shapeWithoutSignature = Node.create(kind: .extendedExistentialTypeShape, child: intType)
-        let printedWithoutSignature = shapeWithoutSignature.print(using: .default)
-        #expect(!printedWithoutSignature.contains("<null node pointer>"))
-        #expect(printedWithoutSignature == "existential shape for any Swift.Int")
+        #expect(
+            shapeWithoutSignature.print(using: .default) == "existential shape for any <null node pointer>",
+            "the one-child shape must match upstream's output, null pointer included"
+        )
 
+        // Two children: the printer reads 1 (the type, printed in the
+        // signature position) and 2 (absent).
         let genericSignature = try #require(
             demangleAsNode("$sSUss17FixedWidthIntegerRzrlEyxqd__cSzRd__lufCSu_SiTg5", internsSubtrees: false)
                 .first(of: .dependentGenericSignature)
         )
         let shapeWithSignature = Node.create(kind: .extendedExistentialTypeShape, children: [genericSignature, intType])
-        let printedWithSignature = shapeWithSignature.print(using: .default)
-        #expect(!printedWithSignature.contains("<null node pointer>"))
-        #expect(printedWithSignature.hasSuffix("Swift.Int"))
+        #expect(
+            shapeWithSignature.print(using: .default) == "existential shape for Swift.Int any <null node pointer>",
+            "the two-child shape must match upstream's output, null pointer included"
+        )
     }
 }

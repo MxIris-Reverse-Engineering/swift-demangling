@@ -124,7 +124,16 @@ store 自带索引级 intern，store 路径不经过全局 `NodeCache`；批量�
 
 ## Source Compatibility
 
-纯增量 API，无破坏性变更。`Node`、`NodeBuilder`、`NodeCache`、`demangleAsNode` 行为全部保持。Phase 2 的协议抽象对 `NodePrinter`/`Remangler` 是内部重构，公共签名不变。
+**提案原文的判断（已被实施推翻，保留以存档）**：纯增量 API，无破坏性变更；`Node`、`NodeBuilder`、`NodeCache`、`demangleAsNode` 行为全部保持；Phase 2 的协议抽象对 `NodePrinter`/`Remangler` 是内部重构，公共签名不变。
+
+**实际落地情况（2026-08-02 更正）**：store 相关 API 确实是纯增量的，但分支整体带了四处破坏性变更，均在 review 收尾轮引入并各自记录在 `0003-review-hardening.md`：
+
+1. `Node` 不再 `Codable`——序列化改用 mangled string（一个符号本身就是这棵树的序列化形式，更小、跨版本稳定、且保留共享结构）。
+2. `NodePrinter` 由 `struct` 改为 `enum`，`init(options:)` 与实例方法 `printRoot` 一并移除——打印统一为静态入口，以保证每次走查都经过 `StackSafeExecutor`，不让一棵树能存活的深度取决于调用线程的剩余栈。
+3. `NodePrinterTarget` 的 `write(_:context:)` 改为 `@autoclosure` 形参，且与 `pushTypeReferenceScope(_:)` 一并**去掉默认实现**——按旧签名写的实现不是合法 witness，有默认实现时会被静默顶替且无任何诊断。
+4. `Node.Rewriter.visit(_:)` 与 `Node.copy()` 由「每次出现一次」改为「每个唯一实例一次」（`0003` 记录了指数级重建的实测动机）。
+
+下游升级需要同步改动的是第 2、3 两条；第 1 条改用 `mangleAsString` 持久化；第 4 条只影响按出现次数计数或按位置变化的 `Rewriter` 子类。
 
 ## Performance Goals（验收标准）
 

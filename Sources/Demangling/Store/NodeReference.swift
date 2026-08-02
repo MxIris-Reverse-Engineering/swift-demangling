@@ -6,13 +6,24 @@
 ///
 /// `==` compares store identity and index, so it answers in O(1). That is not
 /// a weaker form of structural equality — **within one store it is exactly
-/// structural equality**, because a `NodeStoreBuilder` hash-conses on insert:
-/// two structurally identical trees interned into the same arena resolve to
-/// the same index, and `Set` / `Dictionary` deduplicate them (pinned by
+/// structural equality up to the spelling of text**, because a
+/// `NodeStoreBuilder` hash-conses on insert: two structurally identical trees
+/// interned into the same arena resolve to the same index, and `Set` /
+/// `Dictionary` deduplicate them (pinned by
 /// `NodeReferenceInterningConvenienceTests.hashedCollectionsDeduplicateWithinOneArena`:
 /// 100 copies of one symbol collapse to a one-element `Set`). Since bulk
 /// indexing — the case this type exists for — puts every tree in one arena,
 /// that is the case that matters.
+///
+/// The "up to the spelling of text" qualifier is the one exception, and it is
+/// deliberate: text is interned by **exact UTF-8 bytes**, so two identifiers
+/// that are Unicode-canonically equal but differently spelled (NFC `caf\u{e9}`
+/// vs NFD `cafe\u{301}`) receive two indices in one arena — `Set<NodeReference>`
+/// keeps both where `Set<Node>` collapses them, since `Node.contents` compares
+/// through `String`. Byte exactness is what keeps the cross-representation
+/// bridge transitive; see ``structurallyEquals(_:)-(Node)`` for the reasoning.
+/// Reaching this requires the same identifier to appear in two spellings
+/// within one process, which demangled input does not produce on its own.
 ///
 /// Across *different* stores `==` is false even for identical trees, and this
 /// is deliberate: making it structural would turn a pointer-and-integer
@@ -27,8 +38,8 @@
 /// So: same arena → use `==` freely; mixed arenas → use the structural pair.
 /// A `Set` that fails to deduplicate is the signature of one arena per
 /// element, which ``init(interning:)`` produces by design — see its note.
-/// Rationale and measurements: `Documentations/NodeStoreArena.md` (§「为什么
-/// 不能直接用固有的 `Hashable`」).
+/// Rationale and measurements: `Documentations/NodeStoreArena.md`, in the
+/// section on cross-representation equality and hashing.
 public struct NodeReference: Sendable {
     public let store: NodeStore
     public let nodeIndex: NodeStore.NodeIndex
