@@ -14,8 +14,22 @@ struct Remangler {
     /// Capacity of inline substitution array (avoids heap allocation for common case)
     private static let inlineSubstCapacity = 16
 
-    /// Maximum recursion depth to prevent stack overflow
-    private static let maxDepth = 1024
+    /// Maximum mangling recursion depth.
+    ///
+    /// Upstream's `Remangler::MaxDepth`. Restored after a brief lowering to
+    /// 384 on the `feature/node-store` branch: that value came from an
+    /// unoptimized-build measurement (an 8MB thread overflowed between depth
+    /// 565 and 605, at four depth units and ~six real frames per nesting
+    /// level) plus a corpus scan that put the deepest real symbol at 41
+    /// levels. The corpus figure did not hold up — downstream consumers hit
+    /// the sibling printer limit on ordinary SwiftUI-class modules — so all
+    /// three engine limits went back to upstream's rather than keep a
+    /// calibration whose premise was disproved.
+    ///
+    /// Reachable at all only because `hashForNode` ↔ `entryForNode` is
+    /// iterative; while that recursion sat outside `mangle(_:depth:)`'s
+    /// counter it overflowed first. Upstream has the identical hole.
+    static let maxDepth = 1024
 
     /// Maximum number of words to track (matches C++ MaxNumWords = 26)
     private static let maxNumWords = 26
@@ -94,12 +108,14 @@ struct Remangler {
 
     // MARK: - Hash Computation
 
-    /// Compute hash for a node, with caching to avoid expensive recursion
-    private mutating func hashForNode(_ node: Node, treatAsIdentifier: Bool = false) -> Int {
+    /// Hash contribution of a node's own kind and payload, before any child is
+    /// folded in.
+    private func seedHash(of node: Node, treatAsIdentifier: Bool) -> Int {
         var hash = 0
 
         if treatAsIdentifier {
-            // Treat as identifier regardless of actual kind
+            // Treat as identifier regardless of actual kind. This branch never
+            // descends into children, so it needs no explicit stack.
             hash = combineHash(hash, Node.Kind.identifier.hashValue)
 
             if let text = node.text {
@@ -114,27 +130,95 @@ struct Remangler {
                     }
                 }
             }
-        } else {
-            // Use actual node kind
-            hash = combineHash(hash, node.kind.hashValue)
-
-            // Combine index or text
-            if let index = node.index {
-                hash = combineHash(hash, Int(index))
-            } else if let text = node.text {
-                for char in text {
-                    hash = combineHash(hash, char.hashValue)
-                }
-            }
-
-            // Recursively hash children
-            for child in node.children {
-                let childEntry = entryForNode(child, treatAsIdentifier: treatAsIdentifier)
-                hash = combineHash(hash, childEntry.storedHash)
-            }
+            return hash
         }
 
+        // Use actual node kind
+        hash = combineHash(hash, node.kind.hashValue)
+
+        // Combine index or text
+        if let index = node.index {
+            hash = combineHash(hash, Int(index))
+        } else if let text = node.text {
+            for char in text {
+                hash = combineHash(hash, char.hashValue)
+            }
+        }
         return hash
+    }
+
+    /// One suspended level of ``hashForNode(_:treatAsIdentifier:)``'s walk.
+    private struct HashFrame {
+        let node: Node
+        var nextChildIndex: Int
+        var accumulatedHash: Int
+    }
+
+    /// Compute the substitution hash for a node.
+    ///
+    /// Walks the subtree with an explicit stack rather than by recursion. The
+    /// C++ original (`RemanglerBase::hashForNode`, `Remangler.cpp:80`) recurses
+    /// mutually with `entryForNode` and relies on the caller having arranged a
+    /// large stack; here the walk is a whole-subtree traversal that does not
+    /// pass through ``mangle(_:depth:)``, so it would sit entirely outside that
+    /// method's stack guard and overflow before the guard ever ran. Folding it
+    /// iteratively removes the exposure instead of trying to probe it.
+    ///
+    /// Children that already have a cache entry are folded in without being
+    /// walked again, and each completed subtree is written back into the cache,
+    /// so the amortized cost matches the recursive version.
+    private mutating func hashForNode(_ node: Node, treatAsIdentifier: Bool = false) -> Int {
+        // The identifier treatment ignores children entirely.
+        if treatAsIdentifier {
+            return seedHash(of: node, treatAsIdentifier: true)
+        }
+
+        var frames: [HashFrame] = [
+            HashFrame(node: node, nextChildIndex: 0, accumulatedHash: seedHash(of: node, treatAsIdentifier: false)),
+        ]
+        var pendingChildHash: Int?
+
+        while var frame = frames.popLast() {
+            if let childHash = pendingChildHash {
+                frame.accumulatedHash = combineHash(frame.accumulatedHash, childHash)
+                pendingChildHash = nil
+            }
+
+            if frame.nextChildIndex < frame.node.children.count {
+                let child = frame.node.children[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                frames.append(frame)
+
+                let slot = cacheSlot(for: child, treatAsIdentifier: false)
+                if let cachedEntry = slot.cachedEntry {
+                    pendingChildHash = cachedEntry.storedHash
+                } else {
+                    frames.append(
+                        HashFrame(node: child, nextChildIndex: 0, accumulatedHash: seedHash(of: child, treatAsIdentifier: false))
+                    )
+                }
+                continue
+            }
+
+            // This subtree is complete.
+            if frames.isEmpty {
+                return frame.accumulatedHash
+            }
+            // Mirror `entryForNode`'s caching for every node reached through a
+            // parent, so repeated back-references stay O(1).
+            let slot = cacheSlot(for: frame.node, treatAsIdentifier: false)
+            if let freeSlotIndex = slot.freeSlotIndex {
+                hashHash[freeSlotIndex] = SubstitutionEntry(
+                    node: frame.node,
+                    storedHash: frame.accumulatedHash,
+                    treatAsIdentifier: false
+                )
+            }
+            pendingChildHash = frame.accumulatedHash
+        }
+
+        // Unreachable: the loop returns as soon as the root frame completes.
+        return seedHash(of: node, treatAsIdentifier: false)
     }
 
     /// Combine two hash values
@@ -169,8 +253,11 @@ struct Remangler {
     // MARK: - Substitution Entry Creation
 
     /// Create a SubstitutionEntry for a node, using the hash cache
-    private mutating func entryForNode(_ node: Node, treatAsIdentifier: Bool = false) -> SubstitutionEntry {
-        // Compute hash of node pointer + treatment flag for cache lookup
+    /// Result of probing the pointer-keyed hash cache for one node: either the
+    /// entry that is already stored, or the first free slot it may be written
+    /// to. Both are `nil` when every probed slot is taken by another node, in
+    /// which case the hash is computed without being cached.
+    private func cacheSlot(for node: Node, treatAsIdentifier: Bool) -> (cachedEntry: SubstitutionEntry?, freeSlotIndex: Int?) {
         let ident = treatAsIdentifier ? 4 : 0
         let nodeHash = nodePointerHash(node) &+ ident
 
@@ -180,21 +267,27 @@ struct Remangler {
 
             if let cachedEntry = hashHash[index] {
                 if cachedEntry.matches(node: node, treatAsIdentifier: treatAsIdentifier) {
-                    // Cache hit
-                    return cachedEntry
+                    return (cachedEntry, nil)
                 }
             } else {
-                // Cache miss - compute hash and store
-                let hash = hashForNode(node, treatAsIdentifier: treatAsIdentifier)
-                let entry = SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
-                hashHash[index] = entry
-                return entry
+                return (nil, index)
             }
         }
+        return (nil, nil)
+    }
 
-        // Hash table full at this location - compute without caching
+    private mutating func entryForNode(_ node: Node, treatAsIdentifier: Bool = false) -> SubstitutionEntry {
+        let slot = cacheSlot(for: node, treatAsIdentifier: treatAsIdentifier)
+        if let cachedEntry = slot.cachedEntry {
+            return cachedEntry
+        }
+
         let hash = hashForNode(node, treatAsIdentifier: treatAsIdentifier)
-        return SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
+        let entry = SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
+        if let freeSlotIndex = slot.freeSlotIndex {
+            hashHash[freeSlotIndex] = entry
+        }
+        return entry
     }
 
     /// Compute a hash from a node pointer (for cache indexing)
@@ -343,20 +436,42 @@ struct Remangler {
     // MARK: - Public API
 
     /// Remangle a node tree into a mangled string
+    ///
+    /// Every piece of walk state is reset, not just the buffer. `words`
+    /// stores offsets *into* the buffer, so clearing one but not the other
+    /// made the second use of a remangler index into an empty string and
+    /// trap; the substitution tables would have emitted back-references into
+    /// the previous tree's output.
     mutating func mangle(_ node: Node) throws(ManglingError) -> String {
         clearBuffer()
+        words.removeAll(keepingCapacity: true)
+        substWordsInIdent.removeAll(keepingCapacity: true)
+        hashHash = Array(repeating: nil, count: Self.hashHashCapacity)
+        inlineSubstitutions.removeAll(keepingCapacity: true)
+        overflowSubstitutions.removeAll(keepingCapacity: true)
+        substMerging = .init()
         try mangle(node, depth: 0)
         return buffer
     }
 
     // MARK: - Core Mangling
 
-    /// Main entry point for mangling a single node
-    private mutating func mangle(_ node: Node, depth: Int) throws(ManglingError) {
-        // Check recursion depth
+    /// Bails with ``ManglingError/tooComplex(_:)`` once the walk exceeds
+    /// ``maxDepth`` frames.
+    ///
+    /// Called from every recursion in this engine that is reachable without
+    /// passing back through ``mangle(_:depth:)`` — a call-graph audit found six
+    /// such cycles, which is why the C++ original's single check on `mangle`
+    /// was never enough.
+    private func checkDepthLimit(_ node: Node, depth: Int) throws(ManglingError) {
         if depth > Self.maxDepth {
             throw .tooComplex(node)
         }
+    }
+
+    /// Main entry point for mangling a single node
+    private mutating func mangle(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
 
         // Dispatch to specific handler based on node kind
         switch node.kind {
@@ -1408,6 +1523,7 @@ extension Remangler {
 
     /// Mangle generic arguments from a context chain
     private mutating func mangleGenericArgs(_ node: Node, separator: inout Character, depth: Int, fullSubstitutionMap: Bool = false) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         var fullSubst = fullSubstitutionMap
 
         switch node.kind {
@@ -2332,9 +2448,7 @@ extension Remangler {
 
     /// Mangle any nominal type (generic or not)
     private mutating func mangleAnyNominalType(_ node: Node, depth: Int) throws(ManglingError) {
-        if depth > Self.maxDepth {
-            throw .tooComplex(node)
-        }
+        try checkDepthLimit(node, depth: depth)
 
         // Check if this is a specialized type
         if isSpecialized(node) {
@@ -2537,6 +2651,7 @@ extension Remangler {
     }
 
     private mutating func mangleConcreteProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleType(node[_child: 0], depth: depth + 1)
         try mangle(node[_child: 1], depth: depth + 1)
         if node.numberOfChildren > 2 {
@@ -2553,6 +2668,7 @@ extension Remangler {
     }
 
     private mutating func mangleAnyProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         // Dispatch to specific conformance handler
         switch node.kind {
         case .concreteProtocolConformance:
@@ -2857,6 +2973,7 @@ extension Remangler {
     }
 
     private mutating func manglePackProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformanceList(node[_child: 0], depth: depth + 1)
         append("HX")
     }
@@ -4092,6 +4209,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceOpaque(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try mangleType(node[_child: 1], depth: depth + 1)
@@ -4482,6 +4600,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceRoot(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleType(node[_child: 0], depth: depth + 1)
 
         try manglePureProtocol(node[_child: 1], depth: depth + 1)
@@ -4491,6 +4610,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceInherited(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try manglePureProtocol(node[_child: 1], depth: depth + 1)
@@ -4500,6 +4620,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceAssociated(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try mangleDependentAssociatedConformance(node[_child: 1], depth: depth + 1)
@@ -5022,6 +5143,7 @@ extension Remangler {
     }
 
     private mutating func mangleAnyProtocolConformanceList(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         var firstElem = true
         for child in node.children {
             try mangleAnyProtocolConformance(child, depth: depth + 1)
@@ -5803,20 +5925,75 @@ extension Remangler {
         }
 
         /// Perform deep equality comparison of two nodes.
+        /// Structural equality over two subtrees.
+        ///
+        /// Walked with an explicit work list rather than by recursion: like
+        /// ``Remangler/hashForNode(_:treatAsIdentifier:)`` this is a
+        /// whole-subtree traversal reached from the substitution machinery, not
+        /// from `mangle(_:depth:)`, so recursion here would sit outside every
+        /// stack guard the remangler has. Visit order differs from the
+        /// recursive version; the result does not, because every pair must
+        /// match for the answer to be `true`.
+        ///
+        /// Long walks additionally memoize visited pairs, exactly like
+        /// `Node.==`: comparing two separately built copies of a shared DAG
+        /// costs their node counts rather than their path counts. Without the
+        /// memo this was the one pairwise walk of four that re-descended once
+        /// per path, and a signature holding two instance-distinct copies of a
+        /// shared bound-generic subtree made mangling exponential in the
+        /// sharing depth. The memo is created lazily because the overwhelmingly
+        /// common comparisons — substitution probes against demangler-shaped
+        /// trees — finish long before the threshold and must not allocate.
         private static func deepEquals(_ lhs: Node, _ rhs: Node) -> Bool {
-            // Nodes must be similar (same kind, same text/index)
-            guard lhs.isSimilar(to: rhs) else {
-                return false
-            }
+            // `SubstitutionEntry.==` calls this on every hash match, so the
+            // shallow cases must not allocate.
+            if lhs === rhs { return true }
+            guard lhs.isSimilar(to: rhs) else { return false }
+            let rootLeftChildren = lhs.children
+            let rootRightChildren = rhs.children
+            guard rootLeftChildren.count == rootRightChildren.count else { return false }
+            if rootLeftChildren.isEmpty { return true }
 
-            // Check all children recursively
-            guard lhs.children.count == rhs.children.count else {
-                return false
+            struct VisitedPair: Hashable {
+                let leftIdentity: ObjectIdentifier
+                let rightIdentity: ObjectIdentifier
             }
+            /// Walk length at which the pair memo switches on: real
+            /// substitution probes finish long before this, while a
+            /// path-exploding DAG blows past it immediately.
+            let visitedPairTrackingThreshold = 256
+            var visitedPairs: Set<VisitedPair>?
+            var processedPairCount = 0
 
-            for (lhsChild, rhsChild) in zip(lhs.children, rhs.children) {
-                if !deepEquals(lhsChild, rhsChild) {
+            var pendingPairs: [(left: Node, right: Node)] = Array(zip(rootLeftChildren, rootRightChildren).map { ($0, $1) })
+
+            while let pair = pendingPairs.popLast() {
+                if pair.left === pair.right { continue }
+
+                processedPairCount += 1
+                if processedPairCount > visitedPairTrackingThreshold, visitedPairs == nil {
+                    visitedPairs = []
+                }
+                if visitedPairs != nil {
+                    let visitedPair = VisitedPair(
+                        leftIdentity: ObjectIdentifier(pair.left),
+                        rightIdentity: ObjectIdentifier(pair.right)
+                    )
+                    // A repeated pair repeats the identical subtree comparison,
+                    // and any mismatch below it already aborted the whole walk
+                    // the first time.
+                    guard visitedPairs!.insert(visitedPair).inserted else { continue }
+                }
+
+                // Nodes must be similar (same kind, same text/index)
+                guard pair.left.isSimilar(to: pair.right) else {
                     return false
+                }
+                guard pair.left.children.count == pair.right.children.count else {
+                    return false
+                }
+                for (leftChild, rightChild) in zip(pair.left.children, pair.right.children) {
+                    pendingPairs.append((leftChild, rightChild))
                 }
             }
 
@@ -5881,150 +6058,212 @@ extension Node {
     }
 }
 
+/// Strips the generic arguments off a nominal/context chain.
+///
+/// Unlike ``isSpecialized(_:)`` this rebuilds nodes as it unwinds, so it cannot
+/// be a plain loop; it carries its own stack of pending reconstructions
+/// instead. Written recursively it was reached from `mangleAnyNominalType`
+/// without passing back through `mangle(_:depth:)`, which put it outside every
+/// guard the remangler had — and adding a stack probe made things worse rather
+/// than better, because the resulting `nil` was indistinguishable from "this
+/// node cannot be unspecialized". Callers turn that `nil` into
+/// `.invalidNodeStructure`, so a depth problem was reported as a malformed
+/// tree and `.tooComplex` was unreachable on this path. With no recursion there
+/// is no depth to run out of, and `nil` means exactly one thing again.
 func getUnspecialized(_ node: Node) -> Node? {
-    var numToCopy = 2
+    /// A node whose unspecialized form can only be built once its parent
+    /// context has been unspecialized.
+    enum PendingRebuild {
+        case context(node: Node, childrenToCopy: Int)
+        case extensionNode(Node)
+    }
 
-    switch node.kind {
-    case .function,
-         .getter,
-         .setter,
-         .willSet,
-         .didSet,
-         .readAccessor,
-         .modifyAccessor,
-         .unsafeAddressor,
-         .unsafeMutableAddressor,
-         .allocator,
-         .constructor,
-         .destructor,
-         .variable,
-         .subscript,
-         .explicitClosure,
-         .implicitClosure,
-         .initializer,
-         .propertyWrapperBackingInitializer,
-         .propertyWrapperInitFromProjectedValue,
-         .defaultArgumentInitializer,
-         .static:
-        numToCopy = node.children.count
-        fallthrough
-
-    case .structure,
-         .enum,
-         .class,
-         .typeAlias,
-         .otherNominalType:
-        guard node.children.count > 0 else { return nil }
-
-        var resultChildren: [Node] = []
-        var parentOrModule = node.children[0]
-        if isSpecialized(parentOrModule) {
-            guard let unspec = getUnspecialized(parentOrModule) else { return nil }
-            parentOrModule = unspec
-        }
-        resultChildren.append(parentOrModule)
-        for idx in 1 ..< numToCopy {
-            if idx < node.children.count {
-                resultChildren.append(node.children[idx])
-            }
-        }
-        return Node(kind: node.kind, children: resultChildren)
-
-    case .boundGenericStructure,
-         .boundGenericEnum,
-         .boundGenericClass,
-         .boundGenericProtocol,
-         .boundGenericOtherNominalType,
-         .boundGenericTypeAlias:
-        guard node.children.count > 0 else { return nil }
-        let unboundType = node.children[0]
-        guard unboundType.kind == .type, unboundType.children.count > 0 else { return nil }
-        let nominalType = unboundType.children[0]
-        if isSpecialized(nominalType) {
-            return getUnspecialized(nominalType)
-        }
-        return nominalType
-
-    case .constrainedExistential:
-        guard node.children.count > 0 else { return nil }
-        let unboundType = node.children[0]
-        guard unboundType.kind == .type else { return nil }
-        return unboundType
-
-    case .boundGenericFunction:
-        guard node.children.count > 0 else { return nil }
-        let unboundFunction = node.children[0]
-        guard unboundFunction.kind == .function || unboundFunction.kind == .constructor else {
+    /// How many of a context node's children survive unspecialization, or
+    /// `nil` if this kind is not a context chain at all.
+    func contextChildrenToCopy(_ contextNode: Node) -> Int? {
+        switch contextNode.kind {
+        case .function,
+             .getter,
+             .setter,
+             .willSet,
+             .didSet,
+             .readAccessor,
+             .modifyAccessor,
+             .unsafeAddressor,
+             .unsafeMutableAddressor,
+             .allocator,
+             .constructor,
+             .destructor,
+             .variable,
+             .subscript,
+             .explicitClosure,
+             .implicitClosure,
+             .initializer,
+             .propertyWrapperBackingInitializer,
+             .propertyWrapperInitFromProjectedValue,
+             .defaultArgumentInitializer,
+             .static:
+            return contextNode.children.count
+        case .structure,
+             .enum,
+             .class,
+             .typeAlias,
+             .otherNominalType:
+            return 2
+        default:
             return nil
         }
-        if isSpecialized(unboundFunction) {
-            return getUnspecialized(unboundFunction)
-        }
-        return unboundFunction
-
-    case .extension:
-        guard node.children.count >= 2 else { return nil }
-        let parent = node.children[1]
-        if !isSpecialized(parent) {
-            return node
-        }
-        guard let unspec = getUnspecialized(parent) else { return nil }
-        var resultChildren: [Node] = [node.children[0], unspec]
-        if node.children.count == 3 {
-            resultChildren.append(node.children[2])
-        }
-        return Node(kind: .extension, children: resultChildren)
-
-    default:
-        return nil
     }
+
+    func rebuiltContext(_ contextNode: Node, parentOrModule: Node, childrenToCopy: Int) -> Node {
+        var resultChildren: [Node] = [parentOrModule]
+        for childIndex in 1 ..< max(childrenToCopy, 1) where childIndex < contextNode.children.count {
+            resultChildren.append(contextNode.children[childIndex])
+        }
+        return Node(kind: contextNode.kind, children: resultChildren)
+    }
+
+    var pendingRebuilds: [PendingRebuild] = []
+    var currentNode = node
+    var unspecializedNode: Node
+
+    descend: while true {
+        if let childrenToCopy = contextChildrenToCopy(currentNode) {
+            guard let parentOrModule = currentNode.children.first else { return nil }
+            if isSpecialized(parentOrModule) {
+                pendingRebuilds.append(.context(node: currentNode, childrenToCopy: childrenToCopy))
+                currentNode = parentOrModule
+                continue descend
+            }
+            unspecializedNode = rebuiltContext(currentNode, parentOrModule: parentOrModule, childrenToCopy: childrenToCopy)
+            break descend
+        }
+
+        switch currentNode.kind {
+        case .boundGenericStructure,
+             .boundGenericEnum,
+             .boundGenericClass,
+             .boundGenericProtocol,
+             .boundGenericOtherNominalType,
+             .boundGenericTypeAlias:
+            guard let unboundType = currentNode.children.first,
+                  unboundType.kind == .type,
+                  let nominalType = unboundType.children.first
+            else {
+                return nil
+            }
+            if isSpecialized(nominalType) {
+                currentNode = nominalType
+                continue descend
+            }
+            unspecializedNode = nominalType
+            break descend
+
+        case .constrainedExistential:
+            guard let unboundType = currentNode.children.first, unboundType.kind == .type else { return nil }
+            unspecializedNode = unboundType
+            break descend
+
+        case .boundGenericFunction:
+            guard let unboundFunction = currentNode.children.first,
+                  unboundFunction.kind == .function || unboundFunction.kind == .constructor
+            else {
+                return nil
+            }
+            if isSpecialized(unboundFunction) {
+                currentNode = unboundFunction
+                continue descend
+            }
+            unspecializedNode = unboundFunction
+            break descend
+
+        case .extension:
+            guard currentNode.children.count >= 2 else { return nil }
+            let parent = currentNode.children[1]
+            if !isSpecialized(parent) {
+                unspecializedNode = currentNode
+                break descend
+            }
+            pendingRebuilds.append(.extensionNode(currentNode))
+            currentNode = parent
+            continue descend
+
+        default:
+            return nil
+        }
+    }
+
+    while let pendingRebuild = pendingRebuilds.popLast() {
+        switch pendingRebuild {
+        case .context(let contextNode, let childrenToCopy):
+            unspecializedNode = rebuiltContext(contextNode, parentOrModule: unspecializedNode, childrenToCopy: childrenToCopy)
+        case .extensionNode(let extensionNode):
+            var resultChildren: [Node] = [extensionNode.children[0], unspecializedNode]
+            if extensionNode.children.count == 3 {
+                resultChildren.append(extensionNode.children[2])
+            }
+            unspecializedNode = Node(kind: .extension, children: resultChildren)
+        }
+    }
+    return unspecializedNode
 }
 
+/// Whether `node` — or the context chain it hangs off — is a specialized
+/// generic.
+///
+/// The descent is linear (each step moves to one child), so it runs as a loop.
+/// Written recursively it would be one more whole-chain recursion outside
+/// ``Remangler``'s stack guard, for no benefit.
 func isSpecialized(_ node: Node) -> Bool {
-    switch node.kind {
-    case .boundGenericStructure,
-         .boundGenericEnum,
-         .boundGenericClass,
-         .boundGenericOtherNominalType,
-         .boundGenericTypeAlias,
-         .boundGenericProtocol,
-         .boundGenericFunction,
-         .constrainedExistential:
-        return true
+    var currentNode = node
+    while true {
+        switch currentNode.kind {
+        case .boundGenericStructure,
+             .boundGenericEnum,
+             .boundGenericClass,
+             .boundGenericOtherNominalType,
+             .boundGenericTypeAlias,
+             .boundGenericProtocol,
+             .boundGenericFunction,
+             .constrainedExistential:
+            return true
 
-    case .structure,
-         .enum,
-         .class,
-         .typeAlias,
-         .otherNominalType,
-         .protocol,
-         .function,
-         .allocator,
-         .constructor,
-         .destructor,
-         .variable,
-         .subscript,
-         .explicitClosure,
-         .implicitClosure,
-         .initializer,
-         .propertyWrapperBackingInitializer,
-         .propertyWrapperInitFromProjectedValue,
-         .defaultArgumentInitializer,
-         .getter,
-         .setter,
-         .willSet,
-         .didSet,
-         .readAccessor,
-         .modifyAccessor,
-         .unsafeAddressor,
-         .unsafeMutableAddressor,
-         .static:
-        return node.children.count > 0 && isSpecialized(node.children[0])
+        case .structure,
+             .enum,
+             .class,
+             .typeAlias,
+             .otherNominalType,
+             .protocol,
+             .function,
+             .allocator,
+             .constructor,
+             .destructor,
+             .variable,
+             .subscript,
+             .explicitClosure,
+             .implicitClosure,
+             .initializer,
+             .propertyWrapperBackingInitializer,
+             .propertyWrapperInitFromProjectedValue,
+             .defaultArgumentInitializer,
+             .getter,
+             .setter,
+             .willSet,
+             .didSet,
+             .readAccessor,
+             .modifyAccessor,
+             .unsafeAddressor,
+             .unsafeMutableAddressor,
+             .static:
+            guard currentNode.children.count > 0 else { return false }
+            currentNode = currentNode.children[0]
 
-    case .extension:
-        return node.children.count > 1 && isSpecialized(node.children[1])
+        case .extension:
+            guard currentNode.children.count > 1 else { return false }
+            currentNode = currentNode.children[1]
 
-    default:
-        return false
+        default:
+            return false
+        }
     }
 }

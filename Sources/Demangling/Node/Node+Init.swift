@@ -65,6 +65,40 @@ extension Node {
     }
 }
 
+// MARK: - Transient Factory Methods (no interning)
+
+/// Transient counterparts of `Node.create(...)` that never touch
+/// `NodeCache.shared`: leaves are freshly allocated instead of interned, so
+/// nothing gets pinned in global state for the process lifetime.
+///
+/// Exported via `@_spi(Internals)` for consumers whose whole pipeline runs
+/// off the global cache (transient demangling feeding a `NodeStoreBuilder`,
+/// symbolic-reference resolvers building splice nodes, and similar). The
+/// returned nodes are NOT canonical: structurally equal nodes are distinct
+/// instances, so `===`-based sharing assumptions do not apply.
+@_spi(Internals)
+extension Node {
+    public static func createTransient(kind: Kind, contents: Contents = .none, children: [Node] = []) -> Node {
+        Node(kind: kind, contents: contents, children: children)
+    }
+
+    public static func createTransient(kind: Kind, contents: Contents = .none, inlineChildren: Children) -> Node {
+        Node(kind: kind, contents: contents, inlineChildren: inlineChildren)
+    }
+
+    public static func createTransient(kind: Kind, child: Node) -> Node {
+        Node(kind: kind, contents: .none, children: [child])
+    }
+
+    public static func createTransient(kind: Kind, text: String, children: [Node] = []) -> Node {
+        Node(kind: kind, contents: .text(text), children: children)
+    }
+
+    public static func createTransient(kind: Kind, index: UInt64, children: [Node] = []) -> Node {
+        Node(kind: kind, contents: .index(index), children: children)
+    }
+}
+
 extension Node {
     @inlinable
     public static func create(kind: Kind, contents: Contents = .none, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) -> Node {

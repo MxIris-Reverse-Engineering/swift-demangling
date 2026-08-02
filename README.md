@@ -12,6 +12,7 @@ This project is derived from [CwlDemangle](https://github.com/mattgallagher/CwlD
 - **Decode types** from mangled nodes via a pluggable `TypeBuilder` protocol
 - **Traverse & rewrite** trees with built-in iterators and `Node.Rewriter`
 - **Node interning (hash-consing)** via `NodeCache` — structurally equal subtrees share one instance, reducing memory ~4x for whole-binary demangling
+- **Compact bulk storage** via `NodeStore` — an arena packing each node into 12 flat bytes with no object header, reference counting, or per-node allocation; printing and type decoding read straight from it without materializing a `Node` tree
 - Supports all mangling prefixes: `_T0`, `_$S`, `_$s`, `$S`, `$s`, `$e`, `_$e`, `@__swiftmacro_`
 - Swift 6 strict concurrency — all public types are `Sendable`
 
@@ -192,22 +193,57 @@ let rewritten = rewriter.rewrite(originalTree)
 Implement `NodePrinterTarget` to direct output to custom destinations:
 
 ```swift
-struct AttributedStringTarget: NodePrinterTarget {
-    var count: Int { /* ... */ }
+struct HighlightedTarget: NodePrinterTarget {
+    /// Every printed fragment with the semantic state it came from.
+    private(set) var fragments: [(text: String, state: NodePrintState?)] = []
+    /// The type reference the current writes belong to (innermost wins).
+    private var typeReferenceScopes: [Node?] = []
 
-    init() { /* ... */ }
+    var count: Int { fragments.reduce(0) { $0 + $1.text.count } }
 
-    mutating func write(_ content: String) { /* ... */ }
+    init() {}
 
-    mutating func write(_ content: String, context: NodePrintContext?) {
-        // Use context.state (.printIdentifier, .printKeyword, .printType, etc.)
-        // and context.parentKind to apply syntax highlighting
+    mutating func write(_ content: String) {
+        fragments.append((content, nil))
+    }
+
+    // Note `@autoclosure`: the context is built lazily, so a target that
+    // ignores it never pays for it. This requirement has no default
+    // implementation — an eager `context: NodePrintContext?` parameter is a
+    // near-miss that fails to compile instead of silently doing nothing.
+    mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
+        // context()?.state is .printIdentifier, .printKeyword, .printType, …
+        // and context()?.parentKind gives the enclosing node kind.
+        fragments.append((content, context()?.state))
+    }
+
+    // Required so the printer can splice memoized fragments into the output
+    // without dropping the annotations they carry.
+    mutating func append(_ other: Self) {
+        fragments.append(contentsOf: other.fragments)
+    }
+
+    // Also defaultless, for the same near-miss reason as write(_:context:).
+    mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {
+        typeReferenceScopes.append(node())
+    }
+
+    mutating func popTypeReferenceScope() {
+        typeReferenceScopes.removeLast()
     }
 }
 
-var printer = NodePrinter<AttributedStringTarget>(options: .default)
-let attributed = printer.printRoot(node)
+let highlighted = NodePrinter<HighlightedTarget>.print(node, using: .default)
 ```
+
+Both rich-target hooks (`write(_:context:)` and `pushTypeReferenceScope(_:)`)
+take their payload as an `@autoclosure` and deliberately ship **without**
+default implementations: a forwarding default would silently absorb an
+implementation written against the older eager signature, leaving the printed
+text byte-identical while every annotation vanished. Spelling both methods out
+is required even for plain-text targets — `String`'s own conformance is the
+minimal shape to copy. `popTypeReferenceScope()` keeps its default, since a
+method with no arguments has no near-miss to absorb.
 
 ### Type Decoding
 
@@ -239,6 +275,61 @@ For one-off demangling where the cache should not grow, opt out per call:
 ```swift
 let node = try demangleAsNode(symbol, internsSubtrees: false)
 ```
+
+### Deep Generic Nesting and Thread Stacks
+
+Recursion in the printer, remangler, and type decoder is bounded by fixed depth limits, the same model the Swift compiler uses — but calibrated so they actually fire before the stack dies in **unoptimized builds** (upstream's constants assume release-built frames and an 8MB stack). Every limit clears the deepest real-world symbol measured by 2× or more; a pathologically deep tree degrades to `<<too complex>>` (or a `.tooComplex` / type-lookup error) instead of crashing the process, identically in debug and release.
+
+On Darwin every thread except the main one gets a 512KB stack, which only covers a few dozen levels of nesting. When the calling thread runs low, printing, remangling and demangling hop onto a pooled 8MB-stack worker; threads with room to spare (the main thread, or big threads you create yourself) run inline with zero overhead — which also keeps `po node` usable under LLDB. When you are about to make many calls from small-stack threads, wrap the batch so it pays for at most one hop:
+
+```swift
+// At most one thread hop for the whole batch; every call inside runs inline.
+let results = StackSafeExecutor.withLargeStack {
+    symbols.map { try? demangleAsNode($0) }
+}
+```
+
+`withLargeStack` requires `@_spi(Internals) import Demangling`. If you drive the demangler from threads you create yourself, setting `stackSize` to 8MB or more has the same effect — the library detects the headroom and never hops.
+
+`TypeDecoder` is the deliberate exception: its `TypeBuilder` callbacks are your code and may be tied to an actor or a thread, so decoding always runs on the calling thread. Wrap deep batches in `withLargeStack` yourself.
+
+### Bulk Demangling with NodeStore
+
+When demangling a whole binary and keeping every result, `NodeStore` stores nodes in a flat arena instead of as individual class instances: 12 bytes per node, no object header, no reference counting, no per-node allocation. Build with `NodeStoreBuilder`, then `freeze()` into an immutable, `Sendable` store:
+
+```swift
+var builder = NodeStoreBuilder()
+var rootIndices: [NodeStore.NodeIndex] = []
+for symbol in symbols {
+    rootIndices.append(try builder.demangle(symbol))
+}
+let store = builder.freeze()
+```
+
+Nodes are addressed by `NodeReference`, a 16-byte value handle that mirrors `Node`'s accessors. Printing and type decoding read directly from the arena — no `Node` tree is materialized:
+
+```swift
+let reference = store.reference(at: rootIndices[0])
+let readable = reference.print(using: .default)
+
+for child in reference.children where child.kind == .identifier {
+    // `textUTF8` borrows the store's string table without allocating
+    print(child.text ?? "")
+}
+```
+
+The builder hash-conses on insert, so structurally equal subtrees collapse to one index and `NodeReference` equality is O(1) within a store. This path never touches `NodeCache.shared`, so bulk indexing leaves global state untouched.
+
+Interop with the `Node` API stays available in both directions — `builder.intern(existingNode)` imports a tree, and `reference.materialize()` rebuilds a standalone one:
+
+```swift
+var builder = NodeStoreBuilder()
+let index = builder.intern(try demangleAsNode(symbol))
+let store = builder.freeze()          // `freeze()` consumes the builder
+let node = store.reference(at: index).materialize()
+```
+
+Measured on a SwiftUI dyld-cache corpus of 234,232 symbols: 619,688 unique nodes in 8.75 MB of flat storage (14.1 bytes per unique node), built no slower than the `Node` path.
 
 ## Acknowledgments
 

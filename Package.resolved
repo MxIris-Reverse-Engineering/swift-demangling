@@ -1,13 +1,13 @@
 {
-  "originHash" : "1387fc079575fc5cb4e583ee7ee5da8f3a0ac9abf2865c3f4d9ffeb433cba663",
+  "originHash" : "2b7933d111d9c9ef19df8b8fb10f1e9f3ef2d6260ae4c19e8078ea84dbd76f2b",
   "pins" : [
     {
       "identity" : "frameworktoolbox",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/Mx-Iris/FrameworkToolbox",
       "state" : {
-        "revision" : "b82281eb8a6ffcb312941c3d06584182837f4ca9",
-        "version" : "0.7.1"
+        "revision" : "4abda76aaaa00ff5f9da86d8c4ed62bc6cfbcbac",
+        "version" : "0.8.0"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-asn1.git",
       "state" : {
-        "revision" : "eb50cbd14606a9161cbc5d452f18797c90ef0bab",
-        "version" : "1.7.0"
+        "revision" : "a9a5efd40eaf558a2bcd48d64b1d1646be686008",
+        "version" : "1.7.1"
       }
     },
     {
@@ -51,8 +51,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/p-x9/swift-fileio.git",
       "state" : {
-        "revision" : "d589ff3966f9f064574780f527449a946736b989",
-        "version" : "0.13.0"
+        "revision" : "e581ae04d4079c675042fa62aeabc5ba7480d3df",
+        "version" : "0.14.0"
       }
     },
     {
@@ -69,8 +69,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/swiftlang/swift-syntax.git",
       "state" : {
-        "revision" : "f99ae8aa18f0cf0d53481901f88a0991dc3bd4a2",
-        "version" : "601.0.1"
+        "revision" : "79e4b74a295b6eb74a8b585e3a39d29e70c1dbd1",
+        "version" : "603.0.2"
       }
     }
   ],

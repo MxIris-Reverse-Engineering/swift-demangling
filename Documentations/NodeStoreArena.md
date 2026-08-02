@@ -1,0 +1,140 @@
+# NodeStore：Arena 式紧凑节点存储
+
+日期：2026-07-27
+
+对应提案：`evolution/0001-node-store-arena.md`（Phase 1–3 已落地）
+前置优化：`Documentations/SubtreeInterning.md`（全子树 hash-consing）
+
+## 动机
+
+`SubtreeInterning.md` 结尾把「Arena + 索引式存储」列为被推迟的方向，本次即是它的兑现。
+
+全子树 hash-consing 把 49k 符号语料的解析驻留从 39.5 MB 压到 12.9 MB，但剩下的开销已经无法在 class 形态下继续消除：
+
+- `Node` 是 `final class`，每实例 48 字节 —— 其中 16 字节是对象头，41 字节的实际内容还要向上取整到 48 字节的 malloc 桶；
+- 每个节点一次独立 malloc，每次传递一次引用计数增减；
+- 孩子引用是 8 字节指针。
+
+对照 C++ `Demangle::Node`：24 字节/节点 + bump allocator。**差距全部来自 class 这个形态本身**，不是实现细节。
+
+把 `Node` 改成带 `[Node]` 的 struct 并不能解决：children 数组仍然是逐节点堆分配（32 字节缓冲头 + CoW 引用计数），再加上大 struct 的拷贝成本，内存和 CPU 双双倒退。struct 的价值在于**精确布局 + 可平铺进连续缓冲**，所以正确形态是 arena + 索引。
+
+同时，`Node` 是公共 API，下游（MachOSwiftSection、RuntimeViewer）大量依赖，不能就地重写。因此本方案是**并存**而非替换：新增一套存储层，老的 `Node` 路径行为一字不变。
+
+## 范围
+
+新增 `Sources/Demangling/Store/`：
+
+- `CompactNode.swift` — 12 字节平铺节点表示；
+- `NodeStore.swift` — 冻结后的不可变存储；
+- `NodeStoreBuilder.swift` — `~Copyable` 构建器，插入即 hash-consing；
+- `NodeReference.swift` — 16 字节值句柄 + `ChildrenView`；
+- `DemanglingNode.swift` — `Node` 与 `NodeReference` 共同遵循的只读树协议。
+
+改造既有代码：
+
+- `Node/Printer/NodePrinter.swift` — printer 引擎泛型化为 `DemanglingPrinter<Target, SomeNode>`；
+- `Main/TypeDecoder/TypeDecoder.swift` — 泛型化为 `TypeDecoderEngine<Builder, SomeNode>`；
+- `Main/Demangle/Demangler+NodeCreation.swift` — demangler 的节点构造 seam，支持绕开全局缓存。
+
+**公共 API 零破坏**：`Node`、`NodeBuilder`、`NodeCache`、`demangleAsNode`、`NodePrinter<Target>`、`TypeDecoder<Builder>`、`TypeBuilder` 的签名与行为全部保持。
+
+## 关键设计
+
+### 12 字节的节点
+
+```swift
+struct CompactNode {                  // size 12, alignment 4
+    var kindAndPayloadKind: UInt16    // bit 0-8: kind 序号；bit 9-11: payloadKind
+    var payloadWord0: UInt32
+    var payloadWord1: UInt32
+}
+```
+
+两个 payload 字的含义由 `payloadKind` 决定，沿用 `Node.Payload` 既有的互斥不变量（contents 与 children 不共存）。49k 语料实测分布：`oneChild` ~67%、`manyChildren` ~16%、`twoChildren` ~12%、`text` ~5%——**近八成节点只有零到一个孩子**，所以把两个孩子内联进 payload、只让 3+ 孩子外溢到 edges 缓冲，是很划算的选择。
+
+每个 store 三块连续缓冲：`nodes`（主 arena，append 即 bump 分配）、`edges`（3+ 孩子节点的孩子索引区段）、`textBytes`（去重后的 UTF-8 字符串表）。孩子引用是 4 字节索引而非 8 字节指针——这正是相对 C++ 24 字节实现的反超点。
+
+容量上限：42.9 亿节点、4 GB 字符串表。越界走 `precondition` 失败，不静默截断。
+
+### 插入即 hash-consing，intern 表不留在成品里
+
+`NodeStoreBuilder` 对每个插入的节点做 hash-consing：结构相等的子树收敛到同一个索引。因为孩子总是先于父节点被 intern，父节点的键可以直接用**已规范化的孩子索引**比较，无需递归结构哈希——与 `NodeCache.internTreeUnsafe` 同一套经典技巧。
+
+intern 表本身是三张 open-addressing 槽数组（普通节点 / 3+ 孩子节点 / 文本），**每槽只存 4 字节索引，键按需从平铺缓冲区取回比较**，不为键单独保存一份拷贝。早期用字典（键各自持有 12 字节 compact 值、子索引数组或 `String` 副本）时，intern 表本身在全语料上要占约 10 MB 量级；改为槽数组后降到约 2 MB。
+
+`consuming func freeze()` 消费 builder、丢弃全部 intern 表，只留三块缓冲。这带来两个结果：
+
+- 「构建完成后不可变」由类型系统保证，不再依赖锁和文档契约；
+- 冻结后的 store **无法再做哈希查找**——这解释了为什么 `NodeReference` 需要 `structurallyEquals` 这类线性比较 API（见下文）。
+
+### 构建流程：cache-free 临时树，而不是直写 arena
+
+提案原稿设想让 demangler 直接写入 arena。实际落地保留了 `Node` 作为中间的「第一代空间」：
+
+1. `demangleAsNodeTransient` 以 `internsLeaves: false` 解析，产出的临时 `Node` 树完全不碰 `NodeCache.shared`；
+2. `builder.intern(tree)` 自底向上把可达节点 intern 进 arena —— **去重与垃圾回收是同一个 pass**；
+3. 临时树失去引用即被 ARC 回收。
+
+之所以没做直写：demangler 的解析逻辑（回填、substitution 复用）建立在引用语义上，改为索引式直写等于重写全部约 594 个构造点。而实测表明这一层临时成本可以忽略——234k 符号语料上构建期常驻增量仅 9.9 MB（≈ 留存 + 约 1 MB 瞬态），且构建耗时反而**快于** interning 的 `Node` 路径。
+
+为此，demangler 的全部节点构造点收敛到 `createNode(...)` 这一个 seam 上。**新增构造点必须走 `createNode(...)`，不能直接调 `Node.create(...)`**，否则 cache-free 契约会被悄悄破坏。同理，用户提供的 symbolic reference resolver 需要用 `@_spi(Internals) Node.createTransient(...)` 构造回填节点——否则一启用 symbolic reference，批量管线的 cache-free 成果当场失效。
+
+### 一套引擎，两种表示
+
+`DemanglingNode` 是 `Node` 和 `NodeReference` 共同遵循的只读树协议（`kind`/`text`/`index`/`children` 加一个抽象的 `printCacheIdentity`）。成员名刻意与 `Node` 现有 API 一致，这样泛型引擎的函数体不论特化到哪种表示都是同一份代码。
+
+据此，2000 行以上的 printer 引擎泛型化为 `DemanglingPrinter<Target, SomeNode>`，`TypeDecoder` 泛型化为 `TypeDecoderEngine<Builder, SomeNode>`，公共 `NodePrinter<Target>` / `TypeDecoder<Builder>` 退化为薄包装。store 路径的打印是**零物化**的：全量 dyld cache 语料 × 3 套选项，store 打印与 `Node` 打印逐字节零差异。
+
+派生辅助（`isSimpleType`、`needSpaceBeforeType`、`isIdentifier(desired:)`、`isSwiftModule`、`isKind(of:)`、`children.second` 等）**只保留在协议扩展上**。它们是扩展成员而非协议要求，泛型引擎内部静态派发恒走扩展版本——在具体类型上再留一份拷贝不会被引擎调用，只会静默漂移。遍历机制（preorder/inorder/postorder/levelorder、`first(of:)`/`all(of:)`/`contains`）同理，已收敛为单一泛型实现。
+
+**`Remangler` 刻意保持 `Node` 引擎**。审计确认它的遍历过程中节点构造是承重的：`getUnspecialized` 剥掉泛型后要把结果回流给 `mangle`，SIL box 布局要构造 wrapper，两者都共享 substitution 状态——这与 C++ remangler 的设计同构。对这样一个逐字节对齐关键的组件做「无构造」重设计不划算，因此 `mangleAsString(some DemanglingNode)` 经 `materializedNode` 桥接。remangle 的输出本来就是新分配的 `String`，属于瞬态成本，与常驻内存目标无关。
+
+### 读路径的零分配细节
+
+`NodeReference.textUTF8` 暴露字符串表字节的零拷贝 `ArraySlice` 视图。printer 的 sugar 检测热路径（判断 Swift module、Optional/Array/Dictionary）此前每次检查都要构造一个 `String`；升级为协议要求 `isIdentifier(desired:)` / `isSwiftModule` 并由 `NodeReference` 以字节比较见证后，store 路径上这些检查不再分配。非 ASCII 的比较目标回退到 `String` 比较，以保持 Unicode 规范等价语义。
+
+### 跨表示的相等与哈希
+
+冻结后 intern 表已丢弃，无法哈希查找，于是提供三个显式 API：
+
+- `structurallyEquals(_ node: Node)` —— 零物化的跨表示结构相等，语义对齐 `Node.==`；服务「手里有一棵外部 demangle 出来的 `Node`，要在 `NodeReference` 字典键中找到它」这个场景；
+- `structurallyEquals(_ other: NodeReference)` —— 同 store 直接比索引即得答案（hash-consing 使索引相等 ⇔ 结构相等，O(1)），跨 store 才走双树遍历；
+- `structuralHash(into:)` —— 与上述结构相等自洽的结构哈希。
+
+**为什么不能直接用固有的 `Hashable`**：`NodeReference.hash(into:)` 组合的是 `ObjectIdentifier(store)` + 索引，是 store 身份基底的。跨 store 的结构相等键会被劈成两个桶。那些「按节点结构做字典键、内部却存 reference」的下游值类型，需要的正是这个可显式调用的结构哈希构件。
+
+## 取舍与影响面
+
+- **物化出来的树不是 canonical**。`materialize()` 重建的是一棵全新的、不进 `NodeCache` 的 `Node` 树。因此 `===` 共享假设在这条路径上**不成立**：同一个 store 索引物化两次得到两个不同实例。任何按节点身份（`ObjectIdentifier` / `===`）做关联的消费者，在 store 路径上必须改为按结构关联（例如用 remangle 后的字符串作键）。`NodePrinterTarget.pushTypeReferenceScope` 收到的节点同样受此约束。
+  - 物化本身保留 DAG 共享：按索引 memo，同一子树只物化一次并复用实例。否则重度替换共享的符号会被指数展开（SwiftUI `View.Body` 量级即几十万节点），且展开树上按身份键的打印缓存会全部脱靶。
+- **索引只对签发它的 store 有效**。`NodeStore.NodeIndex` 是裸值，不带 store 反向引用。跨 store 混用索引不会被可靠拦截，只会读到无关子树。同时持有多个 builder 时需自行保证不混用。
+- **kind 序号不是序列化格式**。它取自 `Node.Kind.allCases` 中的位置，仅在单次进程运行内稳定。9 位空间共 512 槽，当前 `Node.Kind` 有 373 个 case，余量 139。本项目持续跟进 Apple 工具链的 `Demangle::Node::Kind`，超出时由 `kindsByStoreOrdinal` 的 `precondition` 拦截——注意那是**运行时**失败且位于 lazy static 中，只在首次触及 store 路径时才暴露。Phase 4 的持久化格式必须自带稳定的 kind 映射表。
+- **builder 是单写者**。`~Copyable` 保证了这一点，好处是全程无锁，代价是不能跨线程共享。多线程批量场景应每线程一个 builder，最后合并——合并 API 尚未实现。
+- **`Node` 路径完全不受影响**。默认的 `demangleAsNode` 仍然走 `NodeCache` 的叶 + 全树 interning，行为、输出、身份语义一字未变。
+
+## 实测收益
+
+Phase 1（49k 符号语料）：唯一节点 201,876，与 `NodeCache` 全树 hash-consing 的计数逐一吻合（交叉验证了两套 intern 实现的正确性）；平铺存储 3.0 MB（nodes 2.4 + edges 0.43 + text 0.26）。
+
+Phase 3 验收（本机 dyld cache SwiftUI 语料 234,232 符号，debug 构建）：
+
+| 指标 | 实测 | 目标 |
+|---|---|---|
+| 唯一节点 | 619,688 | — |
+| 平铺存储 | 8.75 MB（nodes 7.4 + edges 0.75 + text 0.57） | — |
+| 每唯一节点 | 14.1 字节 | ≤ 16 |
+| 每符号 | 37 字节 | ≤ 64 |
+| 构建耗时 | 25.3s（`Node` 路径 28.5s） | ≤ 1.2× 基线 |
+| 构建期常驻增量 | 9.9 MB | — |
+
+下游（MachOSwiftSection）迁移实测：构建管线换成 transient + intern 之后，`NodeCache` 增长归零（此前每镜像 +1.9 万叶节点 / +56 万子树），store 本体 7 MB / 57.9 万唯一节点，`Storage` 释放即整镜像回收。
+
+正确性：全量 dyld cache 对齐测试 0 失败；49k 语料 × 3 套打印选项，store 与 `Node` 路径逐字节零差异。
+
+## 后续方向（未实施）
+
+- **Phase 4 — 平铺序列化**：三块缓冲直接二进制序列化 / mmap 加载（接近 memcpy 量级），把整个 dyld cache 的解析结果持久化为符号数据库。需先定义稳定的 kind 映射与格式版本号。
+- **分片并行 store 与终态合并**：配合每线程一个 builder。
+- **`Span` / `UTF8Span`（Swift 6.2）借用视图**：进一步消除 `ArraySlice` 层的开销。
+- **`NodeReference` 层的 `Node.Rewriter` 等价物**：写时拷贝进新 store。
