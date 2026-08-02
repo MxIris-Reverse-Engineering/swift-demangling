@@ -5928,6 +5928,16 @@ extension Remangler {
         /// stack guard the remangler has. Visit order differs from the
         /// recursive version; the result does not, because every pair must
         /// match for the answer to be `true`.
+        ///
+        /// Long walks additionally memoize visited pairs, exactly like
+        /// `Node.==`: comparing two separately built copies of a shared DAG
+        /// costs their node counts rather than their path counts. Without the
+        /// memo this was the one pairwise walk of four that re-descended once
+        /// per path, and a signature holding two instance-distinct copies of a
+        /// shared bound-generic subtree made mangling exponential in the
+        /// sharing depth. The memo is created lazily because the overwhelmingly
+        /// common comparisons — substitution probes against demangler-shaped
+        /// trees — finish long before the threshold and must not allocate.
         private static func deepEquals(_ lhs: Node, _ rhs: Node) -> Bool {
             // `SubstitutionEntry.==` calls this on every hash match, so the
             // shallow cases must not allocate.
@@ -5938,10 +5948,37 @@ extension Remangler {
             guard rootLeftChildren.count == rootRightChildren.count else { return false }
             if rootLeftChildren.isEmpty { return true }
 
+            struct VisitedPair: Hashable {
+                let leftIdentity: ObjectIdentifier
+                let rightIdentity: ObjectIdentifier
+            }
+            /// Walk length at which the pair memo switches on: real
+            /// substitution probes finish long before this, while a
+            /// path-exploding DAG blows past it immediately.
+            let visitedPairTrackingThreshold = 256
+            var visitedPairs: Set<VisitedPair>?
+            var processedPairCount = 0
+
             var pendingPairs: [(left: Node, right: Node)] = Array(zip(rootLeftChildren, rootRightChildren).map { ($0, $1) })
 
             while let pair = pendingPairs.popLast() {
                 if pair.left === pair.right { continue }
+
+                processedPairCount += 1
+                if processedPairCount > visitedPairTrackingThreshold, visitedPairs == nil {
+                    visitedPairs = []
+                }
+                if visitedPairs != nil {
+                    let visitedPair = VisitedPair(
+                        leftIdentity: ObjectIdentifier(pair.left),
+                        rightIdentity: ObjectIdentifier(pair.right)
+                    )
+                    // A repeated pair repeats the identical subtree comparison,
+                    // and any mismatch below it already aborted the whole walk
+                    // the first time.
+                    guard visitedPairs!.insert(visitedPair).inserted else { continue }
+                }
+
                 // Nodes must be similar (same kind, same text/index)
                 guard pair.left.isSimilar(to: pair.right) else {
                     return false

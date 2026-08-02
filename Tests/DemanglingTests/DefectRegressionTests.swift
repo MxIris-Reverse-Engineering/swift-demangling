@@ -242,6 +242,79 @@ struct DefectRegressionTests {
         #expect(referenceHasher.finalize() == nodeHasher.finalize())
     }
 
+    // MARK: - Remangler substitution equality on shared DAGs
+
+    /// Builds `G<T, T>` nested `levels` deep with both type arguments sharing
+    /// one instance — 2^levels paths over ~7×levels unique nodes. Only leaves
+    /// intern through `Node.create`, so two calls yield structurally equal but
+    /// instance-distinct trees at every interior node.
+    private static func doublingGenericType(levels: Int) -> Node {
+        var currentType = Node.create(kind: .type, child: Node.create(kind: .structure) {
+            Node.create(kind: .module, text: "Swift")
+            Node.create(kind: .identifier, text: "Int")
+        })
+        for _ in 0 ..< levels {
+            let genericHead = Node.create(kind: .type, child: Node.create(kind: .structure) {
+                Node.create(kind: .module, text: "main")
+                Node.create(kind: .identifier, text: "G")
+            })
+            currentType = Node.create(kind: .type, child: Node.create(kind: .boundGenericStructure) {
+                genericHead
+                Node.create(kind: .typeList, children: [currentType, currentType])
+            })
+        }
+        return currentType
+    }
+
+    /// `main.foo(_: (first, second)) -> ()` — a shape the remangler accepts
+    /// and the real demangler round-trips.
+    private static func functionTaking(_ firstArgument: Node, _ secondArgument: Node) -> Node {
+        let argumentTuple = Node.create(kind: .type, child: Node.create(kind: .tuple, children: [
+            Node.create(kind: .tupleElement, child: firstArgument),
+            Node.create(kind: .tupleElement, child: secondArgument),
+        ]))
+        let functionType = Node.create(kind: .type, child: Node.create(kind: .functionType) {
+            Node.create(kind: .argumentTuple, child: argumentTuple)
+            Node.create(kind: .returnType, child: Node.create(kind: .type, child: Node.create(kind: .tuple)))
+        })
+        return Node.create(kind: .global, children: [Node.create(kind: .function) {
+            Node.create(kind: .module, text: "main")
+            Node.create(kind: .identifier, text: "foo")
+            Node.create(kind: .labelList)
+            functionType
+        }])
+    }
+
+    /// `SubstitutionEntry.deepEquals` was the one pairwise structural-equality
+    /// walk of four with no visited-pair memo: comparing two structurally equal
+    /// but instance-distinct DAGs re-descended once per *path*, so a signature
+    /// holding two separately built copies of a shared bound-generic subtree
+    /// made `mangleAsString` exponential in the sharing depth (measured 4× per
+    /// 2 levels; 1.5 s at 22 levels for a 155-character output, `===`-shared
+    /// control flat at every depth). Substitutions only cover nominal kinds, so
+    /// the DAG must nest bound generics, not tuples — and 60 levels is as deep
+    /// as the remangler's 384 depth limit admits for this shape. Memoized like
+    /// `Node.==`, 60 doubling levels finish in milliseconds; pre-fix they were
+    /// 2^60 pair visits — never.
+    @Test func remanglerSubstitutionLookupFinishesOnDistinctCopiesOfASharedDag() {
+        let victim = Self.functionTaking(
+            Self.doublingGenericType(levels: 60),
+            Self.doublingGenericType(levels: 60)
+        )
+        let sharedInstance = Self.doublingGenericType(levels: 60)
+        let control = Self.functionTaking(sharedInstance, sharedInstance)
+
+        let finished = Self.completesWithinTimeout {
+            let victimMangled = try? mangleAsString(victim)
+            let controlMangled = try? mangleAsString(control)
+            #expect(victimMangled != nil)
+            // The lookup must also still *match*: the second copy collapses to
+            // the same substitution reference the `===`-shared control takes.
+            #expect(victimMangled == controlMangled)
+        }
+        #expect(finished, "SubstitutionEntry.deepEquals expanded the DAG instead of memoizing visited pairs")
+    }
+
     // MARK: - Rich-target context on the store path (#14)
 
     /// `NodePrintContext.node` was `name as? Node`, which is always nil for a
