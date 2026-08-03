@@ -207,12 +207,6 @@ public struct NodeReference: Sendable {
         store.materializeNode(at: nodeIndex.rawValue)
     }
 
-    /// Prints the demangled form of this subtree directly from the store,
-    /// without materializing a `Node` tree (proposal 0001, Phase 2).
-    public func print(using options: DemangleOptions = .default) -> String {
-        DemanglingPrinter<String, NodeReference>.print(self, options: options)
-    }
-
     /// Whether this subtree is structurally equal to a `Node` tree
     /// (kind + contents + children, recursively) without materializing
     /// anything.

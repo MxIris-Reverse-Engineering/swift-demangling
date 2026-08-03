@@ -53,9 +53,24 @@ public protocol DemanglingNode: Sendable {
 /// generic engine statically dispatches here for every conformer — keeping a
 /// parallel copy on a concrete type would silently drift.
 extension DemanglingNode {
-    /// Prints this subtree with the given options. Mirrors `Node.print(using:)`.
+    /// Prints this subtree with the given options.
+    ///
+    /// The single implementation for every representation: `Node` prints the
+    /// class tree, `NodeReference` prints straight from the store without
+    /// materializing a `Node` tree.
     public func print(using options: DemangleOptions = .default) -> String {
         DemanglingPrinter<String, Self>.print(self, options: options)
+    }
+
+    /// Asynchronous variant of ``print(using:)``.
+    ///
+    /// Suspends the calling task instead of blocking a cooperative worker when
+    /// the walk has to move to a large-stack thread.
+    public func print(using options: DemangleOptions = .default) async -> String {
+        await StackSafeExecutor.executeAsync {
+            var printer = DemanglingPrinter<String, Self>(options: options)
+            return printer.printRoot(self)
+        }
     }
 
     @inlinable
