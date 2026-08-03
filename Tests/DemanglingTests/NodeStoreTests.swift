@@ -433,6 +433,20 @@ struct NodeReferenceInterningConvenienceTests {
         #expect(reference.print(using: .default) == tree.print(using: .default))
     }
 
+    @Test func asyncPrintMatchesSyncPrintOnBothRepresentations() async throws {
+        let tree = try demangleAsNodeTransient("$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC")
+        let reference = NodeReference(interning: tree)
+        // The immediately-invoked closures pin the sync overload; a bare call
+        // in this async context would resolve to the async variant.
+        let syncTreeOutput = { tree.print(using: .default) }()
+        let syncReferenceOutput = { reference.print(using: .default) }()
+        let asyncTreeOutput = await tree.print(using: .default)
+        let asyncReferenceOutput = await reference.print(using: .default)
+        #expect(!asyncTreeOutput.isEmpty)
+        #expect(asyncTreeOutput == syncTreeOutput)
+        #expect(asyncReferenceOutput == syncReferenceOutput)
+    }
+
     @Test func crossStoreStructuralEquality() throws {
         let mangled = "$sSaySiGD"
         var firstBuilder = NodeStoreBuilder()

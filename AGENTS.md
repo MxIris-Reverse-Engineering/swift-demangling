@@ -64,8 +64,11 @@ mangled string → Demangler → Node tree → NodePrinter → human-readable st
 // Demangle
 func demangleAsNode(_ mangled: String, isType: Bool = false, ...) throws(DemanglingError) -> Node
 
-// Print
+// Print — sync and async variants live on the DemanglingNode extension (single
+// implementation for Node and NodeReference); the async one suspends instead of
+// blocking a cooperative worker when the walk hops to a large-stack thread.
 node.print(using: .default)      // → String (human-readable)
+await node.print(using: .default) // → same output; for callers on the Swift concurrency pool
 node.description                  // → debug tree dump (kind=..., text=...); every occurrence expanded, byte-identical to the Swift runtime's dump; bounded at 8MB
 node.sharedStructureDescription   // → @_spi(Internals) same dump priced by graph size: shared interior subtrees print once, labeled "(shared #N)"/"(see #N)"
 
