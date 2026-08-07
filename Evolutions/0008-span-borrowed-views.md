@@ -9,6 +9,8 @@
 - **Related**: `Evolutions/0001-node-store-arena.md`（arena 本体；本条兑现
   `Documentations/NodeStoreArena.md` 「后续方向」中的 **`Span` 借用视图**一项）；
   `Documentations/Concepts/ArenaStorage.md`（概念背景：class 节点的成本都花在哪）
+- **配套实现说明**: `Documentations/SpanBorrowedViews.md`（面向维护者：双轴门控地图、
+  维护契约、验证工具箱；实际落地与本提案不一致之处集中在其「与提案的差异」一节）
 
 ## Summary
 
