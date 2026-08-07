@@ -62,7 +62,8 @@
 | 说法 | 意思 |
 |---|---|
 | **`Node` 路径 / store 路径** | 前者是传统对象树（`demangleAsNode` + `NodeCache`），后者是 arena（`NodeStoreBuilder` + `NodeReference`）。两条路径并存，打印输出逐字节相同。 |
-| **seam（接缝）** | 指 `Demangler+NodeCreation.swift` 里的 `createNode(...)`：demangler 全部 576 处节点构造都收敛到这一个地方，才能一个开关切换「是否走全局缓存」。**新增构造点必须走它。** |
+| **seam（接缝）** | 行为收敛到单点、从而能被一个开关整体切换的地方。本项目有两处：① `Demangler+NodeCreation.swift` 的 `createNode(...)`——demangler 全部节点构造收敛于此，一个开关切换「是否走全局缓存」（**新增构造点必须走它**）；② `DemanglingRuntimePath.forcesLegacyPath`（0008 的可测性 seam）——强制 demangle 入口走 pre-macOS 26 的旧路径，让一台新系统机器把双路径都测全（env `DEMANGLING_FORCE_LEGACY_PATH=1` 可整进程开启）。 |
+| **双路径（dual path）** | 0008 确立的结构：被 OS 运行时版本卡住的特性（`.span` 属性、`UTF8Span`、`InlineArray`）按 `#available(macOS 26 系)` 分流，被编译器能力卡住的（`@_lifetime` 直接返回式）按 `#if hasFeature(Lifetimes)` 分流；分叉只允许出现在入口、物化点、存储选型三处，扫描/引擎/intern 逻辑永远单份。两条路径的产出要求逐字节一致（`DualPathParityTests` + CI 双跑）。 |
 | **语料（corpus）** | 正确性对拍用的真实符号集合：dyld 共享缓存全量 **4,522,325 个符号**。文档里的「全语料 0 失败」都指这一套。 |
 | **对齐测试 / oracle** | 拿本库输出与 Swift runtime / `swift-demangle` 逐字节比对的测试。`Node.description` 之所以不能优化成「共享子树只打印一次」，就是因为要跟 runtime 的转储对拍。 |
 | **`<<too complex>>`** | 打印时触到深度上限的标记，表示这里主动放弃了，不是输出错误。 |

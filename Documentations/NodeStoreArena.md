@@ -248,5 +248,9 @@ Phase 3 验收（本机 dyld cache SwiftUI 语料 234,232 符号，debug 构建�
 - **Phase 4 — 平铺序列化**：三块缓冲直接二进制序列化 / mmap 加载（接近 memcpy 量级），
   把整个 dyld cache 的解析结果持久化为符号数据库。需先定义稳定的 kind 映射与格式版本号。
 - **分片并行 store 与终态合并**：配合每线程一个 builder。
-- **`Span` / `UTF8Span`（Swift 6.2）借用视图**：进一步消除 `ArraySlice` 层的开销。
 - **`NodeReference` 层的 `Node.Rewriter` 等价物**：写时拷贝进新 store。
+
+（原列于此的「`Span` / `UTF8Span` 借用视图」已由提案
+[0008](../Evolutions/0008-span-borrowed-views.md) 实施：扫描器字节化、
+`withTextUTF8` / `textUTF8Span()` 借用视图、`withSpans` 缓冲借用、打印 walk 的
+`UnretainedNodeReference` 去 ARC——细节与实测见该提案的 Decision Log。）

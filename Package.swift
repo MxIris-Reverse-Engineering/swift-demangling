@@ -45,6 +45,12 @@ func envEnable(_ key: String, default defaultValue: Bool = false) -> Bool {
 
 let usingLocalDependencies = envEnable("USING_LOCAL_DEPENDENCIES")
 
+/// Opt-in acceptance harness for proposal 0008 B2 (store print walk must not
+/// retain/release the store per visited child). Gated behind an environment
+/// flag so ordinary consumers never see the extra executable; see
+/// `Sources/RetainCountVerification/main.swift` for the run recipe.
+let buildingRetainCountVerification = envEnable("DEMANGLING_RETAIN_HARNESS")
+
 extension Package.Dependency {
     enum LocalSearchPath {
         case package(path: String, isRelative: Bool, isEnabled: Bool = usingLocalDependencies, traits: Set<PackageDescription.Package.Dependency.Trait> = [.defaults])
@@ -143,5 +149,10 @@ let package = Package(
                 "DemanglingTestingSupport",
             ],
         ),
-    ],
+    ] + (buildingRetainCountVerification ? [
+        .executableTarget(
+            name: "RetainCountVerification",
+            dependencies: ["Demangling"],
+        ),
+    ] : []),
 )

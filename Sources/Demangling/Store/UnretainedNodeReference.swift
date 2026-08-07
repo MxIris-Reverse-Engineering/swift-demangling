@@ -1,10 +1,19 @@
 /// Engine-internal walk handle for store-backed printing (proposal 0008, B2):
-/// `NodeReference` minus the retain. The store is held `unowned(unsafe)`, so
-/// copying the handle — which a walk does once per visited child — moves
-/// sixteen bytes with zero ARC traffic. This is the same layering as
+/// `NodeReference` minus the retain. The store is held as `Unmanaged` and
+/// every access goes through `_withUnsafeGuaranteedRef`, so copying the
+/// handle — which a walk does once per visited child — and calling store
+/// methods through it produce zero ARC traffic. This is the same layering as
 /// swift-syntax's `RawSyntaxArenaRef`: the public value (`NodeReference`)
 /// keeps its strong store reference; the engine-internal handle does not, and
 /// never leaves the engine.
+///
+/// `unowned(unsafe)` storage was the first shape here and turned out not to
+/// be enough: reading the property yields a value the compiler then guards
+/// with a retain/release pair around every method call on it, which the
+/// acceptance harness measured at roughly one pair per visited node.
+/// `Unmanaged` + `_withUnsafeGuaranteedRef` (a long-stable underscored stdlib
+/// primitive, `@_transparent` to a bare pointer use) is the spelling that
+/// actually compiles to zero ARC.
 ///
 /// ## Safety contract
 ///
@@ -17,39 +26,52 @@
 /// Do not store one beyond the scope that anchored its store.
 @usableFromInline
 struct UnretainedNodeReference: Hashable {
-    /// `unowned(unsafe)` is the point of the type: no ARC on load or copy.
     @usableFromInline
-    unowned(unsafe) let store: NodeStore
+    let storeReference: Unmanaged<NodeStore>
 
     @usableFromInline
     let rawIndex: UInt32
 
     @usableFromInline
     init(store: NodeStore, rawIndex: UInt32) {
-        self.store = store
+        self.storeReference = Unmanaged.passUnretained(store)
         self.rawIndex = rawIndex
     }
 
     @usableFromInline
+    init(storeReference: Unmanaged<NodeStore>, rawIndex: UInt32) {
+        self.storeReference = storeReference
+        self.rawIndex = rawIndex
+    }
+
+    /// The single access path to the store: guaranteed (+0) for the duration
+    /// of `body`, no retain/release emitted. Sound under the safety contract
+    /// above — the walk entry anchors the store for longer than any `body`.
+    @usableFromInline
+    func withStore<Result>(_ body: (NodeStore) -> Result) -> Result {
+        storeReference._withUnsafeGuaranteedRef(body)
+    }
+
+    @usableFromInline
     var compactNode: CompactNode {
-        store.compactNode(at: rawIndex)
+        withStore { $0.compactNode(at: rawIndex) }
     }
 
     @usableFromInline
     static func == (left: UnretainedNodeReference, right: UnretainedNodeReference) -> Bool {
-        left.store === right.store && left.rawIndex == right.rawIndex
+        left.storeReference.toOpaque() == right.storeReference.toOpaque() && left.rawIndex == right.rawIndex
     }
 
     @usableFromInline
     func hash(into hasher: inout Hasher) {
-        hasher.combine(ObjectIdentifier(store))
+        hasher.combine(storeReference.toOpaque())
         hasher.combine(rawIndex)
     }
 }
 
 /// `DemanglingNode` requires `Sendable`. The handle is a bare pointer plus an
 /// index over a deeply immutable `Sendable` class; `@unchecked` only because
-/// the compiler cannot see that `unowned(unsafe)` storage is kept alive and
+/// the compiler cannot see that the unmanaged reference is kept alive and
 /// unmutated externally (the safety contract above).
 extension UnretainedNodeReference: @unchecked Sendable {}
 
@@ -61,12 +83,12 @@ extension UnretainedNodeReference: DemanglingNode {
 
     @usableFromInline
     var text: String? {
-        store.textOfNode(at: rawIndex)
+        withStore { $0.textOfNode(at: rawIndex) }
     }
 
     @usableFromInline
     var index: UInt64? {
-        store.indexPayload(of: compactNode)
+        withStore { $0.indexPayload(of: $0.compactNode(at: rawIndex)) }
     }
 
     @usableFromInline
@@ -77,7 +99,7 @@ extension UnretainedNodeReference: DemanglingNode {
 
     @usableFromInline
     var children: ChildrenView {
-        ChildrenView(store: store, compactNode: compactNode)
+        ChildrenView(storeReference: storeReference, compactNode: compactNode)
     }
 
     /// The handle itself: hashes as store identity plus index, exactly the
@@ -87,19 +109,19 @@ extension UnretainedNodeReference: DemanglingNode {
 
     @usableFromInline
     var materializedNode: Node {
-        store.materializeNode(at: rawIndex)
+        withStore { $0.materializeNode(at: rawIndex) }
     }
 
     @usableFromInline
     func isIdentifier(desired: String) -> Bool {
         guard kind == .identifier else { return false }
-        return store.nodeTextMatches(at: rawIndex, expected: desired)
+        return withStore { $0.nodeTextMatches(at: rawIndex, expected: desired) }
     }
 
     @usableFromInline
     var isSwiftModule: Bool {
         guard kind == .module else { return false }
-        return store.nodeTextMatches(at: rawIndex, expected: stdlibName)
+        return withStore { $0.nodeTextMatches(at: rawIndex, expected: stdlibName) }
     }
 
     /// Mirror of `NodeReference.ChildrenView` yielding unretained handles:
@@ -115,14 +137,14 @@ extension UnretainedNodeReference: DemanglingNode {
         typealias Index = Int
 
         @usableFromInline
-        unowned(unsafe) let store: NodeStore
+        let storeReference: Unmanaged<NodeStore>
 
         @usableFromInline
         let compactNode: CompactNode
 
         @usableFromInline
-        init(store: NodeStore, compactNode: CompactNode) {
-            self.store = store
+        init(storeReference: Unmanaged<NodeStore>, compactNode: CompactNode) {
+            self.storeReference = storeReference
             self.compactNode = compactNode
         }
 
@@ -134,7 +156,10 @@ extension UnretainedNodeReference: DemanglingNode {
 
         @usableFromInline
         subscript(position: Int) -> UnretainedNodeReference {
-            UnretainedNodeReference(store: store, rawIndex: store.rawChildIndex(of: compactNode, at: position))
+            UnretainedNodeReference(
+                storeReference: storeReference,
+                rawIndex: storeReference._withUnsafeGuaranteedRef { $0.rawChildIndex(of: compactNode, at: position) }
+            )
         }
     }
 }
