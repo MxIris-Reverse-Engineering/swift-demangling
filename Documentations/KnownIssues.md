@@ -4,6 +4,9 @@
 且理由仍成立的发现直接跳过，不再重走「四问」；若新证据推翻了当初的理由，则更新本文件
 并重新裁决。
 
+概念背景：`Concepts/` 下的五篇（[遍历计价](Concepts/TraversalCost.md)、
+[栈与崩溃](Concepts/RecursionAndStack.md) 与本文关系最紧）。词条速查见 [Glossary.md](Glossary.md)。
+
 - **第一部分（下方 1–6 条）**：已确认真实存在、但经维护者决定**暂缓修复**的问题。
   每条记录：现象与根因、复现方式、影响面评估、暂缓理由。修复任何一条后请把该条目移除
   并在对应演进文档中记录修复。
@@ -26,6 +29,12 @@
     `.type` 裸解包与 `case .tuple` 的元素下标越界已修复（evolution 0007）——理由是本 PR
     自己已修同款模式的一处（`decodeMangledTypeDecl`），「修一半」的状态不可留。其余
     TypeDecoder 健壮性问题仍在暂缓范围内。
+- **2026-08-07 更新（文档与代码对账）**：本文件与其余专题文档逐条核对当前代码
+  （`feature/node-store` @ `f913742`），修正了三处已失效的表述——第 1 条的行号（代码
+  移动后已全部偏移）、第 2 条引用的 `maxDepth = 160`（2026-08-02 已回退为 1024）、
+  第 3 条引用的 `maxPrintDepth = 512`（同上，现为 768）。第二部分 N3 的残留待办
+  （`DemanglingPrinter.init(options:)` 降为 internal）经查证已在 `5cc30c9` 完成。
+  **裁决结论本身没有变化**，只是把过期的数字对上。
 
 ---
 
@@ -35,24 +44,27 @@
 整数转换初始化器，守卫（guard）只挡 `nil` 不挡量级，超范围值直接使进程崩溃（SIGTRAP）。
 均为 `main` 既有问题，非 node-store PR 引入。
 
-> **2026-08-02 更正**：本条原先写作「三处」并只列了 4 个位置（329 / 964 / 970 / 1426）。
-> 全文件重扫后实际有 8 处。原先的清点遗漏了 796、809、1451、1454 四处——由于本清单是
-> review 流程「已裁决即跳过」所依据的机制，清点不全会把从未裁决过的崩溃点静默转为
-> 「已裁决」。补全如下。
+> **2026-08-02 更正**：本条原先写作「三处」并只列了 4 个位置。全文件重扫后实际有
+> 8 处——由于本清单是 review 流程「已裁决即跳过」所依据的机制，清点不全会把从未裁决过
+> 的崩溃点静默转为「已裁决」。补全如下。
+>
+> **2026-08-07 更正**：行号按当前代码（`feature/node-store` @ `f913742`）重新对过，
+> 8 处全部仍在；顺带修正两处的归属函数——原表把 `silBoxTypeWithLayout` 分支里的两处
+> 记成了 `decodeRequirements`。
 
-| 位置（`TypeDecoder.swift`，`feature/node-store` @ 875d3f4） | 转换 | 触发条件 | 原清单 |
-|---|---|---|---|
-| `decodeMangledType` 的 `.dependentGenericParamType` 分支（329 行） | `Int(depthValue)` / `Int(indexValue)` | depth 或 index `>= 2^63` | 已列 |
-| `decodeRequirements`（796 行） | `genericParamsAtDepth.append(Int(index))` | `index > Int.max` | **漏列** |
-| `decodeRequirements`（809 行） | `parameterPacks.append((Int(depth), Int(index)))` | depth 或 index `> Int.max` | **漏列** |
-| `decodeMangledType` 的 `.integer` 分支（964 行） | `Int(index)` | `index > Int.max` | 已列 |
-| `decodeMangledType` 的 `.negativeInteger` 分支（970 行） | `Int(index)` | `index > Int.max` | 已列 |
-| `decodeRequirements` 的 `.dependentGenericInverseConformanceRequirement` 分支（1426 行） | `UInt32(index)` | `index > UInt32.max`（`?? .copyable` 兜底永远等不到转换完成） | 已列 |
-| `decodeRequirements` 的 layout constraint 分支（1451 行） | `alignment = Int(align)` | `align > Int.max`；**可达性未验证**，需确认 `align` 是否受 layout 语法约束 | **漏列** |
-| 同上（1454 行） | `size: Int(size)` | 同上，可达性未验证 | **漏列** |
+| 位置（`TypeDecoder.swift` @ `f913742`） | 转换 | 触发条件 |
+|---|---|---|
+| `decodeMangledType` 的 `.dependentGenericParamType` 分支（335 行） | `Int(depthValue)` / `Int(indexValue)` | depth 或 index `>= 2^63` |
+| `decodeMangledType` 的 `.silBoxTypeWithLayout` 分支（807 行） | `genericParamsAtDepth.append(Int(index))` | `index > Int.max` |
+| 同上（820 行） | `parameterPacks.append((Int(depth), Int(index)))` | depth 或 index `> Int.max` |
+| `decodeMangledType` 的 `.integer` 分支（975 行） | `Int(index)` | `index > Int.max` |
+| `decodeMangledType` 的 `.negativeInteger` 分支（981 行） | `Int(index)` | `index > Int.max` |
+| `decodeRequirements` 的 `.dependentGenericInverseConformanceRequirement` 分支（1449 行） | `UInt32(index)` | `index > UInt32.max`（`?? .copyable` 兜底永远等不到转换完成） |
+| `decodeRequirements` 的 layout constraint 分支（1474 行） | `alignment = Int(align)` | `align > Int.max`；**可达性未验证**，需确认 `align` 是否受 layout 语法约束 |
+| 同上（1477 行） | `size: Int(size)` | 同上，可达性未验证 |
 
-796 / 809 两处吃的是与已列各处**同一个**环绕十进制扫描器，可达性与下文的论证完全一致；
-1451 / 1454 两处的 `align` / `size` 来源尚未追到底，修复前需先确认。
+807 / 820 两处吃的是与其余各处**同一个**环绕十进制扫描器，可达性与下文的论证完全一致；
+1474 / 1477 两处的 `align` / `size` 来源尚未追到底，修复前需先确认。
 
 **从 mangled 字符串可达**：scanner 解析十进制数用环绕算术（`conditionalInt`，注释自述跟随
 Swift 编译器对畸形输入允许溢出），因此任意 `UInt64` 都能从字符串进入节点树。已验证的
@@ -69,16 +81,22 @@ inverse requirement 的 index 走 `Ri<十进制>_` 语法同理可达；`.depend
 **复现测试形态**（未入库）：Swift Testing exit test，断言 `processExitsWith: .success`
 （body 内 catch `TypeLookupError` 后正常退出）；现状三例均以 `.signal(SIGTRAP)` 失败。
 
-**修法方向**：三处改用 `Int(exactly:)` / `UInt32(exactly:)`，超范围抛 `TypeLookupError`。
+**修法方向**：8 处全部改用 `Int(exactly:)` / `UInt32(exactly:)`，超范围抛
+`TypeLookupError`。
 
 ## 2. TypeDecoder 公开入口不经 `StackSafeExecutor`，小栈线程上深度守卫失效
 
 `TypeDecoder.decodeMangledType(node:)`（含 `NodeReference` 重载）在调用线程原地执行——
 这是**有意设计**（`TypeBuilder` 回调可能绑定 actor/线程，见方法文档），代价是栈余量由
-调用方负责。但 `maxDepth = 160` 按 8MB 栈实测校准（unoptimized 每层约 30KB）；在 512KB
-的协作/派发线程上，约嵌套 16 层（8–10 层 Optional 套叠）即先于守卫爆栈 SIGSEGV。
+调用方负责。而 unoptimized 构建下这里每个深度单位约吃 30KB 栈：在 512KB 的协作/派发
+线程上，约嵌套 16 层（8–10 层 Optional 套叠）即先于守卫爆栈 SIGSEGV。
 `demangle` / `remangle` / `print` 三族入口均自动经 `StackSafeExecutor` 保护，唯此入口
 不对称，文档虽有要求（调用方自行 `withLargeStack`）仍属易踩的坑。
+
+> **2026-08-07 更正**：本条原写作「`maxDepth = 160` 按 8MB 栈实测校准」。该常数已于
+> 2026-08-02 回退为上游的 **1024**（见第二部分 N8），问题因此**变严重而非缓解**——
+> 即使在完整的 8MB 线程上，实测约 250 层就爆栈，1024 的守卫根本轮不到生效。参见
+> 第 4 条。
 
 **修法方向**：不改变"回调在调用线程执行"契约的前提下，无法简单套用 executor 跳线程；
 可考虑入口处检测剩余栈并在不足时直接抛 `TypeLookupError`（拒绝而非崩溃），或在文档升级为
@@ -93,8 +111,8 @@ inverse requirement 的 index 走 `Ri<十进制>_` 语法同理可达；`.depend
 量的硬上界；同一棵树的输出依赖子树的遭遇顺序（与 C++ printer 的行为不一致，虽然每棵
 树自身仍是确定性的）。
 
-**影响面**：仅对抗构造可观测——需要共享子树 + 深度逼近 512 的路径；真实符号实测最深
-41 层。回放的内容是该节点的真实完整渲染，所以是「输出过于完整」而非输出错误。
+**影响面**：仅对抗构造可观测——需要共享子树 + 深度逼近 `maxPrintDepth`（现为 768）的
+路径。回放的内容是该节点的真实完整渲染，所以是「输出过于完整」而非输出错误。
 
 **修法方向**：fragment 记录自身渲染高度 `h`，命中时检查 `printDepth + h ≤ maxPrintDepth`，
 不满足则走无缓存路径（该次不回放也不写缓存）。
@@ -166,12 +184,12 @@ handoff 直接携带 `NodeReference`，把物化推迟到 `TypeBuilder` 真正�
 ## 6. TypeDecoder 在共享 DAG 上按出现次数解码，深度上限约束不了总工作量
 
 `TypeDecoderEngine.decodeMangledType` 沿子节点递归构建 `BuiltType`，没有按实例身份的
-memo；唯一的守卫 `maxDepth = 160` 只封顶**单条根到叶路径**的长度，不封顶路径条数。
+memo；唯一的守卫 `maxDepth`（现为 1024）只封顶**单条根到叶路径**的长度，不封顶路径条数。
 替换反向引用让 demangle 输出本身是 DAG——同一子树实例出现在 k 条路径上就被解码 k 次，
 `TypeBuilder` 回调也随之被调 k 次；构造的深共享 DAG 可以在不触碰深度上限的前提下把
 回调次数推到指数级。这正是 printer 用 `printCache`、remangler 用 `deepEquals` 成对
 memo 已经封掉的同一暴露面（evolution 0006 的横向排查发现），TypeDecoder 两者皆无。
-`main` 既有（当时上限 1024，更宽），非 node-store PR 引入。
+`main` 既有问题，非 node-store PR 引入（`main` 与回退后的本分支上限同为 1024）。
 
 **影响面**：仅 `TypeDecoder` 公开入口喂入共享 DAG 时；纯耗时/回调次数问题，产出的
 类型值不受影响。真实符号共享深度浅，语料下无可测差异。
@@ -238,7 +256,8 @@ stranding 缺陷而存在（见 `LargeStackThreadPoolTests`）。在 OS 已无�
 调用线程的剩余栈——这正是该设计要消除的。跨符号缓存复用是这个取舍**有意付出**的代价。
 
 唯一残留的整洁性问题：`printRoot` 既不可达，`public init(options:)` 就是一个构造出来
-无法使用的 API 表面，应降为 internal。已登记为待办，非缺陷。
+无法使用的 API 表面，应降为 internal。**已于 `5cc30c9` 完成**（2026-08-07 复核确认：
+初始化器现为 internal，声明处写明了原因）。
 
 ## N4. `Set<NodeReference>` 不去重
 

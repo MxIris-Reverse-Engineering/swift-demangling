@@ -72,7 +72,7 @@ Remangler 那 6 条的处理：`hashForNode` ↔ `entryForNode` 与 `deepEquals`
 
 释放引用类型的树本身就是递归的，且发生在最后一个引用消失处、由运行时执行，**任何引擎侧护栏都覆盖不到**。实测 512KB 线程释放 620 层的树直接崩。
 
-`deinit` 改成把孩子摘进显式工作队列逐个排空，仅在 `isKnownUniquelyReferenced` 为真时拆解，共享子树保持完整。
+`deinit` 改成把 children 摘进显式工作队列逐个排空，仅在 `isKnownUniquelyReferenced` 为真时拆解，共享子树保持完整。
 
 ### 5. worker 栈 8MB → 64MB
 

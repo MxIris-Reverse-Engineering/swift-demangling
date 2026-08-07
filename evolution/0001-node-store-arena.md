@@ -46,20 +46,20 @@ struct CompactNode {                  // size 12, alignment 4, 无对象头
 | `none` | — | — | 与 leaf 部分重叠 |
 | `index` | `UInt64` 低 32 位 | 高 32 位 | 少量 |
 | `text` | 字符串表 offset | 字节长度 | ~5% |
-| `oneChild` | 孩子索引 | — | ~67% |
-| `twoChildren` | 孩子 0 索引 | 孩子 1 索引 | ~12% |
-| `manyChildren` | edges 缓冲起点 | 孩子数量 | ~16% |
+| `oneChild` | child 索引 | — | ~67% |
+| `twoChildren` | child 0 索引 | child 1 索引 | ~12% |
+| `manyChildren` | edges 缓冲起点 | children 数量 | ~16% |
 
 配套缓冲（每个 store 一套）：
 
 - `nodes: ContiguousArray<CompactNode>` — 主 arena，`append` 即 bump 分配；
-- `edges: ContiguousArray<UInt32>` — 仅 3+ 孩子节点使用的孩子索引连续区段；
+- `edges: ContiguousArray<UInt32>` — 仅 3 个以上 children 的节点使用的 children 索引连续区段；
 - `textBytes: ContiguousArray<UInt8>` — 字符串表，全部 identifier 的 UTF-8 字节连续存放并去重；
-- intern 表 — 把已实现的 hash-consing 从 `ObjectIdentifier` 键迁移为索引键：`(kindAndPayloadKind, payloadWord0, payloadWord1)` 经孩子索引规范化后即天然唯一。落地形态是三张 open-addressing 槽数组（节点 / 多孩子节点 / 文本），每槽仅 4 字节索引，键按需从平铺缓冲区取回比较——不再为键单独存一份拷贝（Phase 3 的 intern 表瘦身，见 Decision Log）。表随 `freeze()` 丢弃，不进入冻结后的 store。
+- intern 表 — 把已实现的 hash-consing 从 `ObjectIdentifier` 键迁移为索引键：`(kindAndPayloadKind, payloadWord0, payloadWord1)` 经 children 索引规范化后即天然唯一。落地形态是三张 open-addressing 槽数组（节点 / 多 children 节点 / 文本），每槽仅 4 字节索引，键按需从平铺缓冲区取回比较——不再为键单独存一份拷贝（Phase 3 的 intern 表瘦身，见 Decision Log）。表随 `freeze()` 丢弃，不进入冻结后的 store。
 
 容量边界：`UInt32` 索引上限 42.9 亿节点、字符串表 4 GB——对单个 store（哪怕整个 dyld cache）远够；越界走 `precondition` 失败而非静默截断。
 
-预算核算（49k 语料，20.2 万唯一子树）：`201k × 12B ≈ 2.4 MB` 节点 + edges ~0.3 MB + 字符串表 ~0.5 MB + intern 表 ~2 MB ≈ **5–6 MB**（现状 12.9 MB）。相对 C++ 的反超点：孩子引用用 4 字节索引而非 8 字节指针。
+预算核算（49k 语料，20.2 万唯一子树）：`201k × 12B ≈ 2.4 MB` 节点 + edges ~0.3 MB + 字符串表 ~0.5 MB + intern 表 ~2 MB ≈ **5–6 MB**（现状 12.9 MB）。相对 C++ 的反超点：指向 children 的引用用 4 字节索引而非 8 字节指针。
 
 ### 类型与 API 面
 
@@ -95,7 +95,7 @@ public struct NodeReference: Hashable, Sendable {
 
 - 构建期使用 `NodeStoreBuilder`（`~Copyable`）：单写者约束由编译器保证，`consuming func freeze() -> NodeStore` 完成冻结——把现在靠 `NSLock` + 文档契约维持的「构建后不可变」升级为类型系统保证；
 - `Hashable`/`==` 基于 (store identity, index)：因为 store 内全量 hash-consed，索引相等 ⇔ 结构相等，比较从 O(树) 降为 O(1)；
-- 读路径后续用 `Span` / `UTF8Span`（Swift 6.2）暴露孩子区段与文本的借用视图，零分配零拷贝。
+- 读路径后续用 `Span` / `UTF8Span`（Swift 6.2）暴露 children 区段与文本的借用视图，零分配零拷贝。
 
 ### 构建流程（两代空间）
 
@@ -148,15 +148,15 @@ store 自带索引级 intern，store 路径不经过全局 `NodeCache`；批量�
 
 ## Alternatives Considered
 
-- **`ManagedBuffer` 尾分配 class 节点**（孩子内联到实例尾部，单次分配）：仍保留 16 字节对象头与引用计数，加权后 ~32–48 字节，被 arena 全面支配，否决；
-- **压缩 class 布局到 32 字节桶**：需手工 union 并外部化 `String`/双孩子，加权收益仅 ~1.2 倍，复杂度不成比例，否决（详见 SubtreeInterning 文档）；
+- **`ManagedBuffer` 尾分配 class 节点**（children 内联到实例尾部，单次分配）：仍保留 16 字节对象头与引用计数，加权后 ~32–48 字节，被 arena 全面支配，否决；
+- **压缩 class 布局到 32 字节桶**：需手工 union 并外部化 `String` / 双 children，加权收益仅 ~1.2 倍，复杂度不成比例，否决（详见 SubtreeInterning 文档）；
 - **直接把 `Node` 重写为 struct 句柄**（swift-syntax 式整体替换）：终态最优但破坏全部公共 API 与下游（MachOSwiftSection / RuntimeViewer），不符合渐进要求；本方案 Phase 3 完成后如需要可再评估。
 
 ## Future Directions
 
 - mmap 符号数据库格式版本化（magic + version + 缓冲布局描述）；
 - 分片并行 store 与终态合并；
-- `InlineArray`（SE-0453）在 scratch arena 孩子暂存区的应用；
+- `InlineArray`（SE-0453）在 scratch arena 的 children 暂存区的应用；
 - `NodeReference` 层面的 `Node.Rewriter` 等价物（写时拷贝进新 store）。
 
 ## Decision Log
@@ -175,4 +175,4 @@ store 自带索引级 intern，store 路径不经过全局 `NodeCache`；批量�
 | 2026-07-24 | Phase 3 跟进（读路径 perf）：零拷贝文本 | `NodeReference.textUTF8` 暴露字符串表字节的零拷贝 `ArraySlice` 视图；`isIdentifier(desired:)`/`isSwiftModule` 升为 `DemanglingNode` requirement（带派生默认实现），`NodeReference` 以字节比较见证——printer 的 sugar 检测热路径（Swift module + Optional/Array/Dictionary）在 store 路径不再每检查构造一次 String；非 ASCII needle 回退 String 比较保持 Unicode 规范等价语义。`UTF8Span` 借用视图仍列为 Future Direction |
 | 2026-07-24 | 命名调整：`SymbolStore` → `NodeStore` | 库的领域概念是 `Node`（demangle 产物树节点），API 体系中并无 "Symbol" 抽象——该词仅是输入 mangled string 的口语说法。全部类型随之更名：`SymbolStore` → `NodeStore`、`SymbolStoreBuilder` → `NodeStoreBuilder`（`NodeStore.NodeIndex` 不变），与 `Node`/`NodeReference`/`CompactNode`/`NodeCache` 命名系对齐。曾考虑 `NodeFactory`（C++ 编译器中 `NodeFactory` 正是 demangle 的 slab arena 分配器，有官方先例）但放弃：本项目 `NodeFactory` 已被无参 singleton 节点集合占用（名同义异），且 C++ 版是短命裸分配器，与可 `freeze()` 的持久 hash-consing 容器语义不符——frozen 只读容器叫 Factory 会误导熟悉官方源码的读者。文件同步更名（含本提案 `0001-symbol-store-arena.md` → `0001-node-store-arena.md`）；分支同步更名 `feature/symbol-store` → `feature/node-store`（本地 + origin：先核对远端 tip 一致、无关联 PR，推新名后删除旧远端分支）；MachOSwiftSection 侧 `SymbolStoreMigrationPlan.md` → `NodeStoreMigrationPlan.md` 同步更新（其自有类型 `SymbolIndexStore` 不在改名范围）；decision log 历史记录保留原状 |
 | 2026-07-24 | 下游迁移配套：跨表示相等 + transient demangle SPI | 为 MachOSwiftSection 的 `SymbolIndexStore` → NodeStore 迁移（其 `Documentations/Internal/NodeStoreMigrationPlan.md`）新增：① `NodeReference.structurallyEquals(_ node: Node)`——零物化跨表示结构相等（语义对齐 `Node.==`：kind + contents + children 递归；text 先字节比较、Unicode 规范等价回退 String ==），服务「外部 canonical `Node` 在 `NodeReference` 字典键中查找」场景（frozen store 的 intern 表已随 `freeze()` 丢弃，不能哈希查找；name 预桶内线性结构比较足够），附 3 个单元测试；② `demangleAsNodeTransient` 以 `@_spi(Internals) public` 导出——下游批量索引在瞬态树上跑分类逻辑后 `builder.intern`，全程 cache-free（文档注明返回树非 canonical）；③ `isKind(of:)`（原 `Node` 扩展）与 `children.second`（原 `Node.Children` 具体成员）上收为 `DemanglingNode`/`DemanglingNodeChildren` 协议扩展单一实现，删除具体副本；④ `NodeReference: CustomStringConvertible`（物化桥的 debug 树 dump）。迁移侧实测（SwiftUI image）：构建管线换 transient+intern 后 `NodeCache` 增长归零（此前 +1.9 万叶/+56 万子树），`Storage` 释放即整镜像回收，store 本体 7 MB / 57.9 万唯一节点 |
-| 2026-07-24 | Stage 5 上游配套：惰性 scope hook + transient 构造 SPI + `NodeReference` 结构性 API + 语料修正（commit `26db7a4`） | 下游（MachOSwiftSection）迁移过程中暴露的四个上游缺口，一并补齐。**① `NodePrinterTarget.pushTypeReferenceScope` 的节点参数改为 `@autoclosure () -> Node?`。** 问题：该 hook 是 main 上 `7fcb0f1` 引入的富 target 分组接缝（printer 在整段限定名打印外围推入 nominal 节点），签名收的是具体 `Node?`；store 路径要服务它就必须 `materializedNode` 物化一棵子树，而 `String` 这类忽略 scope 的 target 根本不读这个节点——等于让不用的人付物化代价，与「store 纯文本打印零分配」直接冲突。此前 07-24 的权宜做法是 store 路径一律传 `nil`（见上一条「以 `name as? Node` 桥接，store 路径传 nil」），代价是富 target 走 store 时永久丢失 scope identity。改为 autoclosure 后两难消解：默认实现与 `String` 从不求值（零成本，store 纯文本路径仍无物化），富 target 求值即拿到 `name.materializedNode`——**且只物化该 nominal reference 的小子树**，不是整棵符号树。**验证**：新增 `NodePrinterScopeTests`，其 `ScopeRecordingTarget` 精确镜像 `String` 的写入行为（保证打印流程逐字节同构）并额外记录 push/pop 事件序列；scope identity 以「被递交节点的 remangle 字符串」表达——这是结构性表征，跨表示相等当且仅当递交的子树结构相等，从而绕开 `Node` 与 `NodeReference` 无法直接比较的问题。对 5 个符号断言两条路径的输出文本与 scope 事件序列逐项相同，并断言至少递交过一个非 nil identity（防止「两边都传 nil 也能通过」的空洞绿灯）。**② `demangleAsNodeTransient` 增加 `symbolicReferenceResolver` 参数，并新增 `@_spi(Internals) Node.createTransient(...)` 工厂族。** 问题：Phase 3 的 cache-free 契约此前只覆盖 demangler 自身的构造点（全部走 `createNode(...)` + `internsLeaves: false`），但 symbolic reference 解析是**用户提供的闭包**在解析中途构造并回填节点——下游只能用公共的 `Node.create(...)`，而它必然写入 `NodeCache.shared`。结果是：一旦启用 symbolic reference（MachOSwiftSection 解析 mach-o 内嵌符号引用的常规路径），批量管线的 cache 增长归零成果当场失效。补齐后 transient 入口可直接透传 resolver，resolver 内部用 `createTransient` 构造 splice 节点，全链路不碰全局 cache、不取全局锁。`createTransient` 覆盖 `create` 的五个重载形态（contents / inlineChildren / 单孩子 / text / index），文档明确标注返回节点**非 canonical**（结构相等者是不同实例，`===` 共享假设不成立）。**③ `NodeReference` 三个结构性 API。** `init(interning:)`：把单棵外部树（瞬态 demangle 结果或手工合成树）interning 进一个**私有 mini store** 并引用其根——reference 持有 store 即保活，值自足且 `Sendable`，适合「值的生命周期长于源树」的持有场景；文档同时指明批量场景仍应直接驱动 `NodeStoreBuilder`，否则每棵树一个 arena，白丢跨符号去重。`structurallyEquals(_ other: NodeReference)`：同 store 直接比索引即得答案（hash-consing 使索引相等 ⇔ 结构相等，O(1)），跨 store 才走双树遍历，text 同样字节优先、回退 `String ==` 保 Unicode 规范等价——与既有的 `structurallyEquals(_ node: Node)` 语义完全对齐。`structuralHash(into:)`：与跨 store 结构相等自洽的结构哈希（kind + contents 判别位 + 孩子数 + 递归）。**为什么不能直接用固有 `Hashable`**：`NodeReference` 的 `hash(into:)` 组合的是 `ObjectIdentifier(store)` + 索引（store 身份基底），跨 store 的结构相等键会被劈成两个桶；下游那些「按节点结构做字典键、但内部存 reference」的值类型需要的正是这个可显式调用的结构哈希构件。**④ 语料修正：`$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc` 是无效符号**（早于本分支就躺在语料里，`xcrun swift-demangle` 同样原样吐回、拒绝解析——尾部 `fc` 非分配构造器与该 extension 上下文不自洽），换成生成的真实跨模块 extension initializer `$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC`（展开为 `(extension in ExampleAddons):ExampleBase.ExampleText.init<A where A: Swift.StringProtocol>(formatter:subject:)`），涉及 `NodeCacheTests` 与 `NodeStoreTests` 共 6 处；全部语料字面量此后统一经 `swift-demangle` 校验后再入库。**全量套件：410 tests / 19 suites 全绿** |
+| 2026-07-24 | Stage 5 上游配套：惰性 scope hook + transient 构造 SPI + `NodeReference` 结构性 API + 语料修正（commit `26db7a4`） | 下游（MachOSwiftSection）迁移过程中暴露的四个上游缺口，一并补齐。**① `NodePrinterTarget.pushTypeReferenceScope` 的节点参数改为 `@autoclosure () -> Node?`。** 问题：该 hook 是 main 上 `7fcb0f1` 引入的富 target 分组接缝（printer 在整段限定名打印外围推入 nominal 节点），签名收的是具体 `Node?`；store 路径要服务它就必须 `materializedNode` 物化一棵子树，而 `String` 这类忽略 scope 的 target 根本不读这个节点——等于让不用的人付物化代价，与「store 纯文本打印零分配」直接冲突。此前 07-24 的权宜做法是 store 路径一律传 `nil`（见上一条「以 `name as? Node` 桥接，store 路径传 nil」），代价是富 target 走 store 时永久丢失 scope identity。改为 autoclosure 后两难消解：默认实现与 `String` 从不求值（零成本，store 纯文本路径仍无物化），富 target 求值即拿到 `name.materializedNode`——**且只物化该 nominal reference 的小子树**，不是整棵符号树。**验证**：新增 `NodePrinterScopeTests`，其 `ScopeRecordingTarget` 精确镜像 `String` 的写入行为（保证打印流程逐字节同构）并额外记录 push/pop 事件序列；scope identity 以「被递交节点的 remangle 字符串」表达——这是结构性表征，跨表示相等当且仅当递交的子树结构相等，从而绕开 `Node` 与 `NodeReference` 无法直接比较的问题。对 5 个符号断言两条路径的输出文本与 scope 事件序列逐项相同，并断言至少递交过一个非 nil identity（防止「两边都传 nil 也能通过」的空洞绿灯）。**② `demangleAsNodeTransient` 增加 `symbolicReferenceResolver` 参数，并新增 `@_spi(Internals) Node.createTransient(...)` 工厂族。** 问题：Phase 3 的 cache-free 契约此前只覆盖 demangler 自身的构造点（全部走 `createNode(...)` + `internsLeaves: false`），但 symbolic reference 解析是**用户提供的闭包**在解析中途构造并回填节点——下游只能用公共的 `Node.create(...)`，而它必然写入 `NodeCache.shared`。结果是：一旦启用 symbolic reference（MachOSwiftSection 解析 mach-o 内嵌符号引用的常规路径），批量管线的 cache 增长归零成果当场失效。补齐后 transient 入口可直接透传 resolver，resolver 内部用 `createTransient` 构造 splice 节点，全链路不碰全局 cache、不取全局锁。`createTransient` 覆盖 `create` 的五个重载形态（contents / inlineChildren / 单 child / text / index），文档明确标注返回节点**非 canonical**（结构相等者是不同实例，`===` 共享假设不成立）。**③ `NodeReference` 三个结构性 API。** `init(interning:)`：把单棵外部树（瞬态 demangle 结果或手工合成树）interning 进一个**私有 mini store** 并引用其根——reference 持有 store 即保活，值自足且 `Sendable`，适合「值的生命周期长于源树」的持有场景；文档同时指明批量场景仍应直接驱动 `NodeStoreBuilder`，否则每棵树一个 arena，白丢跨符号去重。`structurallyEquals(_ other: NodeReference)`：同 store 直接比索引即得答案（hash-consing 使索引相等 ⇔ 结构相等，O(1)），跨 store 才走双树遍历，text 同样字节优先、回退 `String ==` 保 Unicode 规范等价——与既有的 `structurallyEquals(_ node: Node)` 语义完全对齐。`structuralHash(into:)`：与跨 store 结构相等自洽的结构哈希（kind + contents 判别位 + children 数 + 递归）。**为什么不能直接用固有 `Hashable`**：`NodeReference` 的 `hash(into:)` 组合的是 `ObjectIdentifier(store)` + 索引（store 身份基底），跨 store 的结构相等键会被劈成两个桶；下游那些「按节点结构做字典键、但内部存 reference」的值类型需要的正是这个可显式调用的结构哈希构件。**④ 语料修正：`$s7SwiftUI4TextV_10FoundationE9formatterAcA20LocalizedStringStyleV_xtcSyRzlufc` 是无效符号**（早于本分支就躺在语料里，`xcrun swift-demangle` 同样原样吐回、拒绝解析——尾部 `fc` 非分配构造器与该 extension 上下文不自洽），换成生成的真实跨模块 extension initializer `$s11ExampleBase0A4TextV0A6AddonsE9formatter7subjectAcA0A5StyleV_xtcSyRzlufC`（展开为 `(extension in ExampleAddons):ExampleBase.ExampleText.init<A where A: Swift.StringProtocol>(formatter:subject:)`），涉及 `NodeCacheTests` 与 `NodeStoreTests` 共 6 处；全部语料字面量此后统一经 `swift-demangle` 校验后再入库。**全量套件：410 tests / 19 suites 全绿** |
