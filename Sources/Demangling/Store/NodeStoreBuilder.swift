@@ -418,31 +418,52 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         return Int(truncatingIfNeeded: combined)
     }
 
-    private func textLocationMatches(_ location: TextLocation, utf8Bytes: [UInt8]) -> Bool {
-        guard Int(location.length) == utf8Bytes.count else { return false }
+    /// FNV-1a over a string's UTF-8 without materializing an array: native
+    /// `String`s (large and small) vend contiguous storage, so the fast path
+    /// hashes a borrowed buffer; only non-contiguous (bridged) strings fall
+    /// back to iterating the view (proposal 0008, B3).
+    private static func hashOfText(_ textValue: String) -> Int {
+        let utf8View = textValue.utf8
+        if let contiguousHash = utf8View.withContiguousStorageIfAvailable({ buffer in
+            hashOfTextBytes(buffer)
+        }) {
+            return contiguousHash
+        }
+        return hashOfTextBytes(utf8View)
+    }
+
+    private func textLocationMatches(_ location: TextLocation, textValue: String) -> Bool {
+        let length = Int(location.length)
+        guard length == textValue.utf8.count else { return false }
         let start = Int(location.offset)
-        return textBytes[start ..< start + utf8Bytes.count].elementsEqual(utf8Bytes)
+        let storedBytes = textBytes[start ..< start + length]
+        if let contiguousResult = textValue.utf8.withContiguousStorageIfAvailable({ buffer in
+            storedBytes.elementsEqual(buffer)
+        }) {
+            return contiguousResult
+        }
+        return storedBytes.elementsEqual(textValue.utf8)
     }
 
     private mutating func internText(_ textValue: String) -> TextLocation {
         if (uniqueTexts.count &+ 1) &* 4 >= textSlots.count &* 3 {
             growTextSlots()
         }
-        let utf8Bytes = Array(textValue.utf8)
+        let utf8Length = textValue.utf8.count
         let mask = textSlots.count - 1
-        var slot = Self.hashOfTextBytes(utf8Bytes) & mask
+        var slot = Self.hashOfText(textValue) & mask
         while true {
             let existing = textSlots[slot]
             if existing == Self.emptySlot {
-                precondition(textBytes.count + utf8Bytes.count <= UInt32.max, "NodeStore text buffer exceeded UInt32 offset space")
-                let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Bytes.count))
-                textBytes.append(contentsOf: utf8Bytes)
+                precondition(textBytes.count + utf8Length <= UInt32.max, "NodeStore text buffer exceeded UInt32 offset space")
+                let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Length))
+                textBytes.append(contentsOf: textValue.utf8)
                 textSlots[slot] = UInt32(uniqueTexts.count)
                 uniqueTexts.append(location)
                 return location
             }
             let existingLocation = uniqueTexts[Int(existing)]
-            if textLocationMatches(existingLocation, utf8Bytes: utf8Bytes) {
+            if textLocationMatches(existingLocation, textValue: textValue) {
                 return existingLocation
             }
             slot = (slot + 1) & mask
