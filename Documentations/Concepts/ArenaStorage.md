@@ -268,4 +268,4 @@ first === second   // false —— 但不是同一个实例
 - `Store/NodeReference.swift` — 16 字节值句柄（store 引用 + 下标），行为对齐 `Node`
 - `Store/DemanglingNode.swift` — 让 printer / TypeDecoder 同时支持两种表示的只读协议
 
-完整记录：[../NodeStoreArena.md](../NodeStoreArena.md)、提案 `evolution/0001-node-store-arena.md`
+完整记录：[../NodeStoreArena.md](../NodeStoreArena.md)、提案 `Evolutions/0001-node-store-arena.md`

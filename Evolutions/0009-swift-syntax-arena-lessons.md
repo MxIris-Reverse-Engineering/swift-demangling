@@ -5,9 +5,9 @@
 - **Status**: Draft
 - **Date**: 2026-08-07
 - **Branch**: TBD（未开工）
-- **Related**: `evolution/0001-node-store-arena.md`（arena 本体；本条缓解其「取舍与
+- **Related**: `Evolutions/0001-node-store-arena.md`（arena 本体；本条缓解其「取舍与
   影响面」记录的跨 store 混用短板，并为其 Phase 4 / 分片合并路线留下参照）；
-  `evolution/0008-span-borrowed-views.md`（同源审读的另一半：B2 的 unmanaged 句柄
+  `Evolutions/0008-span-borrowed-views.md`（同源审读的另一半：B2 的 unmanaged 句柄
   模式在本条 Motivation 的对照中获得原厂确证）；
   `Documentations/NodeStoreArena.md`（实现说明，落地时同步更新）
 

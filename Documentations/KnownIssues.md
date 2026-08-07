@@ -17,7 +17,7 @@
 - **暂缓决策**：下游消费方（MachOSwiftSection 等）当前未使用 `TypeDecoder` 的任何接口，
   故 TypeDecoder 范围内的健壮性问题本轮不修（维护者 2026-07-29 决定）。
 - **2026-07-30 更新**：原第 3 条（调用方构造的环状 `Node`）已修复并移除——`NodeBuilder`
-  现在对外只交付冻结节点，环从公开 API 不可构造（见 `evolution/0003-review-hardening.md`）。
+  现在对外只交付冻结节点，环从公开 API 不可构造（见 `Evolutions/0003-review-hardening.md`）。
   同轮新增第 3–5 条（打印缓存回放越过深度上限、2MB 探针窗口、TypeDecoder store 路径 O(k²)）。
 - **2026-08-02 更新**：evolution 0006 的横向排查（按路径计价的整树遍历）新增第 6 条
   （TypeDecoder 在共享 DAG 上按出现次数解码）。
@@ -287,7 +287,7 @@ builder 插入即 hash-consing，**同一 arena 内「索引相同」就是「�
 而 `NodeStore.NodeIndex(rawValue:)` 的初始化器是 `@usableFromInline`、**非 public**，
 外部无法凭空构造索引；要让一个合法 store 自然产出 21 亿的索引，在 watchOS 上需约 25GB 内存。
 
-需要区分两种机制：`evolution/0004` 禁止的是 `Int(UInt32.max)` 这类**常量**写法——它在
+需要区分两种机制：`Evolutions/0004` 禁止的是 `Int(UInt32.max)` 这类**常量**写法——它在
 常量折叠期就把整个函数体缩减为无条件 trap，且构建全绿无诊断；而 `Int(变量)` 只在运行时
 值超范围才 trap。因此 `DefectRegressionTests.librarySourceAvoidsWordSizeDependentIntegerConversions`
 只扫三个字面量，与其目的是匹配的，并非「守卫太窄」。
@@ -298,7 +298,7 @@ builder 插入即 hash-consing，**同一 arena 内「索引相同」就是「�
 在共享 DAG 上按路径数（2^N）而非节点数计价。
 
 **裁决：对枚举类操作是误报，刻意设计。** 这些操作枚举的是**逻辑树**，出现次数就是
-正确答案；`evolution/0006` 的横向排查已明确将其归入「按出现次数是文档化语义」一类。
+正确答案；`Evolutions/0006` 的横向排查已明确将其归入「按出现次数是文档化语义」一类。
 
 **下列例外曾是真实缺陷，已于 2026-08-02 修复（evolution 0007），勿再按本条跳过**：
 `first(of:)` 与 `contains(_:)` 是**短路查询**，只回答「第一个是谁 / 有没有」，出现次数
@@ -320,8 +320,8 @@ builder 插入即 hash-consing，**同一 arena 内「索引相同」就是「�
 
 **裁决：属实，但是刻意的、已文档化的决策，不回退。** 动机是实测的指数级重建
 （`Rewriter` 在 58 节点图上 720,891 次访问；`copy()` 把 48 唯一节点的真实符号展开成
-131,070 个节点）。回退等于把指数爆炸放回公开 API。记录在 `evolution/0003` 与
-`AGENTS.md`；`evolution/0001` 的「Source Compatibility」一节已于本轮更正为如实列出
+131,070 个节点）。回退等于把指数爆炸放回公开 API。记录在 `Evolutions/0003` 与
+`AGENTS.md`；`Evolutions/0001` 的「Source Compatibility」一节已于本轮更正为如实列出
 四处破坏性变更。`Node.copy()` 的文档首句已改写，明确「every node」指唯一节点而非每次出现。
 
 ## N8. 三处深度上限下调（remangler 1024→384、TypeDecoder 1024→160、printer 768→512）

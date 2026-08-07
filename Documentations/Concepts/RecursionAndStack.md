@@ -114,7 +114,7 @@ try mangleAsString(node)      // 超限 → 抛 ManglingError
   进到节点树里。
 - **SIGSEGV**：第 3 节那些崩溃边界。
 
-顺带一个 32 位平台的坑（`evolution/0004`）：**永远不要把边界检查写成 `Int(UInt32.max)`**。
+顺带一个 32 位平台的坑（`Evolutions/0004`）：**永远不要把边界检查写成 `Int(UInt32.max)`**。
 watchOS 上 `Int` 是 32 位，这个转换在**常量折叠阶段**就溢出，编译器会把整个函数缩减成
 一条无条件 trap，而构建全绿、没有任何警告。要写成异构比较 `count <= UInt32.max`。
 这条已由源码扫描测试守着。

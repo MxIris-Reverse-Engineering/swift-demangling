@@ -5,8 +5,8 @@
 - **Status**: Implemented
 - **Date**: 2026-08-02
 - **Branch**: `feature/node-store`
-- **Related**: `evolution/0003-review-hardening.md`（同一 PR 上一轮 review 给整树遍历
-  加 memo 的那批，本条正是那批漏掉的一处）；`evolution/0004-32bit-store-guards.md`
+- **Related**: `Evolutions/0003-review-hardening.md`（同一 PR 上一轮 review 给整树遍历
+  加 memo 的那批，本条正是那批漏掉的一处）；`Evolutions/0004-32bit-store-guards.md`
   （同一轮复审的上一条修复）
 
 ## Summary
@@ -37,7 +37,7 @@
   这几条消费者路径。
 - **与 main 对比**：main 上这里是纯递归——没有 memo、没有 `===` 快路径，同样
   指数级，深树还会先爆栈。本 PR 已将它迭代化并加了 `===` 快路径（净改进），
-  给三个兄弟遍历补 memo 时漏掉了这一个（`evolution/0003` 的 memo 名单里没有它，
+  给三个兄弟遍历补 memo 时漏掉了这一个（`Evolutions/0003` 的 memo 名单里没有它，
   也没有说明豁免理由——因为不是豁免，是遗漏）。
 - **横向排查**：四个成对遍历（`Node+Hashable.swift:122`、`NodeReference.swift`
   两处、本处）已全部带 memo，本条是最后一个。同为「遍历成本按路径计」家族的

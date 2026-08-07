@@ -42,11 +42,12 @@
 | [NodeStoreArena.md](NodeStoreArena.md) | `NodeStore` arena 式紧凑存储。节点平铺进连续缓冲，每节点 12 字节、无对象头、无引用计数；printer 与 TypeDecoder 泛型化后可零物化直读。 | 做整个二进制的批量索引、或要动 `Store/` 下的代码时。 | [ArenaStorage](Concepts/ArenaStorage.md) |
 | [StackSafety.md](StackSafety.md) | 栈安全模型：与上游同构的「8MB 大栈 + 固定深度上限」，加上引擎之外全部整树遍历的迭代化（含 `Node` 的迭代式析构）。也记录了曾短暂采用、后因调试器挂死 / 优先级反转 / 工作量不受限而撤回的 `StackBudget` 方案。 | 新增递归、调整深度上限、或排查深符号崩溃时。**动上限前必读**。 | [RecursionAndStack](Concepts/RecursionAndStack.md) |
 | [KnownIssues.md](KnownIssues.md) | code-review 的**裁决记录**，两部分：① 已确认真实存在但暂缓修复的 6 条（含复现方式与修法方向）；② 判定为误报或刻意设计的 8 条（N1–N8）。 | 每次 code-review 之前——已裁决且理由仍成立的发现直接跳过，不必重新推导。 | [TraversalCost](Concepts/TraversalCost.md) |
+| [AlignmentGaps.md](AlignmentGaps.md) | 与上游 Swift 编译器 `Demangling` 源码的对齐缺口追踪（基准 `swift-6.3.2-RELEASE`，审计日期 2026-06-20，对照的是 `main`）。 | 跟进上游新增 kind、或排查与官方 demangler 行为不一致时。 | — |
 
 ## 其他位置的文档
 
-- **`evolution/`** — 演进提案（设计意图 + 决策日志）。上面四篇专题文档是结论，这里是
-  过程。状态总表、演进愿景与流程约定见 [`evolution/README.md`](../evolution/README.md)：
+- **`Evolutions/`** — 演进提案（设计意图 + 决策日志）。上面四篇专题文档是结论，这里是
+  过程。状态总表、演进愿景与流程约定见 [`Evolutions/README.md`](../Evolutions/README.md)：
 
   | 提案 | 一句话 |
   |---|---|
@@ -60,8 +61,6 @@
   | `0008-span-borrowed-views.md` | **Draft**。Span 借用视图（双路径）：demangler 扫描器改为 `Span<UInt8>` 字节扫描，store 读路径消除逐 child ARC 与文本视图的 owner retain。`Span` 核心类型已向后部署（deployment target 不动）；被 macOS 26 卡的 `UTF8Span` / `InlineArray` / `.span` 属性与被编译器卡的 `@_lifetime` 直接返回式**不绕开，全部采用**——新特性路径 + 回退路径两套并行，`#available` / `hasFeature` 双轴门控。 |
   | `0009-swift-syntax-arena-lessons.md` | **Draft**。对 swift-syntax 最新 arena 实现的对照审读产物：builder 按语料常数预估容量（消 realloc 拷贝与内存尖峰）、`NodeIndex` 带 debug generation tag（把跨 store 误用从静默读错变成确定性 trap）；另存档三条记录性结论（合并语义参照、文本直达 arena 的阻塞点、惰性 path 层）。 |
 
-- **`docs/AlignmentGaps.md`**（仓库根） — 与上游 Swift 编译器 `Demangling` 源码的对齐
-  缺口追踪（基准 `swift-6.3.2-RELEASE`，审计日期 2026-06-20，对照的是 `main`）。
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」
   看它。

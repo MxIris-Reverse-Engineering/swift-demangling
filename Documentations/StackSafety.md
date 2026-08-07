@@ -3,7 +3,7 @@
 日期：2026-07-29（首版 2026-07-28 采用按剩余栈字节的 `StackBudget` 方案，后按 review
 结论撤回，见「曾经的方案与撤回原因」；2026-08-02 三个深度上限回退为上游值）
 
-对应提案：`evolution/0002-stack-safety.md`
+对应提案：`Evolutions/0002-stack-safety.md`
 概念背景：[Concepts/RecursionAndStack.md](Concepts/RecursionAndStack.md)（栈为什么会爆、线程栈
 大小、trap 与 SIGSEGV 的区别）。词条速查见 [Glossary.md](Glossary.md)。
 

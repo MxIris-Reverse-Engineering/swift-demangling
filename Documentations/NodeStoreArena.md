@@ -2,7 +2,7 @@
 
 日期：2026-07-27（Phase 1–3 已落地）
 
-对应提案：`evolution/0001-node-store-arena.md`
+对应提案：`Evolutions/0001-node-store-arena.md`
 前置优化：[SubtreeInterning.md](SubtreeInterning.md)（全子树 hash-consing）
 概念背景：[Concepts/ArenaStorage.md](Concepts/ArenaStorage.md)（class 的 48 字节都花在哪、arena /
 bump allocator / 物化是什么）。词条速查见 [Glossary.md](Glossary.md)。

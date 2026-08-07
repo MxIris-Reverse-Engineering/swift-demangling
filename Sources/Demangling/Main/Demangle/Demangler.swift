@@ -1459,7 +1459,7 @@ extension Demangler {
         case "D": return try createNode(kind: .typeMetadataDemanglingCache, child: require(pop(kind: .type)))
         // Apple's closed toolchain demangler accepts these metatype forms that the open-source
         // lib/Demangling source omits: lowercase 'd' (same node as 'D') and 'R'
-        // (TypeMetadataMangledNameRef). Real Apple symbols depend on them — see docs/AlignmentGaps.md.
+        // (TypeMetadataMangledNameRef). Real Apple symbols depend on them — see Documentations/AlignmentGaps.md.
         case "d": return try createNode(kind: .typeMetadataDemanglingCache, child: require(pop(kind: .type)))
         case "R": return try createNode(kind: .typeMetadataMangledNameRef, child: require(pop(kind: .type)))
         case "f": return try createNode(kind: .fullTypeMetadata, child: require(pop(kind: .type)))

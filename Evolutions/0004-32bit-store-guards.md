@@ -5,7 +5,7 @@
 - **Status**: Implemented
 - **Date**: 2026-08-02
 - **Branch**: `feature/node-store`
-- **Related**: `evolution/0003-review-hardening.md`（同一 PR 的上一轮 review）；
+- **Related**: `Evolutions/0003-review-hardening.md`（同一 PR 的上一轮 review）；
   commit `06a423c`（同文件上一处 32-bit 问题——哈希混合常量——的修复）
 
 ## Summary

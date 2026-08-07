@@ -5,7 +5,7 @@
 - **Status**: Implemented
 - **Date**: 2026-08-02
 - **Branch**: `feature/node-store`
-- **Related**: `evolution/0006-interntree-and-demangler-postpass-memo.md`（本条修的是
+- **Related**: `Evolutions/0006-interntree-and-demangler-postpass-memo.md`（本条修的是
   0006 横向排查**分类错误**留下的缺口）；`Documentations/KnownIssues.md` N6 / 第 1 条
 
 ## Summary

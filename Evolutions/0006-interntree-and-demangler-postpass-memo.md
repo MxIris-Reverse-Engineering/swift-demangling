@@ -5,9 +5,9 @@
 - **Status**: Implemented
 - **Date**: 2026-08-02
 - **Branch**: `feature/node-store`
-- **Related**: `evolution/0005-remangler-deepequals-memo.md`（同族上一条，其「横向排查」
+- **Related**: `Evolutions/0005-remangler-deepequals-memo.md`（同族上一条，其「横向排查」
   一节点名 `internTree` 是最后的单树遍历缺口——本条兑现）；
-  `evolution/0003-review-hardening.md`（给重建类遍历补 memo 的那批）
+  `Evolutions/0003-review-hardening.md`（给重建类遍历补 memo 的那批）
 
 ## Summary
 

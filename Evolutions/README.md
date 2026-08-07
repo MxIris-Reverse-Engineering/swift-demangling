@@ -13,7 +13,7 @@
 
 1. **正确性与上游对齐（持续，不可让步）**。输出与 Swift 官方 demangler 逐字节对齐
    （全量 dyld cache corpus oracle），`Node.Kind` 跟进 Apple 工具链演进（缺口追踪
-   在 `docs/AlignmentGaps.md`）。每一条优化提案的验收标准里都有「产出逐字节零差异」
+   在 `Documentations/AlignmentGaps.md`）。每一条优化提案的验收标准里都有「产出逐字节零差异」
    ——性能与内存的所有收益，都不允许用输出偏差换。
 2. **内存形态：从对象树到符号数据库（0001 → 0008 → 0009 → Phase 4）**。已走过的
    路：class 树（48 字节/节点、逐节点 malloc）→ 全子树 interning（驻留 ÷3，0001 的

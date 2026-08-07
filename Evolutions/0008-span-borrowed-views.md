@@ -6,7 +6,7 @@
 - **Date**: 2026-08-07
 - **Last Updated**: 2026-08-07
 - **Branch**: TBD（未开工）
-- **Related**: `evolution/0001-node-store-arena.md`（arena 本体；本条兑现
+- **Related**: `Evolutions/0001-node-store-arena.md`（arena 本体；本条兑现
   `Documentations/NodeStoreArena.md` 「后续方向」中的 **`Span` 借用视图**一项）；
   `Documentations/Concepts/ArenaStorage.md`（概念背景：class 节点的成本都花在哪）
 
