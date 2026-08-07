@@ -97,8 +97,222 @@ public final class NodeStore: Sendable {
     func text(offset: UInt32, length: UInt32) -> String {
         let start = Int(offset)
         let end = start + Int(length)
+        // Every stored text was interned from a whole `String.utf8` payload,
+        // so any (offset, length) a node payload produces is a complete valid
+        // UTF-8 text — unchecked materialization skips only the revalidation
+        // scan (proposal 0008, B1). Legacy runtimes keep the validating
+        // decode.
+        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
+            return textBytes[start ..< end].withUnsafeBufferPointer { buffer in
+                String(copying: UTF8Span(unchecked: buffer.span))
+            }
+        }
         return String(decoding: textBytes[start ..< end], as: UTF8.self)
     }
+
+    // MARK: - Shared node accessors
+
+    // The single implementations behind both handle types (`NodeReference`
+    // and the walk-internal `UnretainedNodeReference`) — a parallel copy on
+    // either handle would silently drift (proposal 0008, B2).
+
+    /// Raw index of the `position`-th child of `compact`.
+    @usableFromInline
+    func rawChildIndex(of compact: CompactNode, at position: Int) -> UInt32 {
+        switch compact.payloadKind {
+        case .oneChild:
+            precondition(position == 0, "Child index out of range")
+            return compact.payloadWord0
+        case .twoChildren:
+            switch position {
+            case 0: return compact.payloadWord0
+            case 1: return compact.payloadWord1
+            default: preconditionFailure("Child index out of range")
+            }
+        case .manyChildren:
+            precondition(position >= 0 && position < Int(compact.payloadWord1), "Child index out of range")
+            return edges[Int(compact.payloadWord0) + position]
+        case .none, .index, .text:
+            preconditionFailure("Child index out of range for a node without children")
+        }
+    }
+
+    /// Span-reading counterpart of ``rawChildIndex(of:at:)`` for walks that
+    /// borrowed the buffers up front (`withSpans(_:)`). Keep the two switches
+    /// in lockstep — they are the same resolution rule over two buffer
+    /// representations.
+    @usableFromInline
+    static func rawChildIndex(of compact: CompactNode, at position: Int, edges edgeSpan: Span<UInt32>) -> UInt32 {
+        switch compact.payloadKind {
+        case .oneChild:
+            precondition(position == 0, "Child index out of range")
+            return compact.payloadWord0
+        case .twoChildren:
+            switch position {
+            case 0: return compact.payloadWord0
+            case 1: return compact.payloadWord1
+            default: preconditionFailure("Child index out of range")
+            }
+        case .manyChildren:
+            precondition(position >= 0 && position < Int(compact.payloadWord1), "Child index out of range")
+            return edgeSpan[Int(compact.payloadWord0) + position]
+        case .none, .index, .text:
+            preconditionFailure("Child index out of range for a node without children")
+        }
+    }
+
+    /// The index payload of `compact`, if it carries one.
+    @usableFromInline
+    func indexPayload(of compact: CompactNode) -> UInt64? {
+        guard case .index = compact.payloadKind else { return nil }
+        return UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32)
+    }
+
+    /// The contents of `compact` in exactly the form ``Node/contents``
+    /// reports them — the single re-encoding point shared by
+    /// `NodeReference.nodeContents` and the structural-digest walk, kept
+    /// single so it cannot drift from `Node.hash(into:)`'s encoding.
+    ///
+    /// Deliberately reports `.none` for `.dependentGenericParamType` (whose
+    /// name ``textOfNode(at:)`` synthesizes): `Node` stores depth and index
+    /// as children there, so its `contents` is `.none` and so must this.
+    @usableFromInline
+    func contents(of compact: CompactNode) -> Node.Contents {
+        switch compact.payloadKind {
+        case .text:
+            return .text(text(offset: compact.payloadWord0, length: compact.payloadWord1))
+        case .index:
+            return .index(UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
+        case .none, .oneChild, .twoChildren, .manyChildren:
+            return .none
+        }
+    }
+
+    /// Text of the node at `rawIndex` in exactly the form `Node.text` reports
+    /// it: stored text for `.text` payloads, plus the synthesized generic
+    /// parameter name for `.dependentGenericParamType` (which stores depth and
+    /// index as children; the printer relies on the synthesis).
+    func textOfNode(at rawIndex: UInt32) -> String? {
+        let compact = compactNode(at: rawIndex)
+        if case .text = compact.payloadKind {
+            return text(offset: compact.payloadWord0, length: compact.payloadWord1)
+        }
+        if compact.kind == .dependentGenericParamType {
+            guard compact.childCount >= 2,
+                  let depth = indexPayload(of: compactNode(at: rawChildIndex(of: compact, at: 0))),
+                  let parameterIndex = indexPayload(of: compactNode(at: rawChildIndex(of: compact, at: 1)))
+            else { return nil }
+            return genericParameterName(depth: depth, index: parameterIndex)
+        }
+        return nil
+    }
+
+    /// Borrows the stored text bytes of the node at `rawIndex` (proposal
+    /// 0008, B1). Returns nil — without calling `body` — when the node stores
+    /// no text; `.dependentGenericParamType`'s synthesized name is not stored
+    /// text (use ``textOfNode(at:)`` for the composed form).
+    func withTextUTF8<Result>(at rawIndex: UInt32, _ body: (Span<UInt8>) throws -> Result) rethrows -> Result? {
+        let compact = compactNode(at: rawIndex)
+        guard case .text = compact.payloadKind else { return nil }
+        let start = Int(compact.payloadWord0)
+        let end = start + Int(compact.payloadWord1)
+        return try textBytes[start ..< end].withUnsafeBufferPointer { buffer in
+            try body(buffer.span)
+        }
+    }
+
+    /// Allocation-free text comparison against an ASCII needle, with the
+    /// `String`-comparison fallback for non-ASCII needles (Unicode canonical
+    /// equivalence) and for nodes whose text is synthesized rather than
+    /// stored.
+    func nodeTextMatches(at rawIndex: UInt32, expected: String) -> Bool {
+        let expectedUTF8 = expected.utf8
+        guard expectedUTF8.allSatisfy({ $0 < 0x80 }) else {
+            return textOfNode(at: rawIndex) == expected
+        }
+        let storedByteComparison = withTextUTF8(at: rawIndex) { spanBytes -> Bool in
+            guard spanBytes.count == expectedUTF8.count else { return false }
+            var byteOffset = 0
+            for expectedByte in expectedUTF8 {
+                guard spanBytes[byteOffset] == expectedByte else { return false }
+                byteOffset += 1
+            }
+            return true
+        }
+        return storedByteComparison ?? (textOfNode(at: rawIndex) == expected)
+    }
+
+    // MARK: - Buffer borrows (proposal 0008, B2)
+
+    /// Borrows the three flat buffers at once for a tight read loop, hoisting
+    /// the class-property loads out of the loop. Axis-1 dual path: modern
+    /// runtimes take the `.span` properties directly, older ones bridge
+    /// through `withUnsafeBufferPointer`.
+    func withSpans<Result>(_ body: (Span<CompactNode>, Span<UInt32>, Span<UInt8>) throws -> Result) rethrows -> Result {
+        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
+            // Local CoW copies (three retains, no element copies) anchor the
+            // buffers for the spans' scope — a span taken straight off a
+            // class property is scoped to the property access and cannot even
+            // reach the `body` call.
+            let nodesBuffer = nodes
+            let edgesBuffer = edges
+            let textBytesBuffer = textBytes
+            return try body(nodesBuffer.span, edgesBuffer.span, textBytesBuffer.span)
+        }
+        return try nodes.withUnsafeBufferPointer { nodeBuffer in
+            try edges.withUnsafeBufferPointer { edgeBuffer in
+                try textBytes.withUnsafeBufferPointer { textBuffer in
+                    try body(nodeBuffer.span, edgeBuffer.span, textBuffer.span)
+                }
+            }
+        }
+    }
+
+    #if hasFeature(Lifetimes)
+    /// Direct-return borrowed view of the string table (proposal 0008).
+    ///
+    /// Dual-gated on purpose: the `@_lifetime` spelling needs the `Lifetimes`
+    /// compiler feature, and the `.span` property the implementation returns
+    /// needs the macOS 26 runtime — on older runtimes use ``withSpans(_:)``
+    /// or the closure-style accessors. `nodesSpan()`/`edgesSpan()` stay
+    /// internal because `CompactNode` is not public API.
+    @_spi(Internals)
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
+    @_lifetime(borrow self)
+    public borrowing func textBytesSpan() -> Span<UInt8> {
+        // A span taken straight off the class property is scoped to that
+        // property access and may not leave the method; the local CoW copy
+        // (one retain, no element copies) anchors the shared buffer while the
+        // span is formed, and the override rebinds its dependence to `self`,
+        // which owns the same buffer through the immutable stored property —
+        // exactly the contract `@_lifetime(borrow self)` states.
+        let sharedBuffer = textBytes
+        let span = sharedBuffer.span
+        return _overrideLifetime(span, borrowing: self)
+    }
+
+    /// Internal direct-return borrow of the node buffer; see
+    /// ``textBytesSpan()`` for the gating and the lifetime-override
+    /// reasoning.
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
+    @_lifetime(borrow self)
+    borrowing func nodesSpan() -> Span<CompactNode> {
+        let sharedBuffer = nodes
+        let span = sharedBuffer.span
+        return _overrideLifetime(span, borrowing: self)
+    }
+
+    /// Internal direct-return borrow of the edge buffer; see
+    /// ``textBytesSpan()`` for the gating and the lifetime-override
+    /// reasoning.
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
+    @_lifetime(borrow self)
+    borrowing func edgesSpan() -> Span<UInt32> {
+        let sharedBuffer = edges
+        let span = sharedBuffer.span
+        return _overrideLifetime(span, borrowing: self)
+    }
+    #endif
 
     // MARK: - Materialization
 

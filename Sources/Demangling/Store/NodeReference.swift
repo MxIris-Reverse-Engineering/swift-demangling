@@ -104,22 +104,18 @@ public struct NodeReference: Sendable {
     /// `[depth, index]` as children rather than text) the generic parameter
     /// name is synthesized, matching what the printer expects.
     public var text: String? {
-        let compact = compactNode
-        if case .text = compact.payloadKind {
-            return store.text(offset: compact.payloadWord0, length: compact.payloadWord1)
-        }
-        if compact.kind == .dependentGenericParamType {
-            let childrenView = children
-            guard let depth = childrenView.at(0)?.index, let parameterIndex = childrenView.at(1)?.index else { return nil }
-            return genericParameterName(depth: depth, index: parameterIndex)
-        }
-        return nil
+        store.textOfNode(at: nodeIndex.rawValue)
     }
 
     /// Zero-copy view of this node's text as UTF-8 bytes in the store's
     /// string table. Only covers text physically stored in the table;
     /// `.dependentGenericParamType`'s synthesized name is not included
     /// (use `text` for the composed form).
+    ///
+    /// Retained for source stability. New code should prefer
+    /// ``withTextUTF8(_:)`` (or, on modern runtimes, ``textUTF8Span()``):
+    /// the slice carries an owner reference, so every access pays a
+    /// retain/release the borrowed forms avoid.
     public var textUTF8: ArraySlice<UInt8>? {
         let compact = compactNode
         guard case .text = compact.payloadKind else { return nil }
@@ -127,30 +123,56 @@ public struct NodeReference: Sendable {
         return store.textBytes[start ..< start + Int(compact.payloadWord1)]
     }
 
+    /// Borrows this node's text as UTF-8 bytes in the store's string table
+    /// (proposal 0008, B1) — the all-platform baseline form.
+    ///
+    /// Returns nil, without calling `body`, when the node stores no text.
+    /// Like ``textUTF8``, this covers only text physically stored in the
+    /// table; `.dependentGenericParamType`'s synthesized name is not stored
+    /// text (use ``text`` for the composed form).
+    public func withTextUTF8<Result>(_ body: (Span<UInt8>) throws -> Result) rethrows -> Result? {
+        try store.withTextUTF8(at: nodeIndex.rawValue, body)
+    }
+
+    #if hasFeature(Lifetimes)
+    /// Direct-return borrowed view of this node's stored text bytes
+    /// (proposal 0008, B1).
+    ///
+    /// Dual-gated: the `@_lifetime` spelling needs the `Lifetimes` compiler
+    /// feature, and the `.span` property the implementation reads needs the
+    /// macOS 26 runtime — on older runtimes use ``withTextUTF8(_:)``. SPI
+    /// consumers accept that this API surface may be absent on a compiler
+    /// without the feature.
+    @_spi(Internals)
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
+    @_lifetime(borrow self)
+    public borrowing func textUTF8Span() -> Span<UInt8>? {
+        let compact = compactNode
+        guard case .text = compact.payloadKind else { return nil }
+        let start = Int(compact.payloadWord0)
+        // Local CoW copy anchors the buffer while the span forms; the
+        // override rebinds the dependence to `self`, which keeps the store —
+        // and with it the same buffer — alive. See
+        // `NodeStore.textBytesSpan()` for the full reasoning.
+        let sharedBuffer = store.textBytes
+        let span = sharedBuffer.span.extracting(start ..< start + Int(compact.payloadWord1))
+        return _overrideLifetime(span, borrowing: self)
+    }
+    #endif
+
     /// Allocation-free witness: compares string-table bytes directly for
     /// ASCII needles (every kind/sugar check the printer performs), falling
     /// back to `String` comparison for non-ASCII to preserve Unicode
     /// canonical-equivalence semantics.
     public func isIdentifier(desired: String) -> Bool {
         guard kind == .identifier else { return false }
-        return textMatches(desired)
+        return store.nodeTextMatches(at: nodeIndex.rawValue, expected: desired)
     }
 
     /// Allocation-free witness, same strategy as `isIdentifier(desired:)`.
     public var isSwiftModule: Bool {
         guard kind == .module else { return false }
-        return textMatches(stdlibName)
-    }
-
-    private func textMatches(_ expected: String) -> Bool {
-        guard let bytes = textUTF8 else {
-            return text == expected
-        }
-        let expectedUTF8 = expected.utf8
-        guard expectedUTF8.allSatisfy({ $0 < 0x80 }) else {
-            return text == expected
-        }
-        return bytes.elementsEqual(expectedUTF8)
+        return store.nodeTextMatches(at: nodeIndex.rawValue, expected: stdlibName)
     }
 
     /// The contents in exactly the form ``Node/contents`` reports them.
@@ -167,15 +189,7 @@ public struct NodeReference: Sendable {
     /// as children, so `Node` reports `.none` for it and so must this.
     @usableFromInline
     var nodeContents: Node.Contents {
-        let compact = compactNode
-        switch compact.payloadKind {
-        case .text:
-            return .text(store.text(offset: compact.payloadWord0, length: compact.payloadWord1))
-        case .index:
-            return .index(UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
-        case .none, .oneChild, .twoChildren, .manyChildren:
-            return .none
-        }
+        store.contents(of: compactNode)
     }
 
     /// The index contents, if this node carries an index.
@@ -232,52 +246,62 @@ public struct NodeReference: Sendable {
     /// equal are skipped, so a maximally shared DAG costs its node count, not
     /// its path count.
     public func structurallyEquals(_ node: Node) -> Bool {
-        struct VisitedPair: Hashable {
-            let referenceIndex: UInt32
-            let nodeIdentity: ObjectIdentifier
-        }
-        var visitedPairs = Set<VisitedPair>()
-        var pendingPairs: [(reference: NodeReference, node: Node)] = [(self, node)]
+        store.withSpans { nodeSpan, edgeSpan, textSpan in
+            struct VisitedPair: Hashable {
+                let referenceIndex: UInt32
+                let nodeIdentity: ObjectIdentifier
+            }
+            var visitedPairs = Set<VisitedPair>()
+            var pendingPairs: [(rawIndex: UInt32, node: Node)] = [(nodeIndex.rawValue, node)]
 
-        while let pair = pendingPairs.popLast() {
-            // A pair seen once contributes nothing new: on a shared DAG the
-            // same (index, instance) pair recurs once per *path*, and every
-            // recurrence repeats the identical subtree comparison. Any
-            // mismatch below a repeated pair aborts the whole walk the first
-            // time, so skipping repeats never changes the outcome.
-            let visitedPair = VisitedPair(
-                referenceIndex: pair.reference.nodeIndex.rawValue,
-                nodeIdentity: ObjectIdentifier(pair.node)
-            )
-            guard visitedPairs.insert(visitedPair).inserted else { continue }
+            while let pair = pendingPairs.popLast() {
+                // A pair seen once contributes nothing new: on a shared DAG the
+                // same (index, instance) pair recurs once per *path*, and every
+                // recurrence repeats the identical subtree comparison. Any
+                // mismatch below a repeated pair aborts the whole walk the first
+                // time, so skipping repeats never changes the outcome.
+                let visitedPair = VisitedPair(
+                    referenceIndex: pair.rawIndex,
+                    nodeIdentity: ObjectIdentifier(pair.node)
+                )
+                guard visitedPairs.insert(visitedPair).inserted else { continue }
 
-            let compact = pair.reference.compactNode
-            guard compact.kind == pair.node.kind else { return false }
+                let compact = nodeSpan[Int(pair.rawIndex)]
+                guard compact.kind == pair.node.kind else { return false }
 
-            switch pair.node.contents {
-            case .none:
-                switch compact.payloadKind {
-                case .index, .text:
-                    return false
-                case .none, .oneChild, .twoChildren, .manyChildren:
-                    break
+                switch pair.node.contents {
+                case .none:
+                    switch compact.payloadKind {
+                    case .index, .text:
+                        return false
+                    case .none, .oneChild, .twoChildren, .manyChildren:
+                        break
+                    }
+                case .index(let indexValue):
+                    guard store.indexPayload(of: compact) == indexValue else { return false }
+                case .text(let textValue):
+                    guard case .text = compact.payloadKind else { return false }
+                    // Exact bytes, not `String ==`: see the doc comment.
+                    let textUTF8View = textValue.utf8
+                    guard Int(compact.payloadWord1) == textUTF8View.count else { return false }
+                    var byteOffset = Int(compact.payloadWord0)
+                    for expectedByte in textUTF8View {
+                        guard textSpan[byteOffset] == expectedByte else { return false }
+                        byteOffset += 1
+                    }
                 }
-            case .index(let indexValue):
-                guard pair.reference.index == indexValue else { return false }
-            case .text(let textValue):
-                guard case .text = compact.payloadKind else { return false }
-                // Exact bytes, not `String ==`: see the doc comment.
-                guard let bytes = pair.reference.textUTF8, bytes.elementsEqual(textValue.utf8) else { return false }
-            }
 
-            let referenceChildren = pair.reference.children
-            let nodeChildren = pair.node.children
-            guard referenceChildren.count == nodeChildren.count else { return false }
-            for (referenceChild, nodeChild) in zip(referenceChildren, nodeChildren) {
-                pendingPairs.append((referenceChild, nodeChild))
+                let nodeChildren = pair.node.children
+                guard compact.childCount == nodeChildren.count else { return false }
+                for childPosition in 0 ..< compact.childCount {
+                    pendingPairs.append((
+                        NodeStore.rawChildIndex(of: compact, at: childPosition, edges: edgeSpan),
+                        nodeChildren[childPosition]
+                    ))
+                }
             }
+            return true
         }
-        return true
     }
 
     /// Whether this subtree is structurally equal to another reference's
@@ -292,56 +316,65 @@ public struct NodeReference: Sendable {
     /// reason as the `Node` overload, and with the same proven-pair skip so a
     /// shared DAG costs its node count rather than its path count.
     ///
-    /// The same-store test sits inside the loop, but it can only ever fire on
-    /// the first pair: a reference's children always come from its own store, so
-    /// a cross-store comparison has store A on the left and store B on the right
-    /// at every level. It is kept in the loop only so the root case reads as one
-    /// rule rather than two.
+    /// The same-store case is answered before any walk starts: within one
+    /// store, hash-consing makes index equality coincide with structural
+    /// equality, and a reference's children always come from its own store,
+    /// so a cross-store comparison has store A on the left and store B on the
+    /// right at every level — the walk below never mixes.
     public func structurallyEquals(_ other: NodeReference) -> Bool {
-        struct VisitedPair: Hashable {
-            let leftIndex: UInt32
-            let rightIndex: UInt32
+        if store === other.store {
+            return nodeIndex == other.nodeIndex
         }
-        var visitedPairs = Set<VisitedPair>()
-        var pendingPairs: [(left: NodeReference, right: NodeReference)] = [(self, other)]
+        return store.withSpans { leftNodes, leftEdges, leftText in
+            other.store.withSpans { rightNodes, rightEdges, rightText in
+                struct VisitedPair: Hashable {
+                    let leftIndex: UInt32
+                    let rightIndex: UInt32
+                }
+                var visitedPairs = Set<VisitedPair>()
+                var pendingPairs: [(leftIndex: UInt32, rightIndex: UInt32)] = [(nodeIndex.rawValue, other.nodeIndex.rawValue)]
 
-        while let pair = pendingPairs.popLast() {
-            if pair.left.store === pair.right.store {
-                guard pair.left.nodeIndex == pair.right.nodeIndex else { return false }
-                continue
-            }
-            let visitedPair = VisitedPair(
-                leftIndex: pair.left.nodeIndex.rawValue,
-                rightIndex: pair.right.nodeIndex.rawValue
-            )
-            guard visitedPairs.insert(visitedPair).inserted else { continue }
+                while let pair = pendingPairs.popLast() {
+                    let visitedPair = VisitedPair(
+                        leftIndex: pair.leftIndex,
+                        rightIndex: pair.rightIndex
+                    )
+                    guard visitedPairs.insert(visitedPair).inserted else { continue }
 
-            let compact = pair.left.compactNode
-            let otherCompact = pair.right.compactNode
-            guard compact.kind == otherCompact.kind else { return false }
+                    let compact = leftNodes[Int(pair.leftIndex)]
+                    let otherCompact = rightNodes[Int(pair.rightIndex)]
+                    guard compact.kind == otherCompact.kind else { return false }
 
-            switch (compact.payloadKind, otherCompact.payloadKind) {
-            case (.text, .text):
-                // Exact bytes, not `String ==`: see the `Node` overload.
-                guard let bytes = pair.left.textUTF8, let otherBytes = pair.right.textUTF8,
-                      bytes.elementsEqual(otherBytes)
-                else { return false }
-            case (.index, .index):
-                guard pair.left.index == pair.right.index else { return false }
-            case (.text, _), (_, .text), (.index, _), (_, .index):
-                return false
-            default:
-                break
-            }
+                    switch (compact.payloadKind, otherCompact.payloadKind) {
+                    case (.text, .text):
+                        // Exact bytes, not `String ==`: see the `Node` overload.
+                        guard compact.payloadWord1 == otherCompact.payloadWord1 else { return false }
+                        let leftStart = Int(compact.payloadWord0)
+                        let rightStart = Int(otherCompact.payloadWord0)
+                        for byteOffset in 0 ..< Int(compact.payloadWord1) {
+                            guard leftText[leftStart + byteOffset] == rightText[rightStart + byteOffset] else { return false }
+                        }
+                    case (.index, .index):
+                        guard compact.payloadWord0 == otherCompact.payloadWord0,
+                              compact.payloadWord1 == otherCompact.payloadWord1
+                        else { return false }
+                    case (.text, _), (_, .text), (.index, _), (_, .index):
+                        return false
+                    default:
+                        break
+                    }
 
-            let selfChildren = pair.left.children
-            let otherChildren = pair.right.children
-            guard selfChildren.count == otherChildren.count else { return false }
-            for (selfChild, otherChild) in zip(selfChildren, otherChildren) {
-                pendingPairs.append((selfChild, otherChild))
+                    guard compact.childCount == otherCompact.childCount else { return false }
+                    for childPosition in 0 ..< compact.childCount {
+                        pendingPairs.append((
+                            NodeStore.rawChildIndex(of: compact, at: childPosition, edges: leftEdges),
+                            NodeStore.rawChildIndex(of: otherCompact, at: childPosition, edges: rightEdges)
+                        ))
+                    }
+                }
+                return true
             }
         }
-        return true
     }
 }
 
@@ -412,72 +445,85 @@ extension NodeReference: Hashable {
     }
 
     /// The reference half of the structural digest; see ``Node/structuralDigest()``.
+    ///
+    /// Walks raw indices over span-borrowed buffers (proposal 0008, B2): the
+    /// buffers are borrowed once at the entry, so the loop neither constructs
+    /// a `NodeReference` per child (a store retain/release each) nor reloads
+    /// the arrays through the class property on every access. Text contents
+    /// still materialize through `store.contents(of:)` — hashing the same
+    /// `String` values `Node.hash(into:)` hashes is what keeps the two
+    /// digests interchangeable.
     func structuralDigest() -> UInt64 {
-        let rootCompact = compactNode
-        let rootChildren = children
-        if rootChildren.isEmpty {
-            let leafHasher = Node.seededDigestHasher(kind: rootCompact.kind, contents: nodeContents, childCount: 0)
-            return UInt64(bitPattern: Int64(leafHasher.finalize()))
-        }
-
-        struct DigestFrame {
-            let reference: NodeReference
-            var hasher: Hasher
-            var nextChildIndex: Int
-        }
-
-        func seededHasher(for reference: NodeReference) -> Hasher {
-            Node.seededDigestHasher(
-                kind: reference.kind,
-                contents: reference.nodeContents,
-                childCount: reference.children.count
-            )
-        }
-
-        var digestByIndex: [UInt32: UInt64] = [:]
-        var frames: [DigestFrame] = [
-            DigestFrame(reference: self, hasher: seededHasher(for: self), nextChildIndex: 0),
-        ]
-        var lastCompletedDigest: UInt64 = 0
-        var pendingChildDigest: UInt64?
-
-        while var frame = frames.popLast() {
-            if let childDigest = pendingChildDigest {
-                frame.hasher.combine(childDigest)
-                pendingChildDigest = nil
+        let store = store
+        return store.withSpans { nodeSpan, edgeSpan, _ in
+            let rootCompact = nodeSpan[Int(nodeIndex.rawValue)]
+            if rootCompact.childCount == 0 {
+                let leafHasher = Node.seededDigestHasher(kind: rootCompact.kind, contents: store.contents(of: rootCompact), childCount: 0)
+                return UInt64(bitPattern: Int64(leafHasher.finalize()))
             }
 
-            let childrenView = frame.reference.children
-            var descended = false
-            while frame.nextChildIndex < childrenView.count {
-                let child = childrenView[frame.nextChildIndex]
-                frame.nextChildIndex += 1
-                let childIndex = child.nodeIndex.rawValue
-                if let knownDigest = digestByIndex[childIndex] {
-                    frame.hasher.combine(knownDigest)
-                } else if child.children.isEmpty {
-                    let leafHasher = seededHasher(for: child)
-                    let leafDigest = UInt64(bitPattern: Int64(leafHasher.finalize()))
-                    digestByIndex[childIndex] = leafDigest
-                    frame.hasher.combine(leafDigest)
-                } else {
-                    frames.append(frame)
-                    frames.append(DigestFrame(reference: child, hasher: seededHasher(for: child), nextChildIndex: 0))
-                    descended = true
-                    break
+            struct DigestFrame {
+                let rawIndex: UInt32
+                let childCount: Int
+                var hasher: Hasher
+                var nextChildIndex: Int
+            }
+
+            var digestByIndex: [UInt32: UInt64] = [:]
+            var frames: [DigestFrame] = [
+                DigestFrame(
+                    rawIndex: nodeIndex.rawValue,
+                    childCount: rootCompact.childCount,
+                    hasher: Node.seededDigestHasher(kind: rootCompact.kind, contents: store.contents(of: rootCompact), childCount: rootCompact.childCount),
+                    nextChildIndex: 0
+                ),
+            ]
+            var lastCompletedDigest: UInt64 = 0
+            var pendingChildDigest: UInt64?
+
+            while var frame = frames.popLast() {
+                if let childDigest = pendingChildDigest {
+                    frame.hasher.combine(childDigest)
+                    pendingChildDigest = nil
                 }
+
+                let frameCompact = nodeSpan[Int(frame.rawIndex)]
+                var descended = false
+                while frame.nextChildIndex < frame.childCount {
+                    let childIndex = NodeStore.rawChildIndex(of: frameCompact, at: frame.nextChildIndex, edges: edgeSpan)
+                    frame.nextChildIndex += 1
+                    let childCompact = nodeSpan[Int(childIndex)]
+                    if let knownDigest = digestByIndex[childIndex] {
+                        frame.hasher.combine(knownDigest)
+                    } else if childCompact.childCount == 0 {
+                        let leafHasher = Node.seededDigestHasher(kind: childCompact.kind, contents: store.contents(of: childCompact), childCount: 0)
+                        let leafDigest = UInt64(bitPattern: Int64(leafHasher.finalize()))
+                        digestByIndex[childIndex] = leafDigest
+                        frame.hasher.combine(leafDigest)
+                    } else {
+                        frames.append(frame)
+                        frames.append(DigestFrame(
+                            rawIndex: childIndex,
+                            childCount: childCompact.childCount,
+                            hasher: Node.seededDigestHasher(kind: childCompact.kind, contents: store.contents(of: childCompact), childCount: childCompact.childCount),
+                            nextChildIndex: 0
+                        ))
+                        descended = true
+                        break
+                    }
+                }
+                if descended { continue }
+
+                let completedHasher = frame.hasher
+                let digest = UInt64(bitPattern: Int64(completedHasher.finalize()))
+                digestByIndex[frame.rawIndex] = digest
+                lastCompletedDigest = digest
+                pendingChildDigest = digest
             }
-            if descended { continue }
 
-            let completedHasher = frame.hasher
-            let digest = UInt64(bitPattern: Int64(completedHasher.finalize()))
-            digestByIndex[frame.reference.nodeIndex.rawValue] = digest
-            lastCompletedDigest = digest
-            pendingChildDigest = digest
+            // The last frame to complete is always the root.
+            return lastCompletedDigest
         }
-
-        // The last frame to complete is always the root.
-        return lastCompletedDigest
     }
 }
 
@@ -506,24 +552,7 @@ extension NodeReference {
         public var endIndex: Int { compactNode.childCount }
 
         public subscript(position: Int) -> NodeReference {
-            let rawChildIndex: UInt32
-            switch compactNode.payloadKind {
-            case .oneChild:
-                precondition(position == 0, "Child index out of range")
-                rawChildIndex = compactNode.payloadWord0
-            case .twoChildren:
-                switch position {
-                case 0: rawChildIndex = compactNode.payloadWord0
-                case 1: rawChildIndex = compactNode.payloadWord1
-                default: preconditionFailure("Child index out of range")
-                }
-            case .manyChildren:
-                precondition(position >= 0 && position < Int(compactNode.payloadWord1), "Child index out of range")
-                rawChildIndex = store.edges[Int(compactNode.payloadWord0) + position]
-            case .none, .index, .text:
-                preconditionFailure("Child index out of range for a node without children")
-            }
-            return NodeReference(store: store, nodeIndex: NodeStore.NodeIndex(rawValue: rawChildIndex))
+            NodeReference(store: store, nodeIndex: NodeStore.NodeIndex(rawValue: store.rawChildIndex(of: compactNode, at: position)))
         }
     }
 }

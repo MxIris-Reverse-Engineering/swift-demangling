@@ -284,3 +284,32 @@ extension NodeReference: DemanglingNode {
 }
 
 extension NodeReference.ChildrenView: DemanglingNodeChildren {}
+
+// MARK: - Store-path printing without per-child ARC (proposal 0008, B2)
+
+extension NodeReference {
+    /// Shadows the generic ``DemanglingNode`` `print(using:)` for the store
+    /// path: the walk runs on `UnretainedNodeReference` handles — zero store
+    /// retain/release per visited child — inside a scope that anchors the
+    /// store strongly for the walk's whole duration. Output and
+    /// fragment-cache behavior are identical to the generic path (the cache
+    /// keys on store identity plus index either way); only the ARC traffic
+    /// differs.
+    public func print(using options: DemangleOptions = .default) -> String {
+        withExtendedLifetime(store) {
+            DemanglingPrinter<String, UnretainedNodeReference>.print(
+                UnretainedNodeReference(store: store, rawIndex: nodeIndex.rawValue),
+                options: options
+            )
+        }
+    }
+
+    /// Asynchronous variant of ``print(using:)``; the closure's strong `self`
+    /// capture anchors the store across the executor hop.
+    public func print(using options: DemangleOptions = .default) async -> String {
+        await StackSafeExecutor.executeAsync {
+            var printer = DemanglingPrinter<String, UnretainedNodeReference>(options: options)
+            return printer.printRoot(UnretainedNodeReference(store: store, rawIndex: nodeIndex.rawValue))
+        }
+    }
+}
