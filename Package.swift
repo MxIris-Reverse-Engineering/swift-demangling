@@ -112,6 +112,17 @@ let package = Package(
                 .product(name: "FoundationToolbox", package: "FrameworkToolbox"),
                 .product(name: "SwiftStdlibToolbox", package: "FrameworkToolbox"),
             ],
+            swiftSettings: [
+                // Proposal 0008: the byte-based demangler stores Span<UInt8>
+                // in its ~Escapable scanner, which requires lifetime
+                // dependence support; @_lifetime-based direct-return borrowed
+                // views are additionally gated by #if hasFeature(Lifetimes)
+                // at each use site. Compilers that do not know the feature
+                // name ignore the flag (verified on 6.3.3) — the module then
+                // fails on the Span stored property, so the effective
+                // compiler floor is a Lifetimes-capable toolchain.
+                .enableExperimentalFeature("Lifetimes"),
+            ],
         ),
         .target(
             name: "DemanglingTestingSupportC",

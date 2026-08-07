@@ -3,24 +3,33 @@ import Testing
 
 @Suite("Embedded flavor detection")
 struct EmbeddedFlavorTests {
+    /// The demangler is `~Escapable` over the input bytes, so the whole run —
+    /// construction, demangle, flavor read — happens inside the `withUTF8`
+    /// borrow scope; only the flavor escapes.
+    private static func flavorAfterDemangling(_ mangled: String) throws -> ManglingFlavor {
+        var utf8Copy = mangled
+        let outcome = utf8Copy.withUTF8 { buffer in
+            Result { () throws(DemanglingError) -> ManglingFlavor in
+                var demangler = Demangler<ArrayWordRanges>(bytes: buffer.span, materialization: .decoding)
+                _ = try demangler.demangleSymbol()
+                return demangler.flavor
+            }
+        }
+        return try outcome.get()
+    }
+
     @Test("$e prefix sets flavor to .embedded")
     func dollarEPrefixSetsEmbeddedFlavor() throws {
-        var demangler = Demangler(scalars: "$e4main4testyyF".unicodeScalars)
-        _ = try demangler.demangleSymbol()
-        #expect(demangler.flavor == .embedded)
+        #expect(try Self.flavorAfterDemangling("$e4main4testyyF") == .embedded)
     }
 
     @Test("_$e prefix sets flavor to .embedded")
     func underscoreDollarEPrefixSetsEmbeddedFlavor() throws {
-        var demangler = Demangler(scalars: "_$e4main4testyyF".unicodeScalars)
-        _ = try demangler.demangleSymbol()
-        #expect(demangler.flavor == .embedded)
+        #expect(try Self.flavorAfterDemangling("_$e4main4testyyF") == .embedded)
     }
 
     @Test("$s prefix keeps flavor at .default")
     func dollarSPrefixKeepsDefaultFlavor() throws {
-        var demangler = Demangler(scalars: "$s4main4testyyF".unicodeScalars)
-        _ = try demangler.demangleSymbol()
-        #expect(demangler.flavor == .default)
+        #expect(try Self.flavorAfterDemangling("$s4main4testyyF") == .default)
     }
 }

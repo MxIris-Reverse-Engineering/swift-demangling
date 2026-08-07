@@ -9,6 +9,11 @@
 /// retained by `NodeCache.shared` until `NodeCache.shared.clear()` is called; pass
 /// `internsSubtrees: false` for one-off demangling that should not grow the cache.
 ///
+/// Error positions carried by thrown ``DemanglingError`` values are byte offsets
+/// into the mangled input (proposal 0008). Mangled symbols are ASCII, so for any
+/// valid input these equal the scalar counts reported before; they can differ only
+/// for invalid inputs containing non-ASCII bytes.
+///
 /// - Parameters:
 ///   - mangled: the string to be parsed ("isType` is false, the string should start with a Swift Symbol prefix, _T, _$S or $S).
 ///   - isType: if true, no prefix is parsed and, on completion, the first item on the parse stack is returned.
@@ -17,7 +22,7 @@
 /// - Throws: a SwiftSymbolParseError error that contains parse position when the error occurred.
 public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool = true) throws(DemanglingError) -> Node {
     let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
-        try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: internsSubtrees)
+        try demangleAsNodeFromMangledText(mangled, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: internsSubtrees)
     }
     return try StackSafeExecutor.execute(demangleBlock)
 }
@@ -30,33 +35,9 @@ public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicRefe
 /// async pipelines.
 public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool = true) async throws(DemanglingError) -> Node {
     let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
-        try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: internsSubtrees)
+        try demangleAsNodeFromMangledText(mangled, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: internsSubtrees)
     }
     return try await StackSafeExecutor.executeAsync(demangleBlock)
-}
-
-/// Pass a collection of `UnicodeScalars` containing a Swift mangled symbol or type, get a parsed SwiftSymbol structure which can then be directly examined or printed.
-///
-/// - Parameters:
-///   - mangled: the collection of `UnicodeScalars` to be parsed ("isType` is false, the string should start with a Swift Symbol prefix, _T, _$S or $S).
-///   - isType: if true, no prefix is parsed and, on completion, the first item on the parse stack is returned.
-/// - Returns: the successfully parsed result
-/// - Throws: a SwiftSymbolParseError error that contains parse position when the error occurred.
-private func demangleAsNode<C: Collection & Sendable>(_ mangled: C, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool = true, internsLeaves: Bool = true) throws(DemanglingError) -> Node where C.Iterator.Element == UnicodeScalar, C.Index: Sendable {
-    var demangler = Demangler(scalars: mangled, internsLeaves: internsLeaves)
-    demangler.symbolicReferenceResolver = symbolicReferenceResolver
-    let demangledNode: Node
-    if isType {
-        demangledNode = try demangler.demangleType()
-    } else if Demangler.getManglingPrefixLength(mangled) != 0 {
-        demangledNode = try demangler.demangleSymbol()
-    } else {
-        demangledNode = try demangler.demangleSwift3TopLevelSymbol()
-    }
-    guard internsSubtrees else {
-        return demangledNode
-    }
-    return NodeCache.shared.intern(demangledNode)
 }
 
 /// Fully cache-free demangle for transient trees (proposal 0001, Phase 3):
@@ -81,7 +62,86 @@ private func demangleAsNode<C: Collection & Sendable>(_ mangled: C, isType: Bool
 @_spi(Internals)
 public func demangleAsNodeTransient(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil) throws(DemanglingError) -> Node {
     let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
-        try demangleAsNode(mangled.unicodeScalars, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: false, internsLeaves: false)
+        try demangleAsNodeFromMangledText(mangled, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: false, internsLeaves: false)
     }
     return try StackSafeExecutor.execute(demangleBlock)
+}
+
+/// The axis-1 entry point (proposal 0008): fixes input borrowing, text
+/// materialization, and word-table storage once, then runs the shared
+/// byte-based demangling core inside the borrow scope.
+///
+/// - Modern runtimes (`#available` macOS 26 family): `String.utf8Span`
+///   borrows the input without copying or a closure; known-ASCII inputs
+///   (`UTF8Span.isKnownASCII`, O(1)) additionally take revalidation-free text
+///   materialization. Non-ASCII inputs keep validating materialization — a
+///   byte subrange of non-ASCII UTF-8 can split a scalar, so `unchecked`
+///   materialization would be unsound there (see
+///   `TextMaterializationStrategy`).
+/// - Legacy runtimes, or when ``DemanglingRuntimePath/forcesLegacyPath`` is
+///   set (the dual-path testability seam): `withUTF8` borrows inside a
+///   closure (possibly copying a bridged string once), validating
+///   materialization, heap-backed word table.
+private func demangleAsNodeFromMangledText(_ mangled: String, isType: Bool, symbolicReferenceResolver: DemangleSymbolicReferenceResolver?, internsSubtrees: Bool, internsLeaves: Bool = true) throws(DemanglingError) -> Node {
+    if !DemanglingRuntimePath.forcesLegacyPath,
+       #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
+        let utf8 = mangled.utf8Span
+        let materialization: TextMaterializationStrategy = utf8.isKnownASCII ? .prevalidatedCopying : .decoding
+        return try runDemangler(
+            bytes: utf8.span,
+            wordRangeStorageType: InlineWordRanges.self,
+            materialization: materialization,
+            mangled: mangled,
+            isType: isType,
+            symbolicReferenceResolver: symbolicReferenceResolver,
+            internsSubtrees: internsSubtrees,
+            internsLeaves: internsLeaves
+        )
+    } else {
+        var utf8Copy = mangled
+        let outcome = utf8Copy.withUTF8 { buffer in
+            Result { () throws(DemanglingError) -> Node in
+                try runDemangler(
+                    bytes: buffer.span,
+                    wordRangeStorageType: ArrayWordRanges.self,
+                    materialization: .decoding,
+                    mangled: mangled,
+                    isType: isType,
+                    symbolicReferenceResolver: symbolicReferenceResolver,
+                    internsSubtrees: internsSubtrees,
+                    internsLeaves: internsLeaves
+                )
+            }
+        }
+        return try outcome.get()
+    }
+}
+
+/// The shared demangling core, generic over the word-table storage. `mangled`
+/// rides along only for the prefix-shape decision (Swift 4+ vs the extinct
+/// Swift 3 `_T` grammar), which predates the byte borrow.
+private func runDemangler<Words: WordRangeStorage>(
+    bytes: Span<UInt8>,
+    wordRangeStorageType: Words.Type,
+    materialization: TextMaterializationStrategy,
+    mangled: String,
+    isType: Bool,
+    symbolicReferenceResolver: DemangleSymbolicReferenceResolver?,
+    internsSubtrees: Bool,
+    internsLeaves: Bool
+) throws(DemanglingError) -> Node {
+    var demangler = Demangler<Words>(bytes: bytes, materialization: materialization, internsLeaves: internsLeaves)
+    demangler.symbolicReferenceResolver = symbolicReferenceResolver
+    let demangledNode: Node
+    if isType {
+        demangledNode = try demangler.demangleType()
+    } else if getManglingPrefixLength(mangled) != 0 {
+        demangledNode = try demangler.demangleSymbol()
+    } else {
+        demangledNode = try demangler.demangleSwift3TopLevelSymbol()
+    }
+    guard internsSubtrees else {
+        return demangledNode
+    }
+    return NodeCache.shared.intern(demangledNode)
 }

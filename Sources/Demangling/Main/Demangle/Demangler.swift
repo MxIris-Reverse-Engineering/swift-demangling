@@ -1,8 +1,15 @@
-struct Demangler<C>: Sendable where C: Collection, C.Iterator.Element == UnicodeScalar, C: Sendable, C.Index: Sendable {
+/// The byte-based demangler (proposal 0008): scans the borrowed UTF-8 bytes
+/// of the mangled input through `ScalarScanner` and is therefore `~Escapable`
+/// — a demangle runs entirely inside the borrow scope opened at the entry
+/// point (`DemangleInterface.swift`); only the resulting `Node` tree escapes.
+/// Generic over the word-substitution table storage, the axis-1 storage
+/// selection point: the entry instantiates `Demangler<InlineWordRanges>` on
+/// modern OS runtimes and `Demangler<ArrayWordRanges>` on the legacy path.
+struct Demangler<Words: WordRangeStorage>: ~Escapable {
     private var scanner: ScalarScanner
     private var nameStack: [Node] = []
     private var substitutions: [Node] = []
-    private var words: [String] = []
+    private var words = Words()
     private var isOldFunctionTypeMangling: Bool = false
     var flavor: ManglingFlavor = .default
     private var symbolicReferenceIndex: Int = 0
@@ -15,22 +22,10 @@ struct Demangler<C>: Sendable where C: Collection, C.Iterator.Element == Unicode
     /// transient by design (proposal 0001, Phase 3).
     let internsLeaves: Bool
 
-    init(scalars: C, internsLeaves: Bool = true) {
-        self.scanner = ScalarScanner(scalars: scalars)
+    @_lifetime(copy bytes)
+    init(bytes: Span<UInt8>, materialization: TextMaterializationStrategy, internsLeaves: Bool = true) {
+        self.scanner = ScalarScanner(bytes: bytes, materialization: materialization)
         self.internsLeaves = internsLeaves
-    }
-
-    static func getManglingPrefixLength(_ scalars: C) -> Int {
-        var scanner = ScalarScanner(scalars: scalars)
-        if scanner.conditional(string: "_T0") || scanner.conditional(string: "_$S") || scanner.conditional(string: "_$s") || scanner.conditional(string: "_$e") {
-            return 3
-        } else if scanner.conditional(string: "$S") || scanner.conditional(string: "$s") || scanner.conditional(string: "$e") {
-            return 2
-        } else if scanner.conditional(string: "@__swiftmacro_") {
-            return 14
-        }
-
-        return 0
     }
 }
 
@@ -78,7 +73,7 @@ extension Demangler {
     private mutating func reset() {
         nameStack = []
         substitutions = []
-        words = []
+        words.removeAll()
         scanner.reset()
     }
 
@@ -134,7 +129,7 @@ extension Demangler {
             return result
         }
 
-        return createNode(kind: .suffix, text: String(String.UnicodeScalarView(scanner.scalars)))
+        return createNode(kind: .suffix, text: scanner.materializeWholeInput())
     }
 
     private mutating func parseAndPushNames() throws(DemanglingError) {
@@ -841,7 +836,11 @@ extension Demangler {
             try scanner.backtrack()
         }
 
-        var identifier = ""
+        // The identifier assembles as bytes and materializes once at the end:
+        // word substitutions and literal chunks copy input ranges, punycode
+        // contributes the UTF-8 of its decoded (valid) String — so the
+        // accumulated buffer is valid UTF-8 whenever the input ranges are.
+        var identifierBytes: [UInt8] = []
         repeat {
             while hasWordSubs && scanner.peek()?.isLetter == true {
                 let c = try scanner.readScalar()
@@ -853,7 +852,8 @@ extension Demangler {
                     hasWordSubs = false
                 }
                 try require(wordIndex < maxNumWords)
-                try identifier.append(require(words.at(wordIndex)))
+                let wordRange = try require(words.range(at: wordIndex))
+                scanner.appendBytes(in: wordRange, to: &identifierBytes)
             }
             if scanner.conditional(scalar: "0") {
                 break
@@ -863,44 +863,49 @@ extension Demangler {
             if isPunycoded {
                 _ = scanner.conditional(scalar: "_")
             }
-            let text = try scanner.readScalars(count: Int(numChars))
+            let textRange = try scanner.readRange(count: numChars)
             if isPunycoded {
-                try identifier.append(Punycode.decodePunycode(text))
+                let decoded = try Punycode.decodePunycode(scanner.materializeText(in: textRange))
+                identifierBytes.append(contentsOf: decoded.utf8)
             } else {
-                identifier.append(text)
-                var word: String?
-                for c in text.unicodeScalars {
-                    if word == nil, !c.isDigit && c != "_" && words.count < maxNumWords {
-                        word = "\(c)"
-                    } else if let w = word {
-                        if (c == "_") || (w.unicodeScalars.last?.isUpper == false && c.isUpper) {
-                            if w.unicodeScalars.count >= 2 {
-                                words.append(w)
+                scanner.appendBytes(in: textRange, to: &identifierBytes)
+                // Word extraction records input ranges instead of building
+                // Strings; a word is materialized only if a back-reference
+                // ever uses it (the C++ demangler's approach). Word bytes are
+                // contiguous in the input, so the previous word byte is
+                // always at `currentOffset - 1`.
+                var wordStartOffset: Int?
+                for currentOffset in textRange {
+                    let c = scanner.scalar(at: currentOffset)
+                    if wordStartOffset == nil, !c.isDigit && c != "_" && words.count < maxNumWords {
+                        wordStartOffset = currentOffset
+                    } else if let startOffset = wordStartOffset {
+                        let previous = scanner.scalar(at: currentOffset - 1)
+                        if (c == "_") || (!previous.isUpper && c.isUpper) {
+                            if currentOffset - startOffset >= 2 {
+                                words.append(startOffset ..< currentOffset)
                             }
                             if !c.isDigit && c != "_" && words.count < maxNumWords {
-                                word = "\(c)"
+                                wordStartOffset = currentOffset
                             } else {
-                                word = nil
+                                wordStartOffset = nil
                             }
-                        } else {
-                            word?.unicodeScalars.append(c)
                         }
                     }
                 }
-                if let w = word, w.unicodeScalars.count >= 2 {
-                    words.append(w)
+                if let startOffset = wordStartOffset, textRange.upperBound - startOffset >= 2 {
+                    words.append(startOffset ..< textRange.upperBound)
                 }
             }
         } while hasWordSubs
-        try require(!identifier.isEmpty)
-        let result = createNode(kind: .identifier, contents: .text(identifier))
+        try require(!identifierBytes.isEmpty)
+        let result = createNode(kind: .identifier, contents: .text(scanner.materialization.materialize(ownedBytes: identifierBytes)))
         substitutions.append(result)
         return result
     }
 
     private mutating func demangleOperatorIdentifier() throws(DemanglingError) -> Node {
         let ident = try require(pop(kind: .identifier))
-        let opCharTable = Array("& @/= >    <*!|+?%-~   ^ .".unicodeScalars)
 
         var str = ""
         for c in try (require(ident.text)).unicodeScalars {
@@ -908,7 +913,7 @@ extension Demangler {
                 str.unicodeScalars.append(c)
             } else {
                 try require(c.isLower)
-                let o = try require(opCharTable.at(Int(c.value - UnicodeScalar("a").value)))
+                let o = try require(operatorCharacterTable.at(Int(c.value - UnicodeScalar("a").value)))
                 try require(o != " ")
                 str.unicodeScalars.append(o)
             }
@@ -1296,7 +1301,7 @@ extension Demangler {
 
     private mutating func demangleClangType() throws(DemanglingError) -> Node {
         let numChars = try require(demangleNatural())
-        let text = try scanner.readScalars(count: Int(numChars))
+        let text = try scanner.readScalars(count: numChars)
         return createNode(kind: .clangType, contents: .text(text))
     }
 
@@ -2779,402 +2784,286 @@ extension Demangler {
 
 private let maxRepeatCount = 2048
 
-private let maxNumWords = 26
+/// Operator character lookup used by `demangleOperatorIdentifier`: index
+/// `letter - "a"` maps to the operator character, with `" "` marking invalid
+/// entries. File scope so the table is built once per process, not per call
+/// (generic types cannot hold static stored properties).
+private let operatorCharacterTable = Array("& @/= >    <*!|+?%-~   ^ .".unicodeScalars)
 
-extension Demangler {
-    /// NOTE: This struct is fileprivate to avoid clashing with CwlUtils (from which it is taken). If you want to use this struct outside this file, consider including CwlUtils.
-    ///
-    /// A structure for traversing a `String.UnicodeScalarView`.
-    ///
-    /// **UNICODE WARNING**: this struct ignores all Unicode combining rules and parses each scalar individually. The rules for parsing must allow combined characters to be parsed separately or better yet, forbid combining characters at critical parse locations. If your data structure does not include these types of rule then you should be iterating over the `Character` elements in a `String` rather than using this struct.
-    private struct ScalarScanner: Sendable {
-        /// The underlying storage
-        let scalars: C
+/// A byte scanner over the mangled input (proposal 0008). Mangled symbols are
+/// ASCII, so scanning single UTF-8 bytes is equivalent to the previous
+/// scalar-by-scalar walk while gaining O(1) random access, O(1) backtracking,
+/// and integer offsets as positions. Each byte is handed out as its Latin-1
+/// `UnicodeScalar`, so the parsing logic upstream of the scanner reads
+/// unchanged; byte ranges materialize to `String` through the strategy fixed
+/// at the demangle entry (`TextMaterializationStrategy`).
+///
+/// Error positions (`at:`) are byte offsets into the mangled input. For ASCII
+/// inputs they coincide with the scalar counts the previous scanner reported;
+/// they diverge only on invalid (non-ASCII) inputs, where this scanner also
+/// walks bytes where the previous one walked whole scalars — the byte walk is
+/// the C++ demangler's semantics.
+private struct ScalarScanner: ~Escapable {
+    /// The borrowed UTF-8 bytes of the mangled input.
+    let bytes: Span<UInt8>
 
-        /// Current scanning index
-        var index: C.Index
+    /// Current scanning position, a byte offset into `bytes`.
+    var offset: Int
 
-        /// Number of scalars consumed up to `index` (since String.UnicodeScalarView.Index is not a RandomAccessIndex, this makes determining the position *much* easier)
-        var consumed: Int
+    /// How byte ranges become `String`s; fixed at the demangle entry.
+    let materialization: TextMaterializationStrategy
 
-        /// Construct from a String.UnicodeScalarView and a context value
-        init(scalars: C) {
-            self.scalars = scalars
-            self.index = self.scalars.startIndex
-            self.consumed = 0
+    @_lifetime(copy bytes)
+    init(bytes: Span<UInt8>, materialization: TextMaterializationStrategy) {
+        self.bytes = bytes
+        self.offset = 0
+        self.materialization = materialization
+    }
+
+    /// Sets the position back to the beginning.
+    mutating func reset() {
+        offset = 0
+    }
+
+    var isAtEnd: Bool {
+        offset == bytes.count
+    }
+
+    /// Returns a throwable error capturing the current scanner progress point.
+    func unexpectedError() -> DemanglingError {
+        DemanglingError.unexpected(at: offset)
+    }
+
+    /// The byte at `byteOffset` as a Latin-1 scalar, without touching the
+    /// position. Bounds are the span's responsibility (out of range traps).
+    func scalar(at byteOffset: Int) -> UnicodeScalar {
+        UnicodeScalar(bytes[byteOffset])
+    }
+
+    /// If the position is at the end, throw; otherwise return the scalar at
+    /// the current position without advancing.
+    func requirePeek() throws(DemanglingError) -> UnicodeScalar {
+        guard offset < bytes.count else {
+            throw DemanglingError.endedPrematurely(count: 1, at: offset)
         }
+        return UnicodeScalar(bytes[offset])
+    }
 
-        /// Sets the index back to the beginning and clears the consumed count
-        mutating func reset() {
-            index = scalars.startIndex
-            consumed = 0
+    /// If the position plus `skipCount` is within bounds, return the scalar at
+    /// that location, otherwise nil. The position never changes.
+    func peek(skipCount: Int = 0) -> UnicodeScalar? {
+        let peekOffset = offset + skipCount
+        guard peekOffset < bytes.count else { return nil }
+        return UnicodeScalar(bytes[peekOffset])
+    }
+
+    /// If the position is at the end, throw; otherwise return the scalar at
+    /// the current position, advancing by one.
+    mutating func readScalar() throws(DemanglingError) -> UnicodeScalar {
+        guard offset < bytes.count else {
+            throw DemanglingError.endedPrematurely(count: 1, at: offset)
         }
+        let result = UnicodeScalar(bytes[offset])
+        offset += 1
+        return result
+    }
 
-        /// Throw if the scalars at the current `index` don't match the scalars in `value`. Advance the `index` to the end of the match.
-        /// WARNING: `string` is used purely for its `unicodeScalars` property and matching is purely based on direct scalar comparison (no decomposition or normalization is performed).
-        mutating func match(string: String) throws(DemanglingError) {
-            let (newIndex, newConsumed) = try string.unicodeScalars.reduceThrowable((index: index, count: 0)) { (tuple: (index: C.Index, count: Int), scalar: UnicodeScalar) throws(DemanglingError) in
-                if tuple.index == self.scalars.endIndex || scalar != self.scalars[tuple.index] {
-                    throw .matchFailed(wanted: string, at: consumed)
-                }
-                return (index: self.scalars.index(after: tuple.index), count: tuple.count + 1)
-            }
-            index = newIndex
-            consumed += newConsumed
+    /// Throw unless `test` accepts the scalar at the current position; on
+    /// success return it and advance.
+    mutating func read(where test: (UnicodeScalar) -> Bool) throws(DemanglingError) -> UnicodeScalar {
+        guard offset < bytes.count, test(UnicodeScalar(bytes[offset])) else {
+            throw DemanglingError.matchFailed(wanted: "(read test function to succeed)", at: offset)
         }
+        let result = UnicodeScalar(bytes[offset])
+        offset += 1
+        return result
+    }
 
-        /// Throw if the scalars at the current `index` don't match the scalars in `value`. Advance the `index` to the end of the match.
-        mutating func match(scalar: UnicodeScalar) throws(DemanglingError) {
-            if index == scalars.endIndex || scalars[index] != scalar {
-                throw DemanglingError.matchFailed(wanted: String(scalar), at: consumed)
-            }
-            index = scalars.index(after: index)
-            consumed += 1
+    /// Throw unless the scalar at the current position equals `scalar`;
+    /// advance over it on success.
+    mutating func match(scalar: UnicodeScalar) throws(DemanglingError) {
+        guard offset < bytes.count, UnicodeScalar(bytes[offset]) == scalar else {
+            throw DemanglingError.matchFailed(wanted: String(scalar), at: offset)
         }
+        offset += 1
+    }
 
-        /// Throw if the scalars at the current `index` don't match the scalars in `value`. Advance the `index` to the end of the match.
-        mutating func match(where test: @escaping (UnicodeScalar) -> Bool) throws(DemanglingError) {
-            if index == scalars.endIndex || !test(scalars[index]) {
-                throw DemanglingError.matchFailed(wanted: "(match test function to succeed)", at: consumed)
-            }
-            index = scalars.index(after: index)
-            consumed += 1
+    /// Throw unless the bytes at the current position match `string`'s UTF-8;
+    /// advance to the end of the match on success.
+    mutating func match(string: String) throws(DemanglingError) {
+        guard conditional(string: string) else {
+            throw DemanglingError.matchFailed(wanted: string, at: offset)
         }
+    }
 
-        /// Throw if the scalars at the current `index` don't match the scalars in `value`. Advance the `index` to the end of the match.
-        mutating func read(where test: @escaping (UnicodeScalar) -> Bool) throws(DemanglingError) -> UnicodeScalar {
-            if index == scalars.endIndex || !test(scalars[index]) {
-                throw DemanglingError.matchFailed(wanted: "(read test function to succeed)", at: consumed)
-            }
-            let s = scalars[index]
-            index = scalars.index(after: index)
-            consumed += 1
-            return s
-        }
-
-        /// Consume scalars from the contained collection, up to but not including the first instance of `scalar` found. `index` is advanced to immediately before `scalar`. Returns all scalars consumed prior to `scalar` as a `String`. Throws if `scalar` is never found.
-        mutating func readUntil(scalar: UnicodeScalar) throws(DemanglingError) -> String {
-            var i = index
-            let previousConsumed = consumed
-            try skipUntil(scalar: scalar)
-
-            var result = ""
-            result.reserveCapacity(consumed - previousConsumed)
-            while i != index {
-                result.unicodeScalars.append(scalars[i])
-                i = scalars.index(after: i)
-            }
-
-            return result
-        }
-
-        /// Consume scalars from the contained collection, up to but not including the first instance of `string` found. `index` is advanced to immediately before `string`. Returns all scalars consumed prior to `string` as a `String`. Throws if `string` is never found.
-        /// WARNING: `string` is used purely for its `unicodeScalars` property and matching is purely based on direct scalar comparison (no decomposition or normalization is performed).
-        mutating func readUntil(string: String) throws(DemanglingError) -> String {
-            var i = index
-            let previousConsumed = consumed
-            try skipUntil(string: string)
-
-            var result = ""
-            result.reserveCapacity(consumed - previousConsumed)
-            while i != index {
-                result.unicodeScalars.append(scalars[i])
-                i = scalars.index(after: i)
-            }
-
-            return result
-        }
-
-        /// Consume scalars from the contained collection, up to but not including the first instance of any character in `set` found. `index` is advanced to immediately before `string`. Returns all scalars consumed prior to `string` as a `String`. Throws if no matching characters are ever found.
-        mutating func readUntil(set inSet: Set<UnicodeScalar>) throws(DemanglingError) -> String {
-            var i = index
-            let previousConsumed = consumed
-            try skipUntil(set: inSet)
-
-            var result = ""
-            result.reserveCapacity(consumed - previousConsumed)
-            while i != index {
-                result.unicodeScalars.append(scalars[i])
-                i = scalars.index(after: i)
-            }
-
-            return result
-        }
-
-        /// Peeks at the scalar at the current `index`, testing it with function `f`. If `f` returns `true`, the scalar is appended to a `String` and the `index` increased. The `String` is returned at the end.
-        mutating func readWhile(true test: (UnicodeScalar) -> Bool) -> String {
-            var string = ""
-            while index != scalars.endIndex {
-                if !test(scalars[index]) {
-                    break
-                }
-                string.unicodeScalars.append(scalars[index])
-                index = scalars.index(after: index)
-                consumed += 1
-            }
-            return string
-        }
-
-        /// Repeatedly peeks at the scalar at the current `index`, testing it with function `f`. If `f` returns `true`, the `index` increased. If `false`, the function returns.
-        mutating func skipWhile(true test: (UnicodeScalar) -> Bool) {
-            while index != scalars.endIndex {
-                if !test(scalars[index]) {
-                    return
-                }
-                index = scalars.index(after: index)
-                consumed += 1
-            }
-        }
-
-        /// Consume scalars from the contained collection, up to but not including the first instance of `scalar` found. `index` is advanced to immediately before `scalar`. Throws if `scalar` is never found.
-        mutating func skipUntil(scalar: UnicodeScalar) throws(DemanglingError) {
-            var i = index
-            var c = 0
-            while i != scalars.endIndex, scalars[i] != scalar {
-                i = scalars.index(after: i)
-                c += 1
-            }
-            if i == scalars.endIndex {
-                throw DemanglingError.searchFailed(wanted: String(scalar), after: consumed)
-            }
-            index = i
-            consumed += c
-        }
-
-        /// Consume scalars from the contained collection, up to but not including the first instance of any scalar from `set` is found. `index` is advanced to immediately before `scalar`. Throws if `scalar` is never found.
-        mutating func skipUntil(set inSet: Set<UnicodeScalar>) throws(DemanglingError) {
-            var i = index
-            var c = 0
-            while i != scalars.endIndex, !inSet.contains(scalars[i]) {
-                i = scalars.index(after: i)
-                c += 1
-            }
-            if i == scalars.endIndex {
-                throw DemanglingError.searchFailed(wanted: "One of: \(inSet.sorted())", after: consumed)
-            }
-            index = i
-            consumed += c
-        }
-
-        /// Consume scalars from the contained collection, up to but not including the first instance of `string` found. `index` is advanced to immediately before `string`. Throws if `string` is never found.
-        /// WARNING: `string` is used purely for its `unicodeScalars` property and matching is purely based on direct scalar comparison (no decomposition or normalization is performed).
-        mutating func skipUntil(string: String) throws(DemanglingError) {
-            let match = string.unicodeScalars
-            guard let first = match.first else { return }
-            if match.count == 1 {
-                return try skipUntil(scalar: first)
-            }
-            var i = index
-            var j = index
-            var c = 0
-            var d = 0
-            let remainder = match[match.index(after: match.startIndex) ..< match.endIndex]
-            outerLoop: repeat {
-                while scalars[i] != first {
-                    if i == scalars.endIndex {
-                        throw DemanglingError.searchFailed(wanted: String(match), after: consumed)
-                    }
-                    i = scalars.index(after: i)
-                    c += 1
-
-                    // Track the last index and consume count before hitting the match
-                    j = i
-                    d = c
-                }
-                i = scalars.index(after: i)
-                c += 1
-                for s in remainder {
-                    if i == scalars.endIndex {
-                        throw DemanglingError.searchFailed(wanted: String(match), after: consumed)
-                    }
-                    if scalars[i] != s {
-                        continue outerLoop
-                    }
-                    i = scalars.index(after: i)
-                    c += 1
-                }
-                break
-            } while true
-            index = j
-            consumed += d
-        }
-
-        /// Attempt to advance the `index` by count, returning `false` and `index` unchanged if `index` would advance past the end, otherwise returns `true` and `index` is advanced.
-        mutating func skip(count: Int = 1) throws(DemanglingError) {
-            if count == 1, index != scalars.endIndex {
-                index = scalars.index(after: index)
-                consumed += 1
-            } else {
-                var i = index
-                var c = count
-                while c > 0 {
-                    if i == scalars.endIndex {
-                        throw DemanglingError.endedPrematurely(count: count, at: consumed)
-                    }
-                    i = scalars.index(after: i)
-                    c -= 1
-                }
-                index = i
-                consumed += count
-            }
-        }
-
-        /// Attempt to advance the `index` by count, returning `false` and `index` unchanged if `index` would advance past the end, otherwise returns `true` and `index` is advanced.
-        mutating func backtrack(count: Int = 1) throws(DemanglingError) {
-            if count <= consumed {
-                if count == 1 {
-                    index = scalars.index(index, offsetBy: -1)
-                    consumed -= 1
-                } else {
-                    let limit = consumed - count
-                    while consumed != limit {
-                        index = scalars.index(index, offsetBy: -1)
-                        consumed -= 1
-                    }
-                }
-            } else {
-                throw DemanglingError.endedPrematurely(count: -count, at: consumed)
-            }
-        }
-
-        /// Returns all content after the current `index`. `index` is advanced to the end.
-        mutating func remainder() -> String {
-            var string = ""
-            while index != scalars.endIndex {
-                string.unicodeScalars.append(scalars[index])
-                index = scalars.index(after: index)
-                consumed += 1
-            }
-            return string
-        }
-
-        /// If the next scalars after the current `index` match `value`, advance over them and return `true`, otherwise, leave `index` unchanged and return `false`.
-        /// WARNING: `string` is used purely for its `unicodeScalars` property and matching is purely based on direct scalar comparison (no decomposition or normalization is performed).
-        mutating func conditional(string: String) -> Bool {
-            var i = index
-            var c = 0
-            for s in string.unicodeScalars {
-                if i == scalars.endIndex || s != scalars[i] {
-                    return false
-                }
-                i = scalars.index(after: i)
-                c += 1
-            }
-            index = i
-            consumed += c
-            return true
-        }
-
-        /// If the next scalar after the current `index` match `value`, advance over it and return `true`, otherwise, leave `index` unchanged and return `false`.
-        mutating func conditional(scalar: UnicodeScalar) -> Bool {
-            if index == scalars.endIndex || scalar != scalars[index] {
+    /// If the bytes at the current position match `string`'s UTF-8, advance
+    /// over them and return true; otherwise leave the position unchanged and
+    /// return false.
+    mutating func conditional(string: String) -> Bool {
+        var checkOffset = offset
+        for utf8Byte in string.utf8 {
+            guard checkOffset < bytes.count, bytes[checkOffset] == utf8Byte else {
                 return false
             }
-            index = scalars.index(after: index)
-            consumed += 1
-            return true
+            checkOffset += 1
         }
+        offset = checkOffset
+        return true
+    }
 
-        /// If the next scalar after the current `index` match `value`, advance over it and return `true`, otherwise, leave `index` unchanged and return `false`.
-        mutating func conditional(where test: (UnicodeScalar) -> Bool) -> UnicodeScalar? {
-            if index == scalars.endIndex || !test(scalars[index]) {
-                return nil
-            }
-            let s = scalars[index]
-            index = scalars.index(after: index)
-            consumed += 1
-            return s
+    /// If the scalar at the current position equals `scalar`, advance over it
+    /// and return true; otherwise leave the position unchanged and return
+    /// false.
+    mutating func conditional(scalar: UnicodeScalar) -> Bool {
+        guard offset < bytes.count, UnicodeScalar(bytes[offset]) == scalar else {
+            return false
         }
+        offset += 1
+        return true
+    }
 
-        /// If the `index` is at the end, throw, otherwise, return the next scalar at the current `index` without advancing `index`.
-        func requirePeek() throws(DemanglingError) -> UnicodeScalar {
-            if index == scalars.endIndex {
-                throw DemanglingError.endedPrematurely(count: 1, at: consumed)
-            }
-            return scalars[index]
+    /// If `test` accepts the scalar at the current position, advance over it
+    /// and return it; otherwise leave the position unchanged and return nil.
+    mutating func conditional(where test: (UnicodeScalar) -> Bool) -> UnicodeScalar? {
+        guard offset < bytes.count else { return nil }
+        let candidate = UnicodeScalar(bytes[offset])
+        guard test(candidate) else { return nil }
+        offset += 1
+        return candidate
+    }
+
+    /// Advance the position by `count` bytes; throw without moving if fewer
+    /// remain.
+    mutating func skip(count: Int = 1) throws(DemanglingError) {
+        guard count >= 0, count <= bytes.count - offset else {
+            throw DemanglingError.endedPrematurely(count: count, at: offset)
         }
+        offset += count
+    }
 
-        /// If `index` + `ahead` is within bounds, return the scalar at that location, otherwise return `nil`. The `index` will not be changed in any case.
-        func peek(skipCount: Int = 0) -> UnicodeScalar? {
-            var i = index
-            var c = skipCount
-            while c > 0, i != scalars.endIndex {
-                i = scalars.index(after: i)
-                c -= 1
-            }
-            if i == scalars.endIndex {
-                return nil
-            }
-            return scalars[i]
+    /// Move the position back by `count` bytes; throw without moving if that
+    /// would pass the beginning.
+    mutating func backtrack(count: Int = 1) throws(DemanglingError) {
+        guard count >= 0, count <= offset else {
+            throw DemanglingError.endedPrematurely(count: -count, at: offset)
         }
+        offset -= count
+    }
 
-        /// If the `index` is at the end, throw, otherwise, return the next scalar at the current `index`, advancing `index` by one.
-        mutating func readScalar() throws(DemanglingError) -> UnicodeScalar {
-            if index == scalars.endIndex {
-                throw DemanglingError.endedPrematurely(count: 1, at: consumed)
-            }
-            let result = scalars[index]
-            index = scalars.index(after: index)
-            consumed += 1
-            return result
+    /// Consume bytes up to but not including the first occurrence of `scalar`,
+    /// returning them as a `String`. Throws without moving if `scalar` never
+    /// occurs.
+    mutating func readUntil(scalar: UnicodeScalar) throws(DemanglingError) -> String {
+        var searchOffset = offset
+        while searchOffset < bytes.count, UnicodeScalar(bytes[searchOffset]) != scalar {
+            searchOffset += 1
         }
-
-        /// Throws if scalar at the current `index` is not in the range `"0"` to `"9"`. Consume scalars `"0"` to `"9"` until a scalar outside that range is encountered. Return the integer representation of the value scanned, interpreted as a base 10 integer. `index` is advanced to the end of the number.
-        mutating func readInt() throws(DemanglingError) -> UInt64 {
-            let result = try conditionalInt()
-            guard let r = result else {
-                throw DemanglingError.expectedInt(at: consumed)
-            }
-            return r
+        guard searchOffset < bytes.count else {
+            throw DemanglingError.searchFailed(wanted: String(scalar), after: offset)
         }
+        let textRange = offset ..< searchOffset
+        offset = searchOffset
+        return materializeText(in: textRange)
+    }
 
-        /// Throws if scalar at the current `index` is not in the range `"0"` to `"9"`. Consume scalars `"0"` to `"9"` until a scalar outside that range is encountered. Return the integer representation of the value scanned, interpreted as a base 10 integer. `index` is advanced to the end of the number.
-        mutating func conditionalInt() throws(DemanglingError) -> UInt64? {
-            var result: UInt64 = 0
-            var i = index
-            var c = 0
-            while i != scalars.endIndex, scalars[i].isDigit {
-                let digit = UInt64(scalars[i].value - UnicodeScalar("0").value)
-
-                // The Swift compiler allows overflow here for malformed inputs, so we're obliged to do the same
-                result = result &* 10 &+ digit
-
-                i = scalars.index(after: i)
-                c += 1
-            }
-            if i == index {
-                return nil
-            }
-            index = i
-            consumed += c
-            return result
+    /// Consume bytes while `test` accepts them, returning the consumed range.
+    mutating func readRange(while test: (UnicodeScalar) -> Bool) -> Range<Int> {
+        let startOffset = offset
+        while offset < bytes.count, test(UnicodeScalar(bytes[offset])) {
+            offset += 1
         }
+        return startOffset ..< offset
+    }
 
-        /// Consume and return `count` scalars. `index` will be advanced by count. Throws if end of `scalars` occurs before consuming `count` scalars.
-        mutating func readScalars(count: Int) throws(DemanglingError) -> String {
-            var result = String()
-            result.reserveCapacity(count)
-            var i = index
-            for _ in 0 ..< count {
-                if i == scalars.endIndex {
-                    throw DemanglingError.endedPrematurely(count: count, at: consumed)
-                }
-                result.unicodeScalars.append(scalars[i])
-                i = scalars.index(after: i)
-            }
-            index = i
-            consumed += count
-            return result
-        }
+    /// Consume bytes while `test` accepts them, returning them as a `String`.
+    mutating func readWhile(_ test: (UnicodeScalar) -> Bool) -> String {
+        materializeText(in: readRange(while: test))
+    }
 
-        /// Returns a throwable error capturing the current scanner progress point.
-        func unexpectedError() -> DemanglingError {
-            return DemanglingError.unexpected(at: consumed)
+    /// Consume exactly `count` bytes, returning the consumed range. Throws
+    /// without moving if fewer remain.
+    mutating func readRange(count: Int) throws(DemanglingError) -> Range<Int> {
+        guard count >= 0, count <= bytes.count - offset else {
+            throw DemanglingError.endedPrematurely(count: count, at: offset)
         }
+        let textRange = offset ..< offset + count
+        offset += count
+        return textRange
+    }
 
-        var isAtEnd: Bool {
-            return index == scalars.endIndex
+    /// Mangled length prefixes arrive as `UInt64`; the bound check happens in
+    /// that domain so oversized (or overflow-wrapped) counts fail cleanly
+    /// instead of trapping in an `Int` conversion — 32-bit `Int` included
+    /// (proposal 0004 discipline).
+    mutating func readRange(count: UInt64) throws(DemanglingError) -> Range<Int> {
+        guard count <= UInt64(bytes.count - offset) else {
+            throw DemanglingError.endedPrematurely(count: Int(clamping: count), at: offset)
         }
+        return try readRange(count: Int(count))
+    }
+
+    /// Consume exactly `count` bytes, returning them as a `String`.
+    mutating func readScalars(count: Int) throws(DemanglingError) -> String {
+        try materializeText(in: readRange(count: count))
+    }
+
+    /// `UInt64` counterpart of `readScalars(count:)` for mangled length
+    /// prefixes; see `readRange(count: UInt64)`.
+    mutating func readScalars(count: UInt64) throws(DemanglingError) -> String {
+        try materializeText(in: readRange(count: count))
+    }
+
+    /// Returns all content after the current position as a `String`, advancing
+    /// to the end.
+    mutating func remainder() -> String {
+        let textRange = offset ..< bytes.count
+        offset = bytes.count
+        return materializeText(in: textRange)
+    }
+
+    /// The whole input as a `String`, regardless of the current position.
+    func materializeWholeInput() -> String {
+        materializeText(in: 0 ..< bytes.count)
+    }
+
+    /// Materializes a byte range of the input through the entry-selected
+    /// strategy.
+    func materializeText(in textRange: Range<Int>) -> String {
+        materialization.materialize(bytes.extracting(textRange))
+    }
+
+    /// Appends a byte range of the input to an owned buffer (identifier
+    /// assembly).
+    func appendBytes(in textRange: Range<Int>, to destination: inout [UInt8]) {
+        bytes.extracting(textRange).withUnsafeBufferPointer { buffer in
+            destination.append(contentsOf: buffer)
+        }
+    }
+
+    /// Throws if the byte at the current position is not a digit. Consumes
+    /// digits until a non-digit is encountered, returning the base-10 value.
+    mutating func readInt() throws(DemanglingError) -> UInt64 {
+        guard let result = try conditionalInt() else {
+            throw DemanglingError.expectedInt(at: offset)
+        }
+        return result
+    }
+
+    /// Consumes digits until a non-digit is encountered, returning the base-10
+    /// value, or nil without moving when the current byte is not a digit.
+    mutating func conditionalInt() throws(DemanglingError) -> UInt64? {
+        var result: UInt64 = 0
+        var scanOffset = offset
+        while scanOffset < bytes.count, UnicodeScalar(bytes[scanOffset]).isDigit {
+            // The Swift compiler allows overflow here for malformed inputs, so we're obliged to do the same
+            result = result &* 10 &+ UInt64(bytes[scanOffset] - UInt8(ascii: "0"))
+            scanOffset += 1
+        }
+        if scanOffset == offset {
+            return nil
+        }
+        offset = scanOffset
+        return result
     }
 }
 
@@ -4061,7 +3950,7 @@ extension Demangler {
             (isOperator, k) = (false, kind ?? Node.Kind.identifier)
         }
 
-        var identifier = try scanner.readScalars(count: Int(scanner.readInt()))
+        var identifier = try scanner.readScalars(count: scanner.readInt())
         if isPunycode {
             identifier = try Punycode.decodePunycode(identifier)
         }

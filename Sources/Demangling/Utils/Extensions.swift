@@ -1,11 +1,26 @@
+/// Length of the recognized mangling prefix at the start of `mangled`, or 0
+/// when there is none. Note `_T` alone (the extinct Swift 3 grammar) is not a
+/// listed prefix: callers that get 0 fall through to the Swift 3 demangler.
+func getManglingPrefixLength(_ mangled: some StringProtocol) -> Int {
+    if mangled.hasPrefix("_T0") || mangled.hasPrefix("_$S") || mangled.hasPrefix("_$s") || mangled.hasPrefix("_$e") {
+        return 3
+    } else if mangled.hasPrefix("$S") || mangled.hasPrefix("$s") || mangled.hasPrefix("$e") {
+        return 2
+    } else if mangled.hasPrefix("@__swiftmacro_") {
+        return 14
+    }
+
+    return 0
+}
+
 extension String {
     public var isSwiftSymbol: Bool {
-        Demangler.getManglingPrefixLength(unicodeScalars) > 0
+        getManglingPrefixLength(self) > 0
     }
 
     public var stripManglePrefix: String {
         guard isSwiftSymbol else { return self }
-        return String(dropFirst(Demangler.getManglingPrefixLength(unicodeScalars)))
+        return String(dropFirst(getManglingPrefixLength(self)))
     }
 }
 
