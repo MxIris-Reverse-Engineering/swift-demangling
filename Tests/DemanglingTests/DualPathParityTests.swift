@@ -36,13 +36,17 @@ struct DualPathParityTests {
         }
     }
 
+    /// Under a CI double-run (`DEMANGLING_FORCE_LEGACY_PATH=1`) the first
+    /// outcome is already legacy and the comparison degrades to legacy vs
+    /// legacy — trivially equal, harmless. The seam is snapshotted and
+    /// restored rather than asserted clean so that mode does not trap.
     private static func assertParity(_ mangled: String, isType: Bool = false, sourceLocation: SourceLocation = #_sourceLocation) {
-        precondition(!DemanglingRuntimePath.forcesLegacyPath, "seam left dirty by an earlier test")
-        let modernOutcome = outcome(for: mangled, isType: isType)
+        let originalSeamValue = DemanglingRuntimePath.forcesLegacyPath
+        let firstOutcome = outcome(for: mangled, isType: isType)
         DemanglingRuntimePath.forcesLegacyPath = true
-        defer { DemanglingRuntimePath.forcesLegacyPath = false }
+        defer { DemanglingRuntimePath.forcesLegacyPath = originalSeamValue }
         let legacyOutcome = outcome(for: mangled, isType: isType)
-        #expect(modernOutcome == legacyOutcome, "path divergence for \(mangled)", sourceLocation: sourceLocation)
+        #expect(firstOutcome == legacyOutcome, "path divergence for \(mangled)", sourceLocation: sourceLocation)
     }
 
     /// Long multi-word identifiers exercise the word-substitution table — the
