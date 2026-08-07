@@ -1,19 +1,68 @@
 # 文档索引
 
-本目录收录内部专题文档：每篇对应一次实质性的架构演进或一块独立的子系统。
+本目录收录内部专题文档：每篇对应一次实质性的架构演进，或一块独立的子系统。
+面向的读者是「不记得本项目任何内部细节」的人，包括几个月后的你自己。
+
+## 先看这个
+
+- [Glossary.md](Glossary.md) — **术语速查**。一句话定义 + 指向详细讲解，读文档卡住时
+  用来快速对上号。
+- **[Concepts/](Concepts/) — 概念篇**。本库绕不开四块「性能优化背景知识」，没接触过的
+  人直接读专题文档会很吃力。每块单独一篇，从零讲起，配真实例子和实测数据：
+
+  | 文档 | 讲什么 | 一句话预告 |
+  |---|---|---|
+  | [SharedStructureAndDAG.md](Concepts/SharedStructureAndDAG.md) | 共享结构与 DAG | 你以为是树，物理上是图——一半的坑从这里长出来 |
+  | [Interning.md](Concepts/Interning.md) | intern 与 hash-consing | 让相同的东西只存一份，内存降到 1/5 |
+  | [ArenaStorage.md](Concepts/ArenaStorage.md) | arena 式存储 | 一个 class 节点的 48 字节都花在哪，怎么压到 12 字节 |
+  | [TraversalCost.md](Concepts/TraversalCost.md) | 遍历按路径还是按节点计价 | 48 个节点的符号为什么会被访问 13 万次 |
+  | [RecursionAndStack.md](Concepts/RecursionAndStack.md) | 递归、线程栈与崩溃 | 主线程 8 MB、协作线程 512 KB，同一段代码换个线程就崩 |
+
+  概念篇讲**通用概念**（读完能迁移到别的项目），下面的专题文档讲**本项目具体怎么做的、
+  测出了什么数**。
+
+## 建议阅读顺序
+
+**第一次接触这个库**：先读概念篇的前两篇（[共享结构](Concepts/SharedStructureAndDAG.md)
+→ [intern](Concepts/Interning.md)），再看下面的专题。**已经熟悉这些概念**：直接从专题
+开始，卡住时回查 [术语速查](Glossary.md)。
+
+1. [SubtreeInterning.md](SubtreeInterning.md) — 内存优化的第一步：把去重做到 class
+   形态的极限。
+2. [NodeStoreArena.md](NodeStoreArena.md) — 第二步：换存储形态，兑现上一篇结尾列为
+   「待将来评估」的 arena 方向。
+3. [StackSafety.md](StackSafety.md) — 与内存方向正交，处理的是递归深度和线程栈。
+4. [KnownIssues.md](KnownIssues.md) — 已知问题与 review 裁决记录，随时查。
 
 ## 专题
 
-- [SubtreeInterning.md](SubtreeInterning.md) — 全子树 interning（hash-consing）内存优化。把 interning 从叶节点扩展到全部子树，49k 符号语料解析驻留 39.5 MB → 12.9 MB。
-- [NodeStoreArena.md](NodeStoreArena.md) — `NodeStore` arena 式紧凑存储。节点平铺进连续缓冲，每节点 12 字节、无对象头、无引用计数；printer 与 TypeDecoder 泛型化后可零物化直读。
-- [StackSafety.md](StackSafety.md) — 栈安全模型：与上游同构的「8MB 大栈 + 按 debug 实测校准的固定深度上限」，加上引擎之外全部整树遍历的迭代化（含 `Node` 迭代析构）。曾短暂采用按剩余栈字节的 `StackBudget` 方案，因调试器挂死 / 优先级反转 / 工作量不受限等固有代价撤回，文中记录了撤回理由与校准数据。
-- [KnownIssues.md](KnownIssues.md) — code-review 的**裁决记录**，分两部分。第一部分是已确认真实存在但暂缓修复的 6 条：TypeDecoder 的 8 处整数转换 trap（含字符串级触发器）、TypeDecoder 入口在小栈线程上的深度守卫失效、打印缓存的完整 fragment 回放越过深度上限、深度上限所需栈超过执行器能保证的栈、TypeDecoder store 路径每层重物化的 O(k²)、TypeDecoder 在共享 DAG 上按出现次数解码；含复现方式与修法方向。第二部分是判定为**误报或刻意设计**的发现（N1–N8），目的是让同一个发现不必被反复重新推导——每次 review 先对照本文件，已裁决且理由仍成立的直接跳过。
-
-前两篇是承接关系：`SubtreeInterning` 把 class 形态下能做的去重做到头，`NodeStoreArena` 兑现了它结尾列为「待将来单独评估」的 arena 方向。`StackSafety` 与内存方向正交，处理的是递归深度与线程栈。
+| 文档 | 讲什么 | 什么时候读 | 建议先读 |
+|---|---|---|---|
+| [SubtreeInterning.md](SubtreeInterning.md) | 全子树 interning（hash-consing）。把结构相同的子树收敛成同一个实例，49k 符号语料的解析驻留 39.5 MB → 12.9 MB。 | 想搞清楚 `NodeCache` 为什么存在、`demangleAsNode` 返回的树为什么可以用 `===` 比较时。 | [Interning](Concepts/Interning.md) |
+| [NodeStoreArena.md](NodeStoreArena.md) | `NodeStore` arena 式紧凑存储。节点平铺进连续缓冲，每节点 12 字节、无对象头、无引用计数；printer 与 TypeDecoder 泛型化后可零物化直读。 | 做整个二进制的批量索引、或要动 `Store/` 下的代码时。 | [ArenaStorage](Concepts/ArenaStorage.md) |
+| [StackSafety.md](StackSafety.md) | 栈安全模型：与上游同构的「8MB 大栈 + 固定深度上限」，加上引擎之外全部整树遍历的迭代化（含 `Node` 的迭代式析构）。也记录了曾短暂采用、后因调试器挂死 / 优先级反转 / 工作量不受限而撤回的 `StackBudget` 方案。 | 新增递归、调整深度上限、或排查深符号崩溃时。**动上限前必读**。 | [RecursionAndStack](Concepts/RecursionAndStack.md) |
+| [KnownIssues.md](KnownIssues.md) | code-review 的**裁决记录**，两部分：① 已确认真实存在但暂缓修复的 6 条（含复现方式与修法方向）；② 判定为误报或刻意设计的 8 条（N1–N8）。 | 每次 code-review 之前——已裁决且理由仍成立的发现直接跳过，不必重新推导。 | [TraversalCost](Concepts/TraversalCost.md) |
 
 ## 其他位置的文档
 
-- `evolution/` — 演进提案（设计意图 + 决策日志）。`0001-node-store-arena.md` 是 `NodeStoreArena.md` 的提案原文；`0002-stack-safety.md` 是 `StackSafety.md` 的提案原文；`0003-review-hardening.md` 是 PR #6 review 收尾轮——冻结移交的 `NodeBuilder`（环不可构造）、整树重建的按图计价（memo 保共享）、`description` 与 runtime dump 的逐字节一致（外加 8MB 输出上限）、移除 `Node: Codable`（序列化用 mangled string）、以及让近似签名的 `NodePrinterTarget` 实现变成编译错误；`0004-32bit-store-guards.md` 修复 Store 越界守卫的 `Int(UInt32.max)` 写法在 watchOS（32 位 `Int`）上被常量折叠成无条件 trap 的问题，并以源码扫描回归测试禁止该转换家族再次进入 `Sources/`；`0005-remangler-deepequals-memo.md` 给 Remangler 替换表相等比较 `deepEquals` 补上其余三个成对遍历都有的 proven-pair memo——此前对两份实例不同但结构相等的共享 bound-generic DAG，`mangleAsString` 按路径数（2^N）增长；`0006-interntree-and-demangler-postpass-memo.md` 一批修复四处按路径计价的整树遍历（`NodeCache.internTree`、demangler 的 opaque-return-type 后处理、`findGenericParamsDepth`、`identifier`）——此前一个 131 字符的构造合法符号就能把默认 `demangleAsNode` 拖到指数级——并附全库横向排查收口（TypeDecoder 一处留档 KnownIssues #6）；`0007-short-circuit-queries-and-typedecoder-sweep.md` 补上 0006 横向排查的分类错误——`first(of:)` / `contains(_:)` 是短路查询而非枚举，出现次数不影响答案，却被归入「按出现次数是语义」一类而留在路径计价上（实测 22 层加倍 DAG 18.2 秒、每 2 层 ×4），同轮补齐 `TypeDecoder` 两处漏扫的越界守卫（本 PR 修了同款模式的一处却未横向排查），并把 PR #6 review 全部 15 条发现的裁决落到 `KnownIssues.md` 两部分。
-- `docs/AlignmentGaps.md` — 与上游 Swift 编译器 `Demangling` 源码的对齐缺口追踪。
-- `AGENTS.md` / `CLAUDE.md`（仓库根） — 面向编码 agent 的架构速查。
-- `README.md`（仓库根） — 面向使用者的英文说明与用法示例。
+- **`evolution/`** — 演进提案（设计意图 + 决策日志）。上面四篇专题文档是结论，这里是
+  过程。状态总表、演进愿景与流程约定见 [`evolution/README.md`](../evolution/README.md)：
+
+  | 提案 | 一句话 |
+  |---|---|
+  | `0001-node-store-arena.md` | `NodeStoreArena.md` 的提案原文（Phase 1–4 的分期计划）。 |
+  | `0002-stack-safety.md` | `StackSafety.md` 的提案原文，含被撤回的首版方案。 |
+  | `0003-review-hardening.md` | PR #6 review 收尾轮：`NodeBuilder` 只交付冻结节点（环从公开 API 不可构造）、整树重建按图计价（保住共享）、`description` 与 Swift runtime 的转储逐字节一致（外加 8MB 输出上限）、移除 `Node: Codable`（序列化就用 mangled string）、让签名近似的 `NodePrinterTarget` 实现变成编译错误。 |
+  | `0004-32bit-store-guards.md` | 边界守卫写成 `Int(UInt32.max)` 时，在 watchOS（32 位 `Int`）上会被常量折叠成无条件 trap 而构建全绿；改为异构比较，并加源码扫描测试禁止该写法再进入 `Sources/`。 |
+  | `0005-remangler-deepequals-memo.md` | Remangler 替换表的相等比较 `deepEquals` 是四个成对遍历里最后一个没有 memo 的；对两份实例不同但结构相等的共享泛型 DAG，`mangleAsString` 会按路径数（2^N）增长。 |
+  | `0006-interntree-and-demangler-postpass-memo.md` | 一批修复四处按路径计价的整树遍历（`NodeCache.internTree`、demangler 的 opaque-return-type 后处理、`findGenericParamsDepth`、`identifier`）——此前一个 131 字符的构造符号就能把默认 `demangleAsNode` 拖到指数级——并附全库横向排查。 |
+  | `0007-short-circuit-queries-and-typedecoder-sweep.md` | 补上 0006 横向排查的分类错误：`first(of:)` / `contains(_:)` 是短路查询而非枚举，出现次数不影响答案，却被留在按路径计价上（实测 22 层加倍 DAG 要 18.2 秒，每 2 层 ×4）。同轮补齐 `TypeDecoder` 两处漏扫的越界守卫，并把 PR #6 全部 15 条 review 发现的裁决落到 `KnownIssues.md`。 |
+  | `0008-span-borrowed-views.md` | **Draft**。Span 借用视图（双路径）：demangler 扫描器改为 `Span<UInt8>` 字节扫描，store 读路径消除逐 child ARC 与文本视图的 owner retain。`Span` 核心类型已向后部署（deployment target 不动）；被 macOS 26 卡的 `UTF8Span` / `InlineArray` / `.span` 属性与被编译器卡的 `@_lifetime` 直接返回式**不绕开，全部采用**——新特性路径 + 回退路径两套并行，`#available` / `hasFeature` 双轴门控。 |
+  | `0009-swift-syntax-arena-lessons.md` | **Draft**。对 swift-syntax 最新 arena 实现的对照审读产物：builder 按语料常数预估容量（消 realloc 拷贝与内存尖峰）、`NodeIndex` 带 debug generation tag（把跨 store 误用从静默读错变成确定性 trap）；另存档三条记录性结论（合并语义参照、文本直达 arena 的阻塞点、惰性 path 层）。 |
+
+- **`docs/AlignmentGaps.md`**（仓库根） — 与上游 Swift 编译器 `Demangling` 源码的对齐
+  缺口追踪（基准 `swift-6.3.2-RELEASE`，审计日期 2026-06-20，对照的是 `main`）。
+- **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
+  最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」
+  看它。
+- **`README.md`**（仓库根） — 面向使用者的英文说明与用法示例。
