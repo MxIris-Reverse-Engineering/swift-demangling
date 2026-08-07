@@ -2,10 +2,10 @@
 
 - **Proposal**: 0008
 - **Author**: Mx-Iris
-- **Status**: Draft
+- **Status**: In Progress
 - **Date**: 2026-08-07
 - **Last Updated**: 2026-08-07
-- **Branch**: TBD（未开工）
+- **Branch**: `feature/node-store`
 - **Related**: `Evolutions/0001-node-store-arena.md`（arena 本体；本条兑现
   `Documentations/NodeStoreArena.md` 「后续方向」中的 **`Span` 借用视图**一项）；
   `Documentations/Concepts/ArenaStorage.md`（概念背景：class 节点的成本都花在哪）
@@ -393,3 +393,6 @@ A、B1、B2、B3 相互独立，可各自成 PR；建议顺序 Phase 0 → A →
 | 2026-08-07 | Created as Draft | 起因：`NodeStoreArena.md` 「后续方向」的 Span 项；触发点是实测确认 `Span` 家族核心类型已向后部署（Xcode 26.6 / Swift 6.3.3，`-target x86_64-apple-macos10.15` 逐特性 typecheck），deployment target 无需变动，此前「被 macOS 26 卡住」的判断仅对 `.span` 属性、`UTF8Span`、`InlineArray` 成立。 |
 | 2026-08-07 | 改为双路径设计（Rev 2） | review 裁决：被 OS / 编译器卡住的特性不绕开，全部采用、写两套。补充实测三项支撑可行性：`UTF8Span(unchecked:)` 存在（免二次校验物化成立，且 `String` UTF-8 恒合法、两条入口都健全）；`@_lifetime` **方法**形式加 `Lifetimes` 实验开关在 10.15 target 编译通过（含跨调用存活消费方），属性形式仍编译错误；`UTF8Span` 无 `extracting`（工作表示必须是 `Span<UInt8>`）。据此确立「轴 1 OS 门控 / 轴 2 编译器门控 + 四条纪律（共享核心单份、逐字节一致、可测性 seam、实验特性圈 SPI）」。 |
 | 2026-08-07 | B2 补原厂确证；swift-syntax 借鉴项拆为独立提案 0009 | 对 swift-syntax 最新 main 的 arena 实现做了对照审读：B2 的 unmanaged 句柄分层与其 `RawSyntaxArenaRef` 模式一致（引用已补进 B2）；审读发现的可实施项（builder 容量预估、跨 store 误用防护）按 review 指示独立成案 0009，本条范围不变。 |
+| 2026-08-07 | Accepted → In Progress，Branch `feature/node-store` | Rev 2 通过 review（用户裁决）。随即开工，Phase 顺序按提案：0 → A → B3 → B1 → B2。 |
+| 2026-08-07 | Phase 0 基线落定（release，arm64 本机，dyld cache 语料远大于历史「49k/234k」——打印语料 SwiftUI+SwiftUICore+Foundation+Combine 去重后 439,533 符号，构建语料另加 AppKit+UIKitCore+AttributeGraph 计 454,094 符号；三遍取最优，malloc 计数走 `malloc_logger` 钩子取末遍）：① 纯 demangle（transient 树）6.868s ≈ **63,995 symbols/s**，**85.3 mallocs/symbol**；② store 端到端构建 9.602s ≈ 47,290 symbols/s，117.3 mallocs/symbol（uniqueNodes 1,267,380 / storageBytes 17.9 MB）；③ store 打印 default 7.026s（62,557/s，21.5 mallocs/symbol）、simplified 5.019s（87,578/s，14.6）、sugared 7.200s（61,045/s，21.4）。基准套件 `SpanBorrowedViewsBenchmarks`（`DEMANGLING_BENCHMARK=1` + release 下手动运行）。**回填 A/B3 通过门槛**：任何基准不得劣于对应基线 2%；Phase A 需在 ① 上呈现吞吐提升与 mallocs/symbol 下降（词表/读取物化去堆化的直接后果）；B3 需在 ② 上呈现 mallocs/symbol 下降（`internText` 命中路径去 `Array` 物化）。 |
+| 2026-08-07 | 实现期核实三项（Swift 6.3.3 / Xcode 26.6 逐项 typecheck，`-target arm64-apple-macos10.15`） | ① Source Compatibility 遗留的「未知 experimental feature 名是否报错」：**不报错**，`-enable-experimental-feature` 收到未知名称时静默忽略（以伪造名实测），风险从「构建断裂」降级为「特性未开导致的正常编译错误」。② 新发现：**扫描器核心本身依赖 `Lifetimes` 特性**——不开该特性时，struct 存储 `Span` 属性直接是编译错误（"initializer cannot return a ~Escapable result"），因此「编译器不认识 feature 即退化为闭包式」只覆盖轴 2 的直接返回式 API；`Demangling` 模块整体要求编译器具备 `Lifetimes`（tools 6.2 起的 Apple 工具链均满足，Swift 6.2 原生行为仍待按提案在 Xcode 26.0 复核）。③ 轴 1 全部拼写在 10.15 target 下 typecheck 通过：`String.utf8Span`、`UTF8Span(unchecked:)`、`String(copying:)`、`Span.extracting(_:)`、`InlineArray<26, Range<Int>>(repeating:)`、`.span` 属性与 `withUnsafeBufferPointer { $0.span }` 桥接；含「~Escapable 扫描器持 `Span` 字段 + 泛型 `Demangler<Words>` + mutating 方法 + `withUTF8` 闭包内构造 + `Result` 桥回 typed throws」的组合探测。 |

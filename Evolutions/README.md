@@ -47,7 +47,7 @@
 | [0005](0005-remangler-deepequals-memo.md) | Remangler 替换表相等比较补 proven-pair memo | Implemented |
 | [0006](0006-interntree-and-demangler-postpass-memo.md) | 按路径计价的整树遍历：`internTree` 等四处补 memo/去重 + 横向排查收口 | Implemented |
 | [0007](0007-short-circuit-queries-and-typedecoder-sweep.md) | 短路查询去重 + TypeDecoder 漏扫守卫补齐 | Implemented |
-| [0008](0008-span-borrowed-views.md) | Span 借用视图：扫描器 UTF-8 字节化与 store 读路径去 ARC（双路径） | Draft |
+| [0008](0008-span-borrowed-views.md) | Span 借用视图：扫描器 UTF-8 字节化与 store 读路径去 ARC（双路径） | In Progress |
 | [0009](0009-swift-syntax-arena-lessons.md) | 借鉴 swift-syntax arena：builder 容量预估与跨 store 误用防护 | Draft |
 
 ## 流程
