@@ -249,6 +249,51 @@ Phase 3 验收（本机 dyld cache SwiftUI 语料 234,232 符号，debug 构建�
 正确性：全量 dyld cache 对齐测试 0 失败；49k 语料 × 3 套打印选项，store 与 `Node` 路径
 逐字节零差异。
 
+## 共享 store：SharedNodeStore（0010）
+
+冻结模型（builder → `freeze()`）要求输入集合开工前已知；下游第二类负载——浏览中
+不断出现的类型名、conformance 树、晚到符号——在 0010 之前只能按「每棵树铸一个
+私有小 store」规避（RV 五镜像实测 14,451 个 `NodeStore` 实例）。`SharedNodeStore`
+是这类**增量负载**的形态：长生命周期、线程安全、`intern(_:)` / `demangle(_:)`
+即刻返回永久有效的 `NodeReference`，没有 freeze 屏障。
+
+### 两种构建模型的分工
+
+| | 冻结（builder → freeze） | 共享（SharedNodeStore） |
+|---|---|---|
+| 输入集合 | 开工前已知（全量 sweep） | 随使用逐步出现 |
+| intern 槽表 | freeze 时丢弃 | 终生保留（持续去重的来源） |
+| 读路径 | 常量视图，零锁零间接 | 每 walk 锁内拷出一次 48 字节描述符 |
+| 何时能读 | freeze 之后 | intern 返回即可 |
+| 内存回收 | store 整体释放 | store 整体释放（同 scope-cache 驱逐模型） |
+
+### 读写协议
+
+- **写侧**：一把 `Mutex` 串行化全部 intern，内部就是一个永不 freeze 的
+  `NodeStoreBuilder`——0009 的容量预估、签发 tag、哈希槽表全部原样生效。
+  `demangle` 的 transient 解析在锁外，只有 intern 进临界区。
+- **读侧（视图钉扎）**：读者经 `SharedViewState`（单 Mutex 槽）拷出当前
+  `BufferView` 描述符；引擎级 walk（打印、结构相等、digest）入口钉一次、全程用
+  同一份，零散访问（`kind` / `children[i]`）每次现取。
+- **增长（退休保活）**：缓冲写满时分配倍增的新代、memcpy、把**旧代挂进退休链**
+  而不是释放——已钉住旧视图的 walk 可能还在读它。空代（count 0）直接释放：
+  没有任何已发引用能指进空代。发布新描述符后新读者自然读到新代。
+- **陈旧视图为何安全**：①退休保活——旧基址永远有效；②自底向上不变量（子索引
+  恒小于父索引，debug 断言钉在 `internInterior`）——只要视图覆盖 root 的索引，
+  整棵子树都在视图内；③引用跨线程移交本身建立 happens-before，接收方随后的
+  锁内视图读取必然覆盖该引用。
+- **引用比本体长寿**：`NodeReference` 持有 `backingStore`（一个共享 store 只有
+  一个 `NodeStore` 身份，`store ===` fast path 全量生效），`backingStore` 经
+  `SharedViewState` 持有当前代 + 全部退休代。`SharedNodeStore` 本体先释放时，
+  写者随之消失，但已发引用照常可读。
+
+### 实测（0010 步骤 5，14,000 唯一名字树 × 2 次请求）
+
+见 0010 提案决策日志的验收数字：与「结构哈希缓存 + 每唯一树一个 mini store」
+（下游规避方案的最优形态）相比，单个共享 store 在保留同等去重语义的前提下
+消灭了全部 per-store 固定开销与跨 store 零去重问题；corpus 级打印对拍
+439,522 符号 × 3 选项集零差异，TSan 全绿。
+
 ## 已知短板
 
 - `TypeDecoder` 的 store 路径**不是**零物化的：每走到一个嵌套 decl 就重建一次它的

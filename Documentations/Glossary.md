@@ -68,3 +68,5 @@
 | **语料（corpus）** | 正确性对拍用的真实符号集合：dyld 共享缓存全量 **4,522,325 个符号**。文档里的「全语料 0 失败」都指这一套。 |
 | **对齐测试 / oracle** | 拿本库输出与 Swift runtime / `swift-demangle` 逐字节比对的测试。`Node.description` 之所以不能优化成「共享子树只打印一次」，就是因为要跟 runtime 的转储对拍。 |
 | **`<<too complex>>`** | 打印时触到深度上限的标记，表示这里主动放弃了，不是输出错误。 |
+| **视图钉扎（view pinning）** | 0010 的读取纪律：walk 入口把 store 当前的缓冲描述符（`BufferView`，三组基址+长度）解析一次、`withUnsafePointer` 钉住整个 walk。冻结 store 的描述符恒定，钉扎等于免费；共享 store 的描述符会随增长更新，钉扎保证一个 walk 全程读同一份一致视图。 |
+| **退休缓冲（retired buffer）** | `SharedNodeStore` 增长时被换下的旧缓冲代。不释放而是挂进保活链——已被钉住的旧视图可能还在读它。倍增策略下退休总量 < 当前缓冲一倍；预留到位时增长不发生、退休链恒空。整链随 store 一起释放。 |

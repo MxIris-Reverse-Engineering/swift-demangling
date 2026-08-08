@@ -344,6 +344,23 @@ let node = store.reference(at: index).materialize()
 
 Measured on a SwiftUI dyld-cache corpus of 234,232 symbols: 619,688 unique nodes in 8.75 MB of flat storage (14.1 bytes per unique node), built no slower than the `Node` path.
 
+### Incremental Interning with SharedNodeStore
+
+`NodeStoreBuilder` wants its input set up front: `freeze()` is a one-shot barrier, nothing can be read before it and nothing interned after. When the input is discovered over time — type names surfacing while a user browses, late-arriving symbols demangled on demand, trees produced while resolving conformances — use `SharedNodeStore`: a long-lived, thread-safe arena whose `intern`/`demangle` return immediately usable, permanently valid references, with no freeze barrier:
+
+```swift
+let store = SharedNodeStore()                        // one per scope (per image / per process)
+store.reserveCapacity(expectedSymbolCount: 10_000)   // optional, same 0009 coefficients
+
+let nameReference = store.intern(someNodeTree)       // structurally equal trees resolve to
+let sameReference = store.intern(equalCopy)          // the same reference: nameReference == sameReference
+let lateReference = try store.demangle(lateSymbol)   // cache-free demangle straight into the arena
+```
+
+One shared store means one arena for the whole scope: common subtrees deduplicate across everything ever interned, `NodeReference`'s intrinsic `==`/`hash` (store identity + index) is structural equality across the scope, and `Set`/`Dictionary` keys deduplicate naturally. Interning serializes on an internal lock (the demangle parse runs outside it); reads are lock-free apart from resolving the current buffer descriptor. References keep the storage alive even after the `SharedNodeStore` itself is released — interning stops, reading never breaks.
+
+Pick by workload: input set known up front → `NodeStoreBuilder` + `freeze()` (drops its interning tables at freeze, reads with zero indirection); input discovered over time → `SharedNodeStore`. The shape to avoid is one private store per tree — `NodeReference(interning:)` in a loop — which forfeits both deduplication and compactness (measured at 110× the memory of one shared arena on repeated names).
+
 ## Acknowledgments
 
 - [CwlDemangle](https://github.com/mattgallagher/CwlDemangle) by Matt Gallagher — the original Swift translation of the demangler

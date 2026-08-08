@@ -1,13 +1,13 @@
 # 0010 - 可增量共享 interning store：取消 freeze 屏障的长生命周期 NodeStore
 
-- **状态**: In Progress
+- **状态**: Implemented
 - **作者**: JH
 - **创建日期**: 2026-08-08
 - **最后更新**: 2026-08-08
 - **所属愿景**: 无（隶属 `Evolutions/README.md` 愿景第 2 条「内存形态」主线：0001 → 0008 → 0009 之后，面向动态构建场景的下一步）
 - **关联提案**: [0001](0001-node-store-arena.md)（arena 模型与 freeze 语义）、[0008](0008-span-borrowed-views.md)（读路径去 ARC——本提案的性能回归门槛）、[0009](0009-swift-syntax-arena-lessons.md)（容量预估与签发 tag——共享 store 直接复用）
-- **实现分支 / PR**: 待定
-- **配套文档**: 待定 —— 落地时登记实现说明 / 使用指南的链接
+- **实现分支 / PR**: `feature/node-store`（步骤 1–6 各自成 commit，状态更新与收尾批次同 commit）
+- **配套文档**: [`Documentations/NodeStoreArena.md`](../Documentations/NodeStoreArena.md) 新增「共享 store：SharedNodeStore（0010）」一节（实现说明性质：两种构建模型分工、读写协议、退休保活语义）；术语「视图钉扎」「退休缓冲」入 [`Documentations/Glossary.md`](../Documentations/Glossary.md)
 
 ## 摘要
 
@@ -344,3 +344,5 @@ one-off 场景仍然合法），文档补充指向 `SharedNodeStore` 的批量�
 | 2026-08-08 | 步骤 2 落地：不变量断言 | 「子索引 < 父索引」debug 断言钉进 `internInterior`（全部 interior 节点的唯一铸造漏斗，一/二/多子路径共用）。**验收**：506 测试全绿；debug 配置下全 corpus store 对拍（439,522 符号经 `builder.demangle` 全程走 intern 路径）零触发、打印零 mismatch。 |
 | 2026-08-08 | 步骤 3 落地：读侧视图化 | 全部纯读取器迁至 `NodeStore.BufferView`（新文件 `NodeStore+BufferView.swift`），`NodeStore` 方法降为经 `withView` 的委托；冻结 store 的视图为 init 时构建的常量 `let`，公开统计量（`nodeCount` 等）改为经视图解析的计算属性（为步骤 4 的动态计数铺路）。**`UnretainedNodeReference` 重构为「walk 级视图指针 + index」**：0008 的 `Unmanaged` + `_withUnsafeGuaranteedRef` 仪式整体退役——句柄不再触碰 store 对象，walk 入口 `withUnsafePointer(to: pinnedView)` 一次钉住整个 walk（同步路径跨 `StackSafeExecutor` hop 有效：提交帧阻塞等待；async 路径在执行线程上钉）。**验收**：506 测试双路径全绿；release 基准全部持平或更优（store-print default 131,792 sym/s vs 基线 116,827；simplified 163,536 vs 145,133）。测量注脚：本轮基准仅跑 0008 套件，基线是两套件同进程（`MallocCounter` 计数互相污染、CPU 互抢），故 demangle/store-build 的显著「提速」大部分是测法差异而非真实收益；两种测法下均无回归，最终 apples-to-apples 对比在步骤 5 定版。 |
 | 2026-08-08 | 步骤 4 落地：`SharedNodeStore` 本体 | 写侧 `Mutex<NodeStoreBuilder>`（builder 永不 freeze，intern 槽表终生保留——持续去重的来源）；读侧 `SharedViewState`（单 Mutex 槽持「当前描述符 + 当前缓冲 + 退休链」，读者锁内拷出 48 字节描述符）；增长经 `GrowableStoreBuffer.retirementSink`（`@Sendable`，保住 builder 的 `Sendable`）把旧代放进退休链，**空代直接释放**（count 0 的代不可能被任何已发引用寻址）；单一 `NodeStore` 身份锚（`backingStore`），引用经它保活全部缓冲代——**`SharedNodeStore` 本体先亡、引用照常可读**（写者随本体死，内存随引用活）。锁序恒为 writer→view，读者只取 view 锁，无死锁形态。`demangle` 的 transient 解析在写锁外。**验收**：`SharedNodeStoreTests` 10 用例绿（结构去重 `==`、跨增长存活、预留零退休、引用越本体存活、打印/冻结路径 parity、并发去重压力、debug tag exit test）；**TSan 全绿**；corpus 级共享 store 打印对拍 439,522 符号 × 3 选项集 × 双运行时路径 **0 mismatch**（全程 retiredBuffers=0——0009 预留系数覆盖全 corpus）；全量 517 测试双路径绿。 |
+| 2026-08-08 | 步骤 5 落地：基准与验收数字 | **增量基准**（`SharedNodeStoreBenchmarks`，14,000 唯一名字树 × 2 次请求，对照组为「结构哈希缓存 + 每唯一树一个 mini store」即下游规避方案的最优形态）：store 实例 **14,000 → 1**；冷启动 footprint **8.0 → 2.9 MiB**（单模式独立进程）；malloc 事件 **616,023 → 308,046**（−50%）；构建耗时 best **0.054s → 0.031s**（−43%）；驻留 storageBytes 1,332,890 → 1,011,051（合成树文本几乎不共享，此项收益天然有限——真实负载中跨名字公共子树去重会进一步拉开）。**冻结路径定版对比**（与基线 commit e874cbd 完全同形状的两套件同进程 release 运行）：demangle 64,960 vs 64,988 sym/s（持平）；store-build 44,982 vs 43,604（+3.2%）、interning 输出逐字节一致（uniqueNodes=1,267,380、storageBytes=17,863,543）；store-print default **129,529 vs 116,827（+10.9%）**、simplified **164,063 vs 145,133（+13.0%）**、sugared 127,886 vs 129,981（−1.6%，噪声带内）——「冻结路径不许为共享路径买单」成立，视图钉扎反而把打印走快了（0008 的 `Unmanaged` 每访问仪式退役）。**RV 实景 memory graph 复测推迟**：三条小 store 流水线的迁移属 MachOSwiftSection 自己的提案范畴，复测在其迁移落地后进行（已约定其会话届时执行；本仓库内的 14,000 → 1 基准为同形状替代证据）。 |
+| 2026-08-08 | 步骤 6 落地 + In Progress → Implemented | 文档批次：`NodeStoreArena.md` 新增共享 store 一节（实现说明性质——两种构建模型分工表、读写协议、退休保活与陈旧视图安全论证）；README 增量场景示例（与批量 sweep 并列 + 模型选择规则）；`AGENTS.md` Store 要点与 env-gated 套件清单同步；Glossary 登记「视图钉扎」「退休缓冲」。**收尾判断**：配套文档——实现说明并入 `NodeStoreArena.md` 扩节（本提案配套文档字段已登记），不另设使用指南：「walk 钉视图」对外不构成新契约（`NodeReference` 公开 API 零变化，钉扎是引擎内部纪律，SPI 深度消费方经由既有 `DemanglingPrinter` 入口自动获得）；新术语——两条均已入项目术语表。 |
