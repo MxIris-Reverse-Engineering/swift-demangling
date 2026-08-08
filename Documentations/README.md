@@ -67,7 +67,7 @@
   | `0008-span-borrowed-views.md` | `SpanBorrowedViews.md` 的提案原文（双路径设计、Phase 0 基线与逐阶段验收数字都在其 Decision Log）。 |
   | `0009-swift-syntax-arena-lessons.md` | 对 swift-syntax 最新 arena 实现的对照审读产物：builder 按语料常数预估容量（`reserveCapacity`，增长期 realloc 拷贝 12→4 次全为预留本身、冷启动峰值 footprint 减半）、`NodeIndex` 带 debug 签发 tag（把跨 store 误用从 in-range 静默读错变成 debug 期确定性 trap，release 零成本）；另存档三条记录性结论（合并语义参照、文本直达 arena 的阻塞点、惰性 path 层）。 |
   | `0010-appendable-shared-node-store.md` | （Draft）新增 `SharedNodeStore`：长生命周期、线程安全、intern 即发放稳定 `NodeReference` 的共享 arena，取消 freeze 屏障。起因：下游被迫按「每棵树一个小 store」规避，RV 五镜像实测产生 14,451 个 store 实例。 |
-  | `0011-public-transient-demangle-entry.md` | （Draft）`demangleAsNodeTransient` 撤 `@_spi(Internals)` 转正为 public（一次性 demangle 是下游常态，两仓库五处在用），并补测试锁死「transient 树与 canonical 树 remangle 输出逐字节一致」——下游生产路径依赖、此前无守卫的隐式契约。 |
+  | `0011-public-transient-demangle-entry.md` | `demangleAsNodeTransient` 撤 `@_spi(Internals)` 转正为 public（一次性 demangle 是下游常态，两仓库五处在用），并以 `TransientRemangleParityTests` 锁死「transient 树与 canonical 树 remangle 输出逐字节一致」——下游生产路径依赖、此前无守卫的隐式契约。 |
 
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」

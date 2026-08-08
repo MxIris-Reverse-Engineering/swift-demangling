@@ -51,7 +51,7 @@
 | [0008](0008-span-borrowed-views.md) | Span 借用视图：扫描器 UTF-8 字节化与 store 读路径去 ARC（双路径） | Implemented |
 | [0009](0009-swift-syntax-arena-lessons.md) | 借鉴 swift-syntax arena：builder 容量预估与跨 store 误用防护 | Implemented |
 | [0010](0010-appendable-shared-node-store.md) | 可增量共享 interning store：取消 freeze 屏障的长生命周期 NodeStore | Draft |
-| [0011](0011-public-transient-demangle-entry.md) | transient demangle 入口转正为 public + remangle 等价契约测试固化 | Draft |
+| [0011](0011-public-transient-demangle-entry.md) | transient demangle 入口转正为 public + remangle 等价契约测试固化 | Implemented |
 
 ## 流程
 

@@ -40,26 +40,37 @@ public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicRefe
     return try await StackSafeExecutor.executeAsync(demangleBlock)
 }
 
-/// Fully cache-free demangle for transient trees (proposal 0001, Phase 3):
-/// neither leaves nor subtrees are interned into `NodeCache.shared`, so bulk
-/// demangling through `NodeStoreBuilder` does not grow the global cache.
+/// Fully cache-free demangle for transient trees: neither leaves nor subtrees
+/// are interned into `NodeCache.shared`, so nothing the call builds is
+/// retained anywhere once the returned tree is released.
 ///
-/// Exported via `@_spi(Internals)` for bulk-indexing consumers
-/// (MachOSwiftSection's `SymbolIndexStore`) that classify each symbol on the
-/// transient tree before interning it into a `NodeStoreBuilder`, so the whole
-/// pipeline stays off the global cache.
+/// This is the entry to choose for **demangle-and-discard** work — demangle,
+/// extract a string or a classification, drop the tree. That shape is the
+/// norm in reverse-engineering tooling (bulk indexing through
+/// `NodeStoreBuilder`, resolving a display name, deriving a lookup key), and
+/// routing it through the cached ``demangleAsNode(_:isType:symbolicReferenceResolver:internsSubtrees:)``
+/// pins every result in the never-evicting global `NodeCache` for the process
+/// lifetime. Choose `demangleAsNode` only when the returned tree itself is
+/// kept and canonical instances (`===` across symbols) are wanted.
 ///
-/// The returned tree is NOT canonical, but neither is it instance-distinct:
-/// parameterless kinds (`.asyncAnnotation`, `.throwsAnnotation`,
-/// `.labelList`, ...) resolve to the process-wide `NodeFactory` singletons
-/// shared by every tree ever demangled, and the demangler's substitution
-/// back-references reuse one instance for repeated occurrences within the
-/// tree. So neither direction of an identity assumption holds: structurally
-/// equal nodes are not guaranteed distinct, and `NodeCache`'s
-/// structurally-equal-implies-identical guarantee does not apply either.
-/// Per-occurrence logic (deduplication, counting, parent maps) must not key
-/// by `ObjectIdentifier`/`===` — use structural keys.
-@_spi(Internals)
+/// Contracts:
+///
+/// - **The returned tree is NOT canonical, but neither is it
+///   instance-distinct**: parameterless kinds (`.asyncAnnotation`,
+///   `.throwsAnnotation`, `.labelList`, ...) resolve to the process-wide
+///   `NodeFactory` singletons shared by every tree ever demangled, and the
+///   demangler's substitution back-references reuse one instance for repeated
+///   occurrences within the tree. So neither direction of an identity
+///   assumption holds: structurally equal nodes are not guaranteed distinct,
+///   and `NodeCache`'s structurally-equal-implies-identical guarantee does
+///   not apply either. Per-occurrence logic (deduplication, counting, parent
+///   maps) must not key by `ObjectIdentifier`/`===` — use structural keys.
+/// - **Remangling is byte-identical to the canonical path**: for any symbol,
+///   `mangleAsString` over this function's tree equals `mangleAsString` over
+///   `demangleAsNode`'s tree — the remangler matches substitutions
+///   structurally, never by instance identity. Deriving lookup keys by
+///   remangling a transient tree is therefore sound
+///   (`TransientRemangleParityTests` pins this equivalence).
 public func demangleAsNodeTransient(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil) throws(DemanglingError) -> Node {
     let demangleBlock: @Sendable () throws(DemanglingError) -> Node = {
         try demangleAsNodeFromMangledText(mangled, isType: isType, symbolicReferenceResolver: symbolicReferenceResolver, internsSubtrees: false, internsLeaves: false)

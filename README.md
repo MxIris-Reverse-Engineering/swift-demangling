@@ -276,6 +276,14 @@ For one-off demangling where the cache should not grow, opt out per call:
 let node = try demangleAsNode(symbol, internsSubtrees: false)
 ```
 
+For demangle-and-discard work — demangle, extract a string or a classification, drop the tree — use the fully cache-free entry instead. It touches no global state at all (`internsSubtrees: false` still interns leaf nodes), and its tree remangles byte-identically to the canonical path, so deriving lookup keys via `mangleAsString` is sound:
+
+```swift
+let node = try demangleAsNodeTransient(symbol)
+```
+
+Rule of thumb: keeping the tree → `demangleAsNode` (canonical, `===`-comparable instances); dropping the tree → `demangleAsNodeTransient` (nothing is retained behind your back). The transient tree is not canonical — never key logic by instance identity (`===` / `ObjectIdentifier`) on it.
+
 ### Deep Generic Nesting and Thread Stacks
 
 Recursion in the printer, remangler, and type decoder is bounded by fixed depth limits, the same model the Swift compiler uses — but calibrated so they actually fire before the stack dies in **unoptimized builds** (upstream's constants assume release-built frames and an 8MB stack). Every limit clears the deepest real-world symbol measured by 2× or more; a pathologically deep tree degrades to `<<too complex>>` (or a `.tooComplex` / type-lookup error) instead of crashing the process, identically in debug and release.

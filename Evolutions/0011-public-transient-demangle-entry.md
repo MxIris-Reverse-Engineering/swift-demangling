@@ -1,13 +1,13 @@
 # 0011 - transient demangle 入口转正为 public，并以测试固化 remangle 等价契约
 
-- **状态**: Draft
+- **状态**: Implemented
 - **作者**: JH
 - **创建日期**: 2026-08-08
 - **最后更新**: 2026-08-08
 - **所属愿景**: 无（隶属 `Evolutions/README.md` 愿景第 4 条「API 演进：稳定的公共面」）
 - **关联提案**: [0001](0001-node-store-arena.md)（Phase 3 引入该入口）、[0005](0005-remangler-deepequals-memo.md)（替换表结构相等的 memo——本提案要守护的正是这层语义）、[0010](0010-appendable-shared-node-store.md)（同一轮下游排查的产物，彼此独立可先后落地）
-- **实现分支 / PR**: 待定
-- **配套文档**: 待定
+- **实现分支 / PR**: `feature/node-store`（与本提案状态更新同一 commit）
+- **配套文档**: 无独立文档——契约固化在入口 doc comment 与 `TransientRemangleParityTests`，README「Memory Management」节补充「何时选它」决策规则（判定见决策日志）
 
 ## 摘要
 
@@ -187,3 +187,5 @@ public func demangleAsNodeTransient(
 | 日期 | 变更 | 说明 |
 |------|------|------|
 | 2026-08-08 | Created as Draft | 起因：下游驻留排查（0010 同轮）落地后，RV 会话反馈两点——`demangleAsNodeTransient` 的 SPI 门迫使非 bulk-indexing 消费方借道 `@_spi(Internals) import`；其生产路径依赖的「transient 树 remangle 等价」无任何测试守护（当前成立，已两方独立核实替换表为结构相等）。 |
+| 2026-08-08 | Draft → Accepted → In Progress | 维护者审核通过（与 0010 同批批准），随即开始实现。 |
+| 2026-08-08 | In Progress → Implemented | 撤 SPI + doc comment 重写落地（`DemangleInterface.swift`）；`TransientRemangleParityTests` 定向集（7 组固定符号 + doubling DAG 生成符号 + symbolic reference 用例）进默认 `swift test`；全量 506 测试双路径绿（含 `DEMANGLING_FORCE_LEGACY_PATH=1` 重跑定向集）。**corpus 腿裁决：保持 env-gated**，与 0008 print-parity sweep 同族同开关（`DEMANGLING_PRINT_PARITY=1`），不并入默认 oracle——该腿每符号两次 demangle + 两次 remangle，且 canonical 侧把全 corpus 灌入 `NodeCache`；release 实测 47 秒 / 439,533 符号（remangle 可达 439,522，**mismatch 0**），成本不可忽略。**收尾判定**：配套文档——无独立指南，契约固化在 doc comment 与测试内，README「Memory Management」补「何时选它」决策规则；术语——「transient tree」已在 `Documentations/Glossary.md`，无需新增。测试期修正：定向集初版误用 `_TtC5AppKit10NSDocument`（`DualPathParityTests` 的**故意无效**符号，模块长度 5 对不上 6 字符的 "AppKit"），换为合法的 `_TtC6AppKit10NSDocument`。 |
