@@ -430,6 +430,18 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func internInterior(kind: Node.Kind, childIndices: [UInt32]) -> UInt32 {
+        // The bottom-up hash-consing invariant, pinned (proposal 0010,
+        // step 2): every child is interned before its parent, so each child
+        // index is smaller than the index this node already holds (table hit)
+        // or is about to receive (append at `nodes.count`). The shared
+        // store's stale-view safety (step 4) rests on exactly this — a
+        // published view that covers a root index covers the root's whole
+        // subtree, so a reader pinned to an older view can never chase an
+        // edge past its view's bounds.
+        assert(
+            childIndices.allSatisfy { Int($0) < nodes.count },
+            "interior node interned before one of its children — the bottom-up invariant is broken"
+        )
         switch childIndices.count {
         case 1:
             return internCanonicalCompact(CompactNode(
