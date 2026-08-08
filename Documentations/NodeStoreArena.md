@@ -201,8 +201,13 @@ reference，批量管线的 cache-free 成果当场失效。
     共享的符号会被指数展开（SwiftUI `View.Body` 量级即几十万节点），且展开树上按身份
     键的打印缓存会全部脱靶。
 - **下标只对签发它的 store 有效**。`NodeStore.NodeIndex` 是裸值，不带 store 反向引用。
-  跨 store 混用不会被可靠拦截：落在范围内就静默读到无关子树，落在范围外还可能因为
-  edges / text 偏移未经边界检查而 trap。同时持有多个 builder 时需自行保证不混用。
+  **debug 构建**下（提案 [0009](../Evolutions/0009-swift-syntax-arena-lessons.md)），每个
+  builder 铸一个随机起点、逐个递增的 `UInt16` 签发 tag 嵌进它铸出的每个下标，
+  `reference(at:)` 与 `intern(kind:children:)` 校验之——跨 builder/store 混用在开发期是
+  确定性 precondition 失败，最坏的「in-range 静默读到无关子树」形态被优先拦截。
+  **release 构建**下 tag 字段整个不存在（布局与行为与 0009 之前完全一致）：落在范围内
+  就静默读到无关子树，落在范围外还可能因为 edges / text 偏移未经边界检查而 trap。这是
+  开发错误检测，不是安全边界；同时持有多个 builder 时仍需自行保证不混用。
 - **kind 序号不是序列化格式**。它取自 `Node.Kind.allCases` 中的位置，仅在单次进程运行
   内稳定。9 位空间共 512 槽，当前 `Node.Kind` 有 373 个 case，余量 139。本项目持续跟进
   Apple 工具链的 `Demangle::Node::Kind`，超出时由 `kindsByStoreOrdinal` 的
@@ -210,6 +215,13 @@ reference，批量管线的 cache-free 成果当场失效。
   store 路径时才暴露。Phase 4 的持久化格式必须自带稳定的 kind 映射表。
 - **builder 是单写者**。`~Copyable` 保证了这一点，好处是全程无锁，代价是不能跨线程
   共享。多线程批量场景应每线程一个 builder，最后合并——合并 API 尚未实现。
+- **已知符号量时先 `reserveCapacity(expectedSymbolCount:)`**（提案
+  [0009](../Evolutions/0009-swift-syntax-arena-lessons.md)）。三块缓冲与三张 intern 槽
+  数组默认从小容量翻倍增长，整框架构建要付十余次整缓冲拷贝、且每次翻倍瞬间新旧缓冲
+  并存；按预估符号量一次预留可消掉这两者。预估系数按 dyld cache 语料实测标定（来源
+  与数字见 builder 源码内 `ReservationCoefficients` 的注释），估小了退化为正常增长，
+  估大了闲置容量随 store 存续（`freeze()` 有意不做 shrink）。用 `capacityUtilization`
+  复核系数是否漂移。
 - **`Node` 路径完全不受影响**。默认的 `demangleAsNode` 仍然走 `NodeCache` 的叶 + 全树
   interning，行为、输出、身份语义一字未变。
 
@@ -247,7 +259,9 @@ Phase 3 验收（本机 dyld cache SwiftUI 语料 234,232 符号，debug 构建�
 
 - **Phase 4 — 平铺序列化**：三块缓冲直接二进制序列化 / mmap 加载（接近 memcpy 量级），
   把整个 dyld cache 的解析结果持久化为符号数据库。需先定义稳定的 kind 映射与格式版本号。
-- **分片并行 store 与终态合并**：配合每线程一个 builder。
+- **分片并行 store 与终态合并**：配合每线程一个 builder。合并的所有权/防环语义可参照
+  swift-syntax `addChild`，但数据面必须走 re-intern（index 模型没有指针稳定性）——
+  裁决记录见 [0009](../Evolutions/0009-swift-syntax-arena-lessons.md) 的 C.1。
 - **`NodeReference` 层的 `Node.Rewriter` 等价物**：写时拷贝进新 store。
 
 （原列于此的「`Span` / `UTF8Span` 借用视图」已由提案

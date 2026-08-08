@@ -2,9 +2,9 @@
 
 - **Proposal**: 0009
 - **Author**: Mx-Iris
-- **Status**: Draft
+- **Status**: Implemented
 - **Date**: 2026-08-07
-- **Branch**: TBD（未开工）
+- **Branch**: `feature/node-store`
 - **Related**: `Evolutions/0001-node-store-arena.md`（arena 本体；本条缓解其「取舍与
   影响面」记录的跨 store 混用短板，并为其 Phase 4 / 分片合并路线留下参照）；
   `Evolutions/0008-span-borrowed-views.md`（同源审读的另一半：B2 的 unmanaged 句柄
@@ -204,3 +204,10 @@ extension NodeStoreBuilder {
 | 日期 | 决定 | 依据 |
 |---|---|---|
 | 2026-08-07 | Created as Draft | 起因：对 swift-syntax 最新 main 的 arena 实现（`BumpPtrAllocator` / `RawSyntaxArena` / `SyntaxDataArena`）做对照审读；review 指示把可借鉴项从 0008 拆出独立成案。审读的完整对照表见 Motivation；0008 B2 的 unmanaged 句柄模式在同一次审读中获得原厂确证（`RawSyntaxArenaRef = Unmanaged` + 公共层持强/引擎层零 ARC 的分层）。 |
+| 2026-08-08 | Accepted → In Progress | 用户 review 通过，批准实施 A（builder 容量预估）与 B（NodeIndex debug generation tag）。分支沿用 `feature/node-store`（0008 同分支，未推送）。 |
+| 2026-08-08 | A 系数标定：`textBytesPerSymbol` 2.7→2.2、`uniqueTextsPerSymbol` 0.2→0.09，其余（2.9 / 0.3 / 1.0）维持 | 首轮标定跑（454,094 符号 store 语料，release）实测每符号：唯一节点 2.791、many-children 节点 0.280、edge 槽 0.935、文本字节 2.108、唯一文本 0.0815。临时系数（按 0001 的 234k 数据折算）下 textSlots 利用率仅 28%（唯一文本数高估一倍余）；标定后全部缓冲落入目标带（见验收行）。系数与实测值一并写进 `ReservationCoefficients` 的注释。 |
+| 2026-08-08 | A 验收方法修正：footprint 对比必须跨进程量冷启动 pass；「realloc 次数」落地为 ≥1MiB 大分配事件计数 | 首轮在同进程内对最终 pass 采样，phys_footprint 增量≈0——前几轮 pass 释放的页驻留并被 allocator 复用，翻倍尖峰根本到不了 footprint 账本。基准改为 `DEMANGLING_RESERVATION_MODE` 每进程一个模式、冷启动 pass 采样。首轮计时还被本会话并行的文档编辑污染（reserved 第二遍 12.68s 离群），空闲机重跑——0008 已犯过同错，写进基准套件的使用注释。「realloc 次数」用 `MallocCounter` 新增的大分配事件计数（阈值 1 MiB）度量：增长拷贝都是多 MB 级，而窗口总事件 5000 万，不设阈值根本数不出来。 |
+| 2026-08-08 | A 验收通过（454,094 符号语料，release，独立进程、空闲机） | ① 大分配事件（≥1MiB）**12 → 4**：增长期 realloc 拷贝归零，剩余 4 次即预留本身（nodes 16 MiB、compactSlots 8 MiB、edges 1.7 MiB、manyChildrenSlots 1 MiB）。② 冷启动峰值 footprint 增量 **18.0 → 9.0 MiB**：翻倍增长「新旧缓冲并存」的尖峰消掉，减半。③ 构建耗时 best **9.712s → 9.018s**（−7.1%；幅度在 pass 间波动带内、方向有利，realloc 拷贝的绝对量相对 9s 的 demangle 本来就小，如实记录不夸大）。④ 利用率：nodes 91% / edges 93% / textBytes 96% / uniqueTexts 90%，自由定容缓冲全部远超 50% 合格线；槽表 compactSlots 54% / textSlots 56% / manyChildrenSlots 48.6%——槽表被「2 的幂 + 3/4 负载因子」结构性钉在 (37.5%, 75%]，manyChildren 的 48.6% 是其条目数（127,340）下的最优表大小（预估与自然增长落在同一张表），裁定达标：50% 合格线只对自由定容缓冲有意义。 |
+| 2026-08-08 | B 实现偏差：tag 铸造改为「系统熵随机起点 + 单调递增」，非纯随机 | 提案原文「每 builder 唯一即可」——纯随机对相邻两个 builder 有 1/65536 概率同 tag，而相邻 builder 恰是最可能互换 index 的误用场景；随机起点满足「不走可预测源」的本意，递增保证 65,536 个 builder 内绝对唯一。计数器在 `Mutex` 里，仅 debug 构建存在（release 的 `mintStoreTag` 恒返回 0，tag 字段本身也不存在于 `NodeIndex`）。另一处小偏差：tag 以 2 字节常驻 builder 与 store（release 也存），换取 `freeze()`/`NodeStore.init` 签名跨配置一致；`NodeIndex` 的字段仍按提案只在 debug 存在。 |
+| 2026-08-08 | B 验收通过 | debug：两个 exit test（跨 builder 子索引、跨 store `reference(at:)`，均构造成 in-range、仅签发 tag 可拦的形态）确定性 trap ✓；全量 corpus（4,573,306 符号）debug 配置 0 失败，store Phase 3 验收测试（234k 语料）同跑通——tag 校验无误伤 ✓。release：tag 字段与校验整个编译不存在（`#if DEBUG`），行为与 0009 之前逐字节一致，由既有套件覆盖。既有测试中两处直接铸 `NodeIndex(rawValue: 0)` 的写法改为使用 builder 返回的 index——新契约下裸铸外部 index 本就是被拦截的误用形态。 |
+| 2026-08-08 | In Progress → Implemented | 双配置全量套件全绿：debug 502 tests / 31 suites（含 4,573,306 符号对齐 oracle 全过），release 499 tests / 30 suites（少的 3 个正是 debug 专用的 `NodeIndexProvenanceTests`，按设计编译不存在）。文档同批更新：`NodeStoreArena.md`（跨 store 条目改写 + 容量预估条目 + 合并参照回指）、`AGENTS.md`（Store bullet）、`Glossary.md`（签发 tag）、`Documentations/README.md` 与 `Evolutions/README.md` 的 0009 行与愿景措辞。 |

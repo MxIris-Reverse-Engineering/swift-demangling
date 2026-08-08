@@ -364,18 +364,18 @@ struct NodeStoreTests {
 
     @Test func referenceEqualityIsStoreAndIndexBased() {
         var firstBuilder = NodeStoreBuilder()
-        _ = firstBuilder.intern(Node(kind: .identifier, text: "same"))
+        let firstRootIndex = firstBuilder.intern(Node(kind: .identifier, text: "same"))
         let firstStore = firstBuilder.freeze()
 
         var secondBuilder = NodeStoreBuilder()
-        _ = secondBuilder.intern(Node(kind: .identifier, text: "same"))
+        let secondRootIndex = secondBuilder.intern(Node(kind: .identifier, text: "same"))
         let secondStore = secondBuilder.freeze()
 
-        let firstReference = firstStore.reference(at: NodeStore.NodeIndex(rawValue: 0))
-        let secondReference = secondStore.reference(at: NodeStore.NodeIndex(rawValue: 0))
+        let firstReference = firstStore.reference(at: firstRootIndex)
+        let secondReference = secondStore.reference(at: secondRootIndex)
 
         #expect(firstReference != secondReference, "References into different stores should not be equal")
-        #expect(firstReference == firstStore.reference(at: NodeStore.NodeIndex(rawValue: 0)))
+        #expect(firstReference == firstStore.reference(at: firstRootIndex))
     }
 }
 

@@ -62,7 +62,7 @@
   | `0006-interntree-and-demangler-postpass-memo.md` | 一批修复四处按路径计价的整树遍历（`NodeCache.internTree`、demangler 的 opaque-return-type 后处理、`findGenericParamsDepth`、`identifier`）——此前一个 131 字符的构造符号就能把默认 `demangleAsNode` 拖到指数级——并附全库横向排查。 |
   | `0007-short-circuit-queries-and-typedecoder-sweep.md` | 补上 0006 横向排查的分类错误：`first(of:)` / `contains(_:)` 是短路查询而非枚举，出现次数不影响答案，却被留在按路径计价上（实测 22 层加倍 DAG 要 18.2 秒，每 2 层 ×4）。同轮补齐 `TypeDecoder` 两处漏扫的越界守卫，并把 PR #6 全部 15 条 review 发现的裁决落到 `KnownIssues.md`。 |
   | `0008-span-borrowed-views.md` | `SpanBorrowedViews.md` 的提案原文（双路径设计、Phase 0 基线与逐阶段验收数字都在其 Decision Log）。 |
-  | `0009-swift-syntax-arena-lessons.md` | **Draft**。对 swift-syntax 最新 arena 实现的对照审读产物：builder 按语料常数预估容量（消 realloc 拷贝与内存尖峰）、`NodeIndex` 带 debug generation tag（把跨 store 误用从静默读错变成确定性 trap）；另存档三条记录性结论（合并语义参照、文本直达 arena 的阻塞点、惰性 path 层）。 |
+  | `0009-swift-syntax-arena-lessons.md` | 对 swift-syntax 最新 arena 实现的对照审读产物：builder 按语料常数预估容量（`reserveCapacity`，增长期 realloc 拷贝 12→4 次全为预留本身、冷启动峰值 footprint 减半）、`NodeIndex` 带 debug 签发 tag（把跨 store 误用从 in-range 静默读错变成 debug 期确定性 trap，release 零成本）；另存档三条记录性结论（合并语义参照、文本直达 arena 的阻塞点、惰性 path 层）。 |
 
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」

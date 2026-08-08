@@ -552,7 +552,7 @@ extension NodeReference {
         public var endIndex: Int { compactNode.childCount }
 
         public subscript(position: Int) -> NodeReference {
-            NodeReference(store: store, nodeIndex: NodeStore.NodeIndex(rawValue: store.rawChildIndex(of: compactNode, at: position)))
+            NodeReference(store: store, nodeIndex: store.nodeIndex(forRaw: store.rawChildIndex(of: compactNode, at: position)))
         }
     }
 }

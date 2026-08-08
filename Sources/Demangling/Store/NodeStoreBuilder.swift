@@ -1,3 +1,5 @@
+import SwiftStdlibToolbox
+
 /// Append-only builder that constructs a `NodeStore`.
 ///
 /// The builder is noncopyable: exactly one owner may build at a time, and
@@ -60,14 +62,52 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         let length: UInt32
     }
 
-    public init() {}
+    /// Issuance tag for this builder's indices (proposal 0009): debug builds
+    /// embed it in every minted `NodeIndex` and validate it wherever an index
+    /// crosses back in, so an index from another builder fails fast instead
+    /// of silently resolving in-range. Stored in every configuration (2
+    /// bytes, so `freeze()` keeps one signature); read only in debug.
+    private let storeTag: UInt16
+
+    #if DEBUG
+    /// Tag source: a random starting point from system entropy, then
+    /// monotonic — adjacent builders (exactly the plausible misuse pairing)
+    /// always receive distinct tags, and a collision needs 65,536 builders
+    /// created in between.
+    private static let nextStoreTag = Mutex<UInt16>(UInt16.random(in: .min ... .max))
+    #endif
+
+    private static func mintStoreTag() -> UInt16 {
+        #if DEBUG
+        return nextStoreTag.withLockUnchecked { storedTagValue in
+            storedTagValue &+= 1
+            return storedTagValue
+        }
+        #else
+        return 0
+        #endif
+    }
+
+    /// Wraps a raw index as a `NodeIndex` carrying this builder's issuance
+    /// tag (the tag field exists only in debug builds).
+    private func mintIndex(_ rawValue: UInt32) -> NodeStore.NodeIndex {
+        #if DEBUG
+        return NodeStore.NodeIndex(rawValue: rawValue, storeTag: storeTag)
+        #else
+        return NodeStore.NodeIndex(rawValue: rawValue)
+        #endif
+    }
+
+    public init() {
+        storeTag = Self.mintStoreTag()
+    }
 
     // MARK: - Building
 
     /// Interns an existing `Node` tree, returning the canonical index of its root.
     public mutating func intern(_ node: Node) -> NodeStore.NodeIndex {
         var visitedIndices = [ObjectIdentifier: UInt32]()
-        return NodeStore.NodeIndex(rawValue: internTree(node, visitedIndices: &visitedIndices))
+        return mintIndex(internTree(node, visitedIndices: &visitedIndices))
     }
 
     /// Demangles a mangled symbol and interns the resulting tree in one step.
@@ -93,17 +133,17 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
 
     /// Interns a parameterless node.
     public mutating func intern(kind: Node.Kind) -> NodeStore.NodeIndex {
-        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+        mintIndex(internLeaf(kind: kind, contents: .none))
     }
 
     /// Interns a text-carrying leaf node.
     public mutating func intern(kind: Node.Kind, text: String) -> NodeStore.NodeIndex {
-        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .text(text)))
+        mintIndex(internLeaf(kind: kind, contents: .text(text)))
     }
 
     /// Interns an index-carrying leaf node.
     public mutating func intern(kind: Node.Kind, index: UInt64) -> NodeStore.NodeIndex {
-        NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .index(index)))
+        mintIndex(internLeaf(kind: kind, contents: .index(index)))
     }
 
     /// Interns an interior node over already-interned children — e.g. a
@@ -114,19 +154,28 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// Hash-consing is shared with every other insertion route: constructing
     /// a node directly and interning a structurally equal `Node` tree yield
     /// the same index.
-    /// - Precondition: every child index is within this builder's bounds. As
-    ///   with ``NodeStore/reference(at:)`` a `NodeIndex` carries no record of
-    ///   which builder minted it, so an in-range index from another builder
-    ///   resolves silently to a different node; only the bound can be checked.
+    /// - Precondition: every child index was minted by this builder and is
+    ///   within its bounds. Debug builds verify the minting builder through
+    ///   the index's issuance tag (proposal 0009) and trap deterministically
+    ///   on a foreign index. In release the tag does not exist, so — as with
+    ///   ``NodeStore/reference(at:)`` — an in-range index from another
+    ///   builder resolves silently to a different node and only the bound is
+    ///   checked.
     public mutating func intern(kind: Node.Kind, children: [NodeStore.NodeIndex]) -> NodeStore.NodeIndex {
         let childIndices = children.map { childIndex in
+            #if DEBUG
+            precondition(
+                childIndex.storeTag == storeTag,
+                "NodeIndex was minted by a different builder — an index is only valid in the builder (or the store frozen from it) that issued it"
+            )
+            #endif
             precondition(Int(childIndex.rawValue) < nodes.count, "Child index out of range for this builder")
             return childIndex.rawValue
         }
         if childIndices.isEmpty {
-            return NodeStore.NodeIndex(rawValue: internLeaf(kind: kind, contents: .none))
+            return mintIndex(internLeaf(kind: kind, contents: .none))
         }
-        return NodeStore.NodeIndex(rawValue: internInterior(kind: kind, childIndices: childIndices))
+        return mintIndex(internInterior(kind: kind, childIndices: childIndices))
     }
 
     /// Freezes the builder into an immutable, `Sendable` store.
@@ -135,13 +184,134 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// buffers survive. Indices minted by this builder remain valid in the
     /// frozen store.
     public consuming func freeze() -> NodeStore {
-        NodeStore(nodes: nodes, edges: edges, textBytes: textBytes)
+        NodeStore(nodes: nodes, edges: edges, textBytes: textBytes, storeTag: storeTag)
     }
 
     // MARK: - Statistics
 
     /// Number of unique nodes interned so far.
     public var nodeCount: Int { nodes.count }
+
+    // MARK: - Capacity Reservation (proposal 0009)
+
+    /// Per-symbol buffer-sizing coefficients, measured on the dyld-cache
+    /// bulk-build corpus (454,094 unique exported Swift symbols across
+    /// AppKit / UIKitCore / SwiftUI / SwiftUICore / AttributeGraph /
+    /// Foundation / Combine, macOS 26 shared cache; calibration run
+    /// 2026-08-08, recorded in evolution 0009's decision log — measured:
+    /// 2.791 unique nodes, 0.280 many-children nodes, 0.935 edge slots,
+    /// 2.108 text bytes, 0.0815 unique texts per symbol). Each value is the
+    /// measured ratio rounded up a few percent, so a corpus matching the
+    /// calibration shape lands just under the reservation. Re-check against
+    /// ``capacityUtilization`` when the corpus shape drifts.
+    private enum ReservationCoefficients {
+        static let uniqueNodesPerSymbol: Double = 2.9
+        static let manyChildrenNodesPerSymbol: Double = 0.3
+        static let edgeSlotsPerSymbol: Double = 1.0
+        static let textBytesPerSymbol: Double = 2.2
+        static let uniqueTextsPerSymbol: Double = 0.09
+    }
+
+    /// Pre-sizes the three flat buffers and the three interning tables for
+    /// an expected number of interned symbols.
+    ///
+    /// Building a whole-framework store from the default capacities pays
+    /// roughly a dozen full-buffer regrowth copies per buffer, each of which
+    /// transiently keeps the old and the new buffer alive (a ~2× spike on
+    /// that buffer). One reservation up front removes both. Estimates use
+    /// per-symbol coefficients measured on the dyld-cache corpus
+    /// (`ReservationCoefficients`); an undersized reservation degrades to
+    /// the normal growth behavior, an oversized one keeps the slack — for
+    /// the builder's lifetime and into the frozen store, because `freeze()`
+    /// deliberately does not shrink (until mmap serialization lands, a
+    /// shrink would be one more full copy to save capacity that dies with
+    /// the store).
+    ///
+    /// Callable at any point and growing only (a reservation at or below
+    /// current capacity is a no-op). Reserving never changes interning
+    /// results: indices, buffer contents, and the frozen store are identical
+    /// with or without it.
+    public mutating func reserveCapacity(expectedSymbolCount: Int) {
+        guard expectedSymbolCount > 0 else { return }
+        let expectedUniqueNodes = Self.estimatedCount(expectedSymbolCount, ReservationCoefficients.uniqueNodesPerSymbol)
+        let expectedManyChildrenNodes = Self.estimatedCount(expectedSymbolCount, ReservationCoefficients.manyChildrenNodesPerSymbol)
+        let expectedCompactNodes = max(0, expectedUniqueNodes - expectedManyChildrenNodes)
+        let expectedUniqueTexts = Self.estimatedCount(expectedSymbolCount, ReservationCoefficients.uniqueTextsPerSymbol)
+        nodes.reserveCapacity(expectedUniqueNodes)
+        edges.reserveCapacity(Self.estimatedCount(expectedSymbolCount, ReservationCoefficients.edgeSlotsPerSymbol))
+        textBytes.reserveCapacity(Self.estimatedCount(expectedSymbolCount, ReservationCoefficients.textBytesPerSymbol))
+        uniqueTexts.reserveCapacity(expectedUniqueTexts)
+        resizeCompactSlots(to: Self.slotCount(holding: expectedCompactNodes, growingFrom: compactSlots.count))
+        resizeManyChildrenSlots(to: Self.slotCount(holding: expectedManyChildrenNodes, growingFrom: manyChildrenSlots.count))
+        resizeTextSlots(to: Self.slotCount(holding: expectedUniqueTexts, growingFrom: textSlots.count))
+    }
+
+    /// Used-versus-reserved snapshot for re-calibrating the reservation
+    /// coefficients (proposal 0009); not a hot-path API.
+    ///
+    /// For the three interning tables `usedCount` is occupied slots, and a
+    /// well-sized open-addressing table reads between 37.5% and 75% — they
+    /// grow at a 3/4 load factor in power-of-two steps, which bounds the
+    /// achievable utilization. The flat buffers can approach 100%.
+    public var capacityUtilization: CapacityUtilization {
+        CapacityUtilization(
+            nodes: CapacityUtilization.BufferUtilization(usedCount: nodes.count, capacity: nodes.capacity),
+            edges: CapacityUtilization.BufferUtilization(usedCount: edges.count, capacity: edges.capacity),
+            textBytes: CapacityUtilization.BufferUtilization(usedCount: textBytes.count, capacity: textBytes.capacity),
+            compactInternSlots: CapacityUtilization.BufferUtilization(usedCount: compactCount, capacity: compactSlots.count),
+            manyChildrenInternSlots: CapacityUtilization.BufferUtilization(usedCount: manyChildrenCount, capacity: manyChildrenSlots.count),
+            textInternSlots: CapacityUtilization.BufferUtilization(usedCount: uniqueTexts.count, capacity: textSlots.count),
+            uniqueTexts: CapacityUtilization.BufferUtilization(usedCount: uniqueTexts.count, capacity: uniqueTexts.capacity)
+        )
+    }
+
+    /// Capacity-utilization report across every internal buffer; see
+    /// ``capacityUtilization``.
+    public struct CapacityUtilization: Sendable {
+        /// used/capacity of one internal buffer or interning table.
+        public struct BufferUtilization: Sendable {
+            /// Elements in use (flat buffers) or occupied slots (tables).
+            public let usedCount: Int
+            /// Allocated capacity, in elements or slots.
+            public let capacity: Int
+            /// `usedCount / capacity`; 0 while nothing is allocated.
+            public var utilization: Double {
+                capacity == 0 ? 0 : Double(usedCount) / Double(capacity)
+            }
+        }
+
+        public let nodes: BufferUtilization
+        public let edges: BufferUtilization
+        public let textBytes: BufferUtilization
+        public let compactInternSlots: BufferUtilization
+        public let manyChildrenInternSlots: BufferUtilization
+        public let textInternSlots: BufferUtilization
+        public let uniqueTexts: BufferUtilization
+    }
+
+    /// Rounds a per-symbol estimate up to a whole count, clamped to 2^30 so
+    /// an absurd caller value degrades to a huge reservation instead of
+    /// trapping on the `Int` conversion (which a `Double` above `Int.max`
+    /// would — and on watchOS `Int.max` is only 2^31 − 1).
+    private static func estimatedCount(_ symbolCount: Int, _ coefficientPerSymbol: Double) -> Int {
+        let estimated = (Double(symbolCount) * coefficientPerSymbol).rounded(.up)
+        return Int(min(estimated, 1_073_741_824))
+    }
+
+    /// Smallest power-of-two slot count, at least `currentSlotCount`, that
+    /// keeps `expectedEntryCount` entries under the 3/4 load-factor
+    /// threshold the insertion paths grow at. The comparison runs in
+    /// `UInt64` so the arithmetic cannot overflow a 32-bit `Int` (see
+    /// ``mix(_:_:)`` for the width-pinning rationale); the table is capped
+    /// at 2^30 slots.
+    private static func slotCount(holding expectedEntryCount: Int, growingFrom currentSlotCount: Int) -> Int {
+        var proposedSlotCount = currentSlotCount
+        while proposedSlotCount < 1 << 30,
+              (UInt64(expectedEntryCount) + 1) * 4 >= UInt64(proposedSlotCount) * 3 {
+            proposedSlotCount *= 2
+        }
+        return proposedSlotCount
+    }
 
     // MARK: - Interning
 
@@ -329,7 +499,14 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func growCompactSlots() {
-        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: compactSlots.count * 2)
+        resizeCompactSlots(to: compactSlots.count * 2)
+    }
+
+    /// Rehashes the compact-node table into `newSlotCount` slots (a power of
+    /// two). Growing only: a target at or below the current size is a no-op.
+    private mutating func resizeCompactSlots(to newSlotCount: Int) {
+        guard newSlotCount > compactSlots.count else { return }
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: newSlotCount)
         let mask = grownSlots.count - 1
         for existing in compactSlots where existing != Self.emptySlot {
             var slot = Self.hash(of: nodes[Int(existing)]) & mask
@@ -390,7 +567,15 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func growManyChildrenSlots() {
-        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: manyChildrenSlots.count * 2)
+        resizeManyChildrenSlots(to: manyChildrenSlots.count * 2)
+    }
+
+    /// Rehashes the many-children table into `newSlotCount` slots (a power
+    /// of two). Growing only: a target at or below the current size is a
+    /// no-op.
+    private mutating func resizeManyChildrenSlots(to newSlotCount: Int) {
+        guard newSlotCount > manyChildrenSlots.count else { return }
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: newSlotCount)
         let mask = grownSlots.count - 1
         for existing in manyChildrenSlots where existing != Self.emptySlot {
             let compact = nodes[Int(existing)]
@@ -471,7 +656,14 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func growTextSlots() {
-        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: textSlots.count * 2)
+        resizeTextSlots(to: textSlots.count * 2)
+    }
+
+    /// Rehashes the text table into `newSlotCount` slots (a power of two).
+    /// Growing only: a target at or below the current size is a no-op.
+    private mutating func resizeTextSlots(to newSlotCount: Int) {
+        guard newSlotCount > textSlots.count else { return }
+        var grownSlots = ContiguousArray<UInt32>(repeating: Self.emptySlot, count: newSlotCount)
         let mask = grownSlots.count - 1
         for existing in textSlots where existing != Self.emptySlot {
             let location = uniqueTexts[Int(existing)]

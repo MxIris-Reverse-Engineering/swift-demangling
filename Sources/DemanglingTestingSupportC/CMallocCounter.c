@@ -17,26 +17,40 @@ extern malloc_logger_t *malloc_logger;
  * carry bit 4 instead and are deliberately not counted — the metric is gross
  * allocations, not net live blocks. */
 #define DEMANGLING_STACK_LOGGING_TYPE_ALLOC 2u
+#define DEMANGLING_STACK_LOGGING_TYPE_DEALLOC 4u
 
 static _Atomic uint64_t demangling_allocation_event_count;
+static _Atomic uint64_t demangling_large_allocation_event_count;
+static _Atomic uint64_t demangling_large_allocation_threshold = UINT64_MAX;
 
 static void demangling_counting_malloc_logger(uint32_t type, uintptr_t arg1,
                                               uintptr_t arg2, uintptr_t arg3,
                                               uintptr_t result,
                                               uint32_t num_hot_frames_to_skip) {
     (void)arg1;
-    (void)arg2;
-    (void)arg3;
     (void)result;
     (void)num_hot_frames_to_skip;
     if (type & DEMANGLING_STACK_LOGGING_TYPE_ALLOC) {
         atomic_fetch_add_explicit(&demangling_allocation_event_count, 1,
                                   memory_order_relaxed);
+        /* Requested size sits in arg2 for plain allocations; realloc events
+         * carry both the alloc and dealloc bits and move the size to arg3
+         * (arg2 is the old pointer there). */
+        uint64_t requested_size =
+            (type & DEMANGLING_STACK_LOGGING_TYPE_DEALLOC) ? arg3 : arg2;
+        if (requested_size >= atomic_load_explicit(
+                                  &demangling_large_allocation_threshold,
+                                  memory_order_relaxed)) {
+            atomic_fetch_add_explicit(&demangling_large_allocation_event_count,
+                                      1, memory_order_relaxed);
+        }
     }
 }
 
 void demangling_malloc_counter_start(void) {
     atomic_store_explicit(&demangling_allocation_event_count, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&demangling_large_allocation_event_count, 0,
                           memory_order_relaxed);
     malloc_logger = demangling_counting_malloc_logger;
 }
@@ -44,5 +58,16 @@ void demangling_malloc_counter_start(void) {
 uint64_t demangling_malloc_counter_stop(void) {
     malloc_logger = 0;
     return atomic_load_explicit(&demangling_allocation_event_count,
+                                memory_order_relaxed);
+}
+
+void demangling_malloc_counter_set_large_allocation_threshold(
+    uint64_t threshold_bytes) {
+    atomic_store_explicit(&demangling_large_allocation_threshold,
+                          threshold_bytes, memory_order_relaxed);
+}
+
+uint64_t demangling_malloc_counter_large_allocation_event_count(void) {
+    return atomic_load_explicit(&demangling_large_allocation_event_count,
                                 memory_order_relaxed);
 }

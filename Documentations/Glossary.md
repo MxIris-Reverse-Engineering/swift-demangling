@@ -36,6 +36,7 @@
 | **open addressing（开放寻址）** | 冲突时顺着数组往后找空槽的哈希表。本库的槽里**只存 4 字节下标**，键按需回缓冲区取（intern 表 10 MB → 2 MB）。 |
 | **materialize（物化）** | 把 arena 里的紧凑表示重新展开成 `Node` 树。结果是**新实例**，`===` 关联在这条路径上失效。 |
 | **freeze / `~Copyable` / `consuming`** | 构建器不可复制（单写者、无锁），`freeze()` 消费它并丢弃 intern 表，换来类型系统保证的不可变 store。 |
+| **签发 tag（issuance tag）** | debug 构建下每个 builder 铸的 `UInt16` 标记，嵌进它铸出的每个 `NodeIndex`，`reference(at:)` / `intern(kind:children:)` 按 tag 校验签发方——把跨 store 误用最坏的「in-range 静默读到无关子树」变成开发期确定性 trap。release 下字段整个不存在，布局行为不变（0009）。 |
 
 ## 遍历计价 → [Concepts/TraversalCost.md](Concepts/TraversalCost.md)
 

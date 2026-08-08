@@ -18,10 +18,35 @@ public final class NodeStore: Sendable {
         @usableFromInline
         let rawValue: UInt32
 
+        #if DEBUG
+        /// Debug-only issuance tag (proposal 0009): identifies the builder
+        /// (and the store frozen from it) that minted this index.
+        /// ``NodeStore/reference(at:)`` and
+        /// `NodeStoreBuilder.intern(kind:children:)` compare it against
+        /// their own tag, turning the worst cross-store misuse — an
+        /// in-range foreign index silently resolving to an unrelated
+        /// subtree — into a deterministic precondition failure during
+        /// development. Release builds compile the field out entirely:
+        /// layout and behavior are unchanged there, and the check is a
+        /// development-time diagnostic, not a security boundary.
+        ///
+        /// Hashing and equality include the tag in debug: same-store
+        /// comparisons are unaffected, cross-store ones fail earlier —
+        /// semantics only tighten.
+        @usableFromInline
+        let storeTag: UInt16
+
+        @usableFromInline
+        init(rawValue: UInt32, storeTag: UInt16) {
+            self.rawValue = rawValue
+            self.storeTag = storeTag
+        }
+        #else
         @usableFromInline
         init(rawValue: UInt32) {
             self.rawValue = rawValue
         }
+        #endif
     }
 
     @usableFromInline
@@ -33,14 +58,35 @@ public final class NodeStore: Sendable {
     @usableFromInline
     let textBytes: ContiguousArray<UInt8>
 
+    /// Issuance tag inherited from the minting builder; see
+    /// `NodeIndex.storeTag`. Stored in every configuration (2 bytes per
+    /// store, so `init` keeps one signature); read only in debug.
+    @usableFromInline
+    let storeTag: UInt16
+
     init(
         nodes: ContiguousArray<CompactNode>,
         edges: ContiguousArray<UInt32>,
-        textBytes: ContiguousArray<UInt8>
+        textBytes: ContiguousArray<UInt8>,
+        storeTag: UInt16
     ) {
         self.nodes = nodes
         self.edges = edges
         self.textBytes = textBytes
+        self.storeTag = storeTag
+    }
+
+    /// Wraps a raw index produced by in-store navigation (child resolution)
+    /// as a `NodeIndex` carrying this store's issuance tag. Internal on
+    /// purpose: raw indices only come from walking this store's own buffers,
+    /// which cannot produce a foreign index.
+    @usableFromInline
+    func nodeIndex(forRaw rawIndex: UInt32) -> NodeIndex {
+        #if DEBUG
+        return NodeIndex(rawValue: rawIndex, storeTag: storeTag)
+        #else
+        return NodeIndex(rawValue: rawIndex)
+        #endif
     }
 
     // MARK: - Statistics
@@ -71,19 +117,28 @@ public final class NodeStore: Sendable {
     /// mean equal structure. That equivalence is per-store — for references
     /// spanning stores use `structurallyEquals(_:)` / `structuralHash(into:)`.
     ///
-    /// - Precondition: `nodeIndex` is within this store's bounds. A
-    ///   `NodeIndex` is a bare offset with no record of which store minted it,
-    ///   so only the bound can be checked here; keeping indices with their
-    ///   store is the caller's job.
+    /// - Precondition: `nodeIndex` was minted by this store's builder and is
+    ///   within bounds. Debug builds verify the minting store through the
+    ///   index's issuance tag (proposal 0009), so a foreign index fails this
+    ///   precondition deterministically during development.
     ///
-    ///   Passing a foreign index is undefined behavior, not a checked error,
-    ///   and it has two shapes. If it lands in range it resolves to whatever
-    ///   node lives at that offset — silently wrong, but well-formed. It can
-    ///   also *trap*: the node it resolves to carries edge and text offsets
-    ///   minted against the other store, and those are not bounds-checked, so
-    ///   reading its children or text can index past this store's buffers.
-    ///   Do not write recovery code against the silent case alone.
+    ///   In release the tag does not exist and a `NodeIndex` is a bare
+    ///   offset, so only the bound can be checked; keeping indices with
+    ///   their store is the caller's job. There, passing a foreign index is
+    ///   undefined behavior, not a checked error, and it has two shapes. If
+    ///   it lands in range it resolves to whatever node lives at that offset
+    ///   — silently wrong, but well-formed. It can also *trap*: the node it
+    ///   resolves to carries edge and text offsets minted against the other
+    ///   store, and those are not bounds-checked, so reading its children or
+    ///   text can index past this store's buffers. Do not write recovery
+    ///   code against the silent case alone.
     public func reference(at nodeIndex: NodeIndex) -> NodeReference {
+        #if DEBUG
+        precondition(
+            nodeIndex.storeTag == storeTag,
+            "NodeIndex was minted by a different builder/store — an index is only valid in the store whose builder issued it"
+        )
+        #endif
         precondition(Int(nodeIndex.rawValue) < nodes.count, "NodeIndex out of range for this store")
         return NodeReference(store: self, nodeIndex: nodeIndex)
     }

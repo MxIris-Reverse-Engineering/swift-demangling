@@ -17,8 +17,9 @@
    ——性能与内存的所有收益，都不允许用输出偏差换。
 2. **内存形态：从对象树到符号数据库（0001 → 0008 → 0009 → Phase 4）**。已走过的
    路：class 树（48 字节/节点、逐节点 malloc）→ 全子树 interning（驻留 ÷3，0001 的
-   前置）→ arena 平铺（12 字节/节点、`UInt32` 互指，0001）。正在走的路：借用视图
-   （读路径零 ARC、扫描器字节化，0008）与 builder 加固（0009）。终点：三块连续
+   前置）→ arena 平铺（12 字节/节点、`UInt32` 互指，0001）→ 借用视图（读路径零
+   ARC、扫描器字节化，0008）→ builder 加固（容量预估 + debug 签发 tag，0009）。
+   终点：三块连续
    缓冲直接二进制序列化 / mmap 加载（0001 Phase 4）——解析一次 dyld cache，此后
    所有进程 mmap 共享同一份符号数据库，加载接近 memcpy 量级。分片并行构建与终态
    合并（0009 C.1 留有设计参照）是同一终点的横向扩展。
@@ -48,7 +49,7 @@
 | [0006](0006-interntree-and-demangler-postpass-memo.md) | 按路径计价的整树遍历：`internTree` 等四处补 memo/去重 + 横向排查收口 | Implemented |
 | [0007](0007-short-circuit-queries-and-typedecoder-sweep.md) | 短路查询去重 + TypeDecoder 漏扫守卫补齐 | Implemented |
 | [0008](0008-span-borrowed-views.md) | Span 借用视图：扫描器 UTF-8 字节化与 store 读路径去 ARC（双路径） | Implemented |
-| [0009](0009-swift-syntax-arena-lessons.md) | 借鉴 swift-syntax arena：builder 容量预估与跨 store 误用防护 | Draft |
+| [0009](0009-swift-syntax-arena-lessons.md) | 借鉴 swift-syntax arena：builder 容量预估与跨 store 误用防护 | Implemented |
 
 ## 流程
 
