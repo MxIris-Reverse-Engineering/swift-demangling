@@ -66,6 +66,7 @@
   | `0007-short-circuit-queries-and-typedecoder-sweep.md` | 补上 0006 横向排查的分类错误：`first(of:)` / `contains(_:)` 是短路查询而非枚举，出现次数不影响答案，却被留在按路径计价上（实测 22 层加倍 DAG 要 18.2 秒，每 2 层 ×4）。同轮补齐 `TypeDecoder` 两处漏扫的越界守卫，并把 PR #6 全部 15 条 review 发现的裁决落到 `KnownIssues.md`。 |
   | `0008-span-borrowed-views.md` | `SpanBorrowedViews.md` 的提案原文（双路径设计、Phase 0 基线与逐阶段验收数字都在其 Decision Log）。 |
   | `0009-swift-syntax-arena-lessons.md` | 对 swift-syntax 最新 arena 实现的对照审读产物：builder 按语料常数预估容量（`reserveCapacity`，增长期 realloc 拷贝 12→4 次全为预留本身、冷启动峰值 footprint 减半）、`NodeIndex` 带 debug 签发 tag（把跨 store 误用从 in-range 静默读错变成 debug 期确定性 trap，release 零成本）；另存档三条记录性结论（合并语义参照、文本直达 arena 的阻塞点、惰性 path 层）。 |
+  | `0010-appendable-shared-node-store.md` | （Draft）新增 `SharedNodeStore`：长生命周期、线程安全、intern 即发放稳定 `NodeReference` 的共享 arena，取消 freeze 屏障。起因：下游被迫按「每棵树一个小 store」规避，RV 五镜像实测产生 14,451 个 store 实例。 |
 
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」
