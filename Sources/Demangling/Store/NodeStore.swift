@@ -12,9 +12,13 @@
 ///
 /// `@unchecked` only because the buffers are self-managed allocations
 /// (proposal 0010, step 1) the compiler cannot see the immutability of: every
-/// stored property is `let`, the `StoreBuffer` contents are written only by
-/// the builder this store was frozen from, and freezing consumes the builder,
-/// so no writer exists once the store does.
+/// stored property is `let`, and published buffer contents are never written
+/// again. A frozen store has no writer at all (freezing consumes the
+/// builder). A store serving as a `SharedNodeStore`'s identity anchor
+/// (proposal 0010, step 4) has a writer, but it only ever appends past the
+/// published counts and republishes the descriptor through the locked slot in
+/// `SharedViewState` — elements a reader can reach through any published view
+/// are write-once.
 public final class NodeStore: @unchecked Sendable {
     /// A stable identifier of a node within its store.
     ///
@@ -71,9 +75,17 @@ public final class NodeStore: @unchecked Sendable {
 
     /// The frozen store's constant view descriptor (proposal 0010, step 3):
     /// built once at init from the handed-over buffers, resolved by every
-    /// read through ``withView(_:)``.
+    /// read through ``withView(_:)``. For a shared store this holds the empty
+    /// initial view and is never read past init — ``withView(_:)`` resolves
+    /// through ``sharedViewState`` instead.
     @usableFromInline
     let view: BufferView
+
+    /// Present exactly when this store is the identity anchor of a
+    /// `SharedNodeStore` (proposal 0010, step 4): the mutable view slot plus
+    /// the buffer keepalive chain. `nil` for every frozen store.
+    @usableFromInline
+    let sharedViewState: SharedViewState?
 
     /// Issuance tag inherited from the minting builder; see
     /// `NodeIndex.storeTag`. Stored in every configuration (2 bytes per
@@ -95,19 +107,49 @@ public final class NodeStore: @unchecked Sendable {
             edges: UnsafeBufferPointer(start: edgesStorage.baseAddress, count: edgeCount),
             textBytes: UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount)
         )
+        self.sharedViewState = nil
+        self.storeTag = storeTag
+    }
+
+    /// The shared-store identity anchor (proposal 0010, step 4): starts over
+    /// the builder's initial (empty) buffers; every subsequent read resolves
+    /// the current descriptor through `sharedViewState`.
+    init(
+        sharedViewState: SharedViewState,
+        nodesStorage: StoreBuffer<CompactNode>,
+        edgesStorage: StoreBuffer<UInt32>,
+        textStorage: StoreBuffer<UInt8>,
+        storeTag: UInt16
+    ) {
+        self.nodesStorage = nodesStorage
+        self.edgesStorage = edgesStorage
+        self.textStorage = textStorage
+        self.view = BufferView(
+            nodes: UnsafeBufferPointer(start: nodesStorage.baseAddress, count: 0),
+            edges: UnsafeBufferPointer(start: edgesStorage.baseAddress, count: 0),
+            textBytes: UnsafeBufferPointer(start: textStorage.baseAddress, count: 0)
+        )
+        self.sharedViewState = sharedViewState
         self.storeTag = storeTag
     }
 
     /// Resolves the current view descriptor and runs `body` over it — the
     /// single read gate every accessor and every walk entry goes through.
     ///
-    /// For a frozen store this is a plain load of the constant descriptor.
-    /// The shared store (step 4) adds its mutable-slot branch here; walks pin
-    /// the resolved view for their whole duration, per-access reads resolve
-    /// fresh each time.
+    /// For a frozen store this is a plain load of the constant descriptor
+    /// behind one predicted-nil branch. For a shared store it copies the
+    /// published descriptor out of the mutable slot (a locked 48-byte copy;
+    /// see `SharedViewState`) — walks pin the resolved view once for their
+    /// whole duration, per-access reads resolve fresh each time. Stale views
+    /// stay safe: retired buffer generations are kept alive, and the
+    /// bottom-up invariant (step 2) means any view covering a root index
+    /// covers the root's whole subtree.
     @usableFromInline
     func withView<Result>(_ body: (BufferView) throws -> Result) rethrows -> Result {
-        try body(view)
+        if let sharedViewState {
+            return try body(sharedViewState.currentView())
+        }
+        return try body(view)
     }
 
     /// The resolved view as a value, for direct-return borrows that cannot

@@ -59,6 +59,15 @@ struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
     @usableFromInline
     private(set) var count: Int = 0
 
+    /// Present only when a shared store owns the enclosing builder (proposal
+    /// 0010, step 4): receives each grown-out generation that published
+    /// reader views may still address, so the owner can keep it alive.
+    /// Without a sink (the frozen build-then-freeze flow) old generations
+    /// simply deallocate — no reader can hold a view before `freeze()`.
+    /// `@Sendable` so the enclosing builder keeps its `Sendable` conformance.
+    @usableFromInline
+    var retirementSink: (@Sendable (AnyObject) -> Void)?
+
     @usableFromInline
     init() {
         storage = StoreBuffer(capacity: 0)
@@ -119,6 +128,12 @@ struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
         let grownStorage = StoreBuffer<Element>(capacity: newCapacity)
         if count > 0 {
             grownStorage.baseAddress.initialize(from: storage.baseAddress, count: count)
+            // Only a generation that ever held elements can be addressed by a
+            // published view that dereferences: a view over an empty
+            // generation has count 0 everywhere and every bounds check on it
+            // fails before any pointer is chased. So empty generations free
+            // immediately even under a sink.
+            retirementSink?(storage)
         }
         storage = grownStorage
     }

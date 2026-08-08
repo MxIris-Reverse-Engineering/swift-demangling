@@ -184,6 +184,38 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         return mintIndex(internInterior(kind: kind, childIndices: childIndices))
     }
 
+    // MARK: - Shared-store wiring (proposal 0010, step 4)
+
+    // The internal seams `SharedNodeStore` builds on: it owns a builder for
+    // the store's whole lifetime (never freezing, so the interning tables —
+    // the source of persistent dedup — are never dropped), publishes a fresh
+    // view after every intern, and keeps grown-out buffer generations alive
+    // for readers pinned to older views.
+
+    /// The issuance tag this builder mints indices with; the shared store's
+    /// `NodeStore` identity is created with the same tag so debug-build
+    /// provenance checks work unchanged.
+    var issuedStoreTag: UInt16 { storeTag }
+
+    /// The current buffer generations and their initialized counts — what a
+    /// shared store publishes as its readers' view descriptor after an
+    /// intern.
+    var bufferSnapshot: (
+        nodesStorage: StoreBuffer<CompactNode>, nodeCount: Int,
+        edgesStorage: StoreBuffer<UInt32>, edgeCount: Int,
+        textStorage: StoreBuffer<UInt8>, textByteCount: Int
+    ) {
+        (nodes.storage, nodes.count, edges.storage, edges.count, textBytes.storage, textBytes.count)
+    }
+
+    /// Installs the grown-generation keepalive hook on all three flat
+    /// buffers; see `GrowableStoreBuffer.retirementSink`.
+    mutating func installRetirementSink(_ sink: @escaping @Sendable (AnyObject) -> Void) {
+        nodes.retirementSink = sink
+        edges.retirementSink = sink
+        textBytes.retirementSink = sink
+    }
+
     /// Freezes the builder into an immutable, `Sendable` store.
     ///
     /// Consumes the builder; interning tables are dropped, only the flat
