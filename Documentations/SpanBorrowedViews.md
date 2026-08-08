@@ -191,6 +191,10 @@ class 属性取 `ContiguousArray`」的重复加载提出循环。memo 语义逐
 
 ## 验证工具箱
 
+这里只列 0008 专属的复跑命令与验收数字；各计量工具本身的原理、使用契约与判读的坑
+（malloc 计数、footprint 采样、interpose 计数、基准纪律）集中在
+[MeasurementToolbox.md](MeasurementToolbox.md)。
+
 全部可重复，验收数字（2026-08-07，arm64 本机，release）随各命令附注：
 
 ```bash

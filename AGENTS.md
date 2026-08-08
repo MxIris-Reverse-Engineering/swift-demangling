@@ -24,6 +24,8 @@ swift test --filter DemanglingTests.NodeBuilderTests/initWithExistingNode
 
 Tests use the Swift Testing framework (`@Suite`, `@Test`, `#expect`, `Issue.record`), **not** XCTest.
 
+Benchmarks and heavy sweeps are env-gated and release-only: `DEMANGLING_BENCHMARK=1` enables the throughput/allocation suites (`SpanBorrowedViewsBenchmarks`, `NodeStoreReservationBenchmarks`), `DEMANGLING_PRINT_PARITY=1` the corpus-scale print-parity sweep, and `DEMANGLING_FORCE_LEGACY_PATH=1` re-runs anything on the pre-macOS 26 path. The full-corpus alignment oracle needs no switch — it runs in the default `swift test`. Before measuring anything, read `Documentations/MeasurementToolbox.md`: it records each instrument's contract and the pitfalls that have produced wrong numbers before (benchmarks need an idle machine, footprint comparisons need one mode per process on the cold pass, and release test builds must use `swift test -c release`, not `swift build -c release --build-tests`).
+
 ## Architecture
 
 ### Core Pipeline

@@ -299,12 +299,15 @@ When demangling a whole binary and keeping every result, `NodeStore` stores node
 
 ```swift
 var builder = NodeStoreBuilder()
+builder.reserveCapacity(expectedSymbolCount: symbols.count)
 var rootIndices: [NodeStore.NodeIndex] = []
 for symbol in symbols {
     rootIndices.append(try builder.demangle(symbol))
 }
 let store = builder.freeze()
 ```
+
+`reserveCapacity(expectedSymbolCount:)` is optional but recommended when the symbol count is known up front (it usually is — one image, one builder): it pre-sizes every internal buffer from corpus-measured per-symbol constants, so a bulk build pays no buffer-regrowth copies and none of their transient memory spikes. An undersized estimate just degrades to normal growth; `capacityUtilization` reports used-versus-reserved per buffer.
 
 Nodes are addressed by `NodeReference`, a 16-byte value handle that mirrors `Node`'s accessors. Printing and type decoding read directly from the arena — no `Node` tree is materialized:
 
@@ -319,6 +322,8 @@ for child in reference.children where child.kind == .identifier {
 ```
 
 The builder hash-conses on insert, so structurally equal subtrees collapse to one index and `NodeReference` equality is O(1) within a store. This path never touches `NodeCache.shared`, so bulk indexing leaves global state untouched.
+
+A `NodeIndex` is only meaningful in the store whose builder minted it. Debug builds enforce this: every index carries its builder's issuance tag, and handing it to another builder or store fails a precondition immediately instead of silently resolving to an unrelated node (release builds compile the tag out — same layout and behavior as before).
 
 Interop with the `Node` API stays available in both directions — `builder.intern(existingNode)` imports a tree, and `reference.materialize()` rebuilds a standalone one:
 
