@@ -1,6 +1,6 @@
 # 0010 - 可增量共享 interning store：取消 freeze 屏障的长生命周期 NodeStore
 
-- **状态**: Draft
+- **状态**: In Progress
 - **作者**: JH
 - **创建日期**: 2026-08-08
 - **最后更新**: 2026-08-08
@@ -339,3 +339,5 @@ one-off 场景仍然合法），文档补充指向 `SharedNodeStore` 的批量�
 | 日期 | 变更 | 说明 |
 |------|------|------|
 | 2026-08-08 | Created as Draft | 起因：RV 五镜像 memory graph 实测 14,451 个 `NodeStore` 实例（意图形状为 5 个）；排查确认下游三条小 store 流水线均为对「freeze 屏障 + `NodeReference(interning:)` 每调用一 store」这一库侧缺口的规避。序列化方向被维护者暂缓后，本提案为动态构建场景仅剩两条结构级优化中收益/成本比更高的一条。 |
+| 2026-08-08 | Draft → Accepted → In Progress | 维护者审核通过（与 0011 同批批准），按落地步骤 1–6 顺序实现。 |
+| 2026-08-08 | 步骤 1 落地：缓冲引擎替换 | 三块平铺缓冲从 `ContiguousArray` 迁到自管理 `StoreBuffer`（final class，`deinit` 释放）+ builder 侧 `GrowableStoreBuffer` 门面；`freeze()` 变为所有权移交。读侧越界语义保持（显式 precondition 对齐原数组下标的 release trap）；`withSpans` 的 0008 双路径收敛为单路径（`UnsafeBufferPointer.span` 全运行时可用）。**验收**：506 测试双路径全绿；interning 结果逐字节一致（uniqueNodes=1,267,380、storageBytes=17,863,543 与基线完全相同）；吞吐持平或更优（store-print default 116,827→129,142 sym/s，store-build 43,604→45,098 sym/s，demangle 持平）；0009 预留性质完好且更紧（单进程对测：reserved 冷启动 9.0 MiB < unreserved 11.5 MiB，大分配 4 < 13 次；nodes 预留利用率 73%→96%——精确容量分配替代了 `ContiguousArray` 的 malloc 桶取整）。**两处已记录的行为注脚**：`NodeReference.textUTF8` 从零拷贝切片变为拷贝桥（该 API 自 0008 起即标注「新代码请用借用形式」，字节语义不变）；`CompactNode` 显式声明 `BitwiseCopyable`（`@usableFromInline` 类型不参与自动推断）。 |

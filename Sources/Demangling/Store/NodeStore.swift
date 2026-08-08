@@ -9,7 +9,13 @@
 ///
 /// The store is deeply immutable after freezing, so it is `Sendable` and reads
 /// take no locks. See evolution proposal 0001 for the overall design.
-public final class NodeStore: Sendable {
+///
+/// `@unchecked` only because the buffers are self-managed allocations
+/// (proposal 0010, step 1) the compiler cannot see the immutability of: every
+/// stored property is `let`, the `StoreBuffer` contents are written only by
+/// the builder this store was frozen from, and freezing consumes the builder,
+/// so no writer exists once the store does.
+public final class NodeStore: @unchecked Sendable {
     /// A stable identifier of a node within its store.
     ///
     /// Indices are minted by `NodeStoreBuilder` and remain valid in the
@@ -49,14 +55,28 @@ public final class NodeStore: Sendable {
         #endif
     }
 
-    @usableFromInline
-    let nodes: ContiguousArray<CompactNode>
+    // Storage handed over from the builder at freeze (proposal 0010, step 1):
+    // the `StoreBuffer` allocations move here by reference, no element copy.
+    // Counts are the initialized prefixes; capacity beyond them is the
+    // reservation slack `freeze()` deliberately keeps.
 
     @usableFromInline
-    let edges: ContiguousArray<UInt32>
+    let nodesStorage: StoreBuffer<CompactNode>
 
     @usableFromInline
-    let textBytes: ContiguousArray<UInt8>
+    let edgesStorage: StoreBuffer<UInt32>
+
+    @usableFromInline
+    let textStorage: StoreBuffer<UInt8>
+
+    /// Number of unique nodes in the store.
+    public let nodeCount: Int
+
+    /// Number of child-edge slots used by nodes with three or more children.
+    public let edgeCount: Int
+
+    /// Number of deduplicated UTF-8 text bytes.
+    public let textByteCount: Int
 
     /// Issuance tag inherited from the minting builder; see
     /// `NodeIndex.storeTag`. Stored in every configuration (2 bytes per
@@ -65,14 +85,17 @@ public final class NodeStore: Sendable {
     let storeTag: UInt16
 
     init(
-        nodes: ContiguousArray<CompactNode>,
-        edges: ContiguousArray<UInt32>,
-        textBytes: ContiguousArray<UInt8>,
+        nodesStorage: StoreBuffer<CompactNode>, nodeCount: Int,
+        edgesStorage: StoreBuffer<UInt32>, edgeCount: Int,
+        textStorage: StoreBuffer<UInt8>, textByteCount: Int,
         storeTag: UInt16
     ) {
-        self.nodes = nodes
-        self.edges = edges
-        self.textBytes = textBytes
+        self.nodesStorage = nodesStorage
+        self.nodeCount = nodeCount
+        self.edgesStorage = edgesStorage
+        self.edgeCount = edgeCount
+        self.textStorage = textStorage
+        self.textByteCount = textByteCount
         self.storeTag = storeTag
     }
 
@@ -91,21 +114,12 @@ public final class NodeStore: Sendable {
 
     // MARK: - Statistics
 
-    /// Number of unique nodes in the store.
-    public var nodeCount: Int { nodes.count }
-
-    /// Number of child-edge slots used by nodes with three or more children.
-    public var edgeCount: Int { edges.count }
-
-    /// Number of deduplicated UTF-8 text bytes.
-    public var textByteCount: Int { textBytes.count }
-
-    /// Total payload bytes of the flat buffers (excluding the containers'
+    /// Total payload bytes of the flat buffers (excluding the buffers'
     /// own headers and growth slack).
     public var storageByteCount: Int {
-        nodes.count * MemoryLayout<CompactNode>.stride
-            + edges.count * MemoryLayout<UInt32>.stride
-            + textBytes.count
+        nodeCount * MemoryLayout<CompactNode>.stride
+            + edgeCount * MemoryLayout<UInt32>.stride
+            + textByteCount
     }
 
     // MARK: - Access
@@ -139,30 +153,34 @@ public final class NodeStore: Sendable {
             "NodeIndex was minted by a different builder/store — an index is only valid in the store whose builder issued it"
         )
         #endif
-        precondition(Int(nodeIndex.rawValue) < nodes.count, "NodeIndex out of range for this store")
+        precondition(Int(nodeIndex.rawValue) < nodeCount, "NodeIndex out of range for this store")
         return NodeReference(store: self, nodeIndex: nodeIndex)
     }
 
     @usableFromInline
     func compactNode(at rawIndex: UInt32) -> CompactNode {
-        nodes[Int(rawIndex)]
+        // Bounds-checked in release too, matching the `ContiguousArray`
+        // subscript this replaced: an out-of-range index traps instead of
+        // reading past the allocation.
+        precondition(Int(rawIndex) < nodeCount, "Node index out of range for this store")
+        return nodesStorage.baseAddress[Int(rawIndex)]
     }
 
     @usableFromInline
     func text(offset: UInt32, length: UInt32) -> String {
         let start = Int(offset)
         let end = start + Int(length)
+        precondition(end <= textByteCount, "Text range out of range for this store")
+        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress + start, count: Int(length))
         // Every stored text was interned from a whole `String.utf8` payload,
         // so any (offset, length) a node payload produces is a complete valid
         // UTF-8 text — unchecked materialization skips only the revalidation
         // scan (proposal 0008, B1). Legacy runtimes keep the validating
         // decode.
         if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
-            return textBytes[start ..< end].withUnsafeBufferPointer { buffer in
-                String(copying: UTF8Span(unchecked: buffer.span))
-            }
+            return String(copying: UTF8Span(unchecked: textBuffer.span))
         }
-        return String(decoding: textBytes[start ..< end], as: UTF8.self)
+        return String(decoding: textBuffer, as: UTF8.self)
     }
 
     // MARK: - Shared node accessors
@@ -186,7 +204,9 @@ public final class NodeStore: Sendable {
             }
         case .manyChildren:
             precondition(position >= 0 && position < Int(compact.payloadWord1), "Child index out of range")
-            return edges[Int(compact.payloadWord0) + position]
+            let edgeIndex = Int(compact.payloadWord0) + position
+            precondition(edgeIndex < edgeCount, "Edge index out of range for this store")
+            return edgesStorage.baseAddress[edgeIndex]
         case .none, .index, .text:
             preconditionFailure("Child index out of range for a node without children")
         }
@@ -270,10 +290,10 @@ public final class NodeStore: Sendable {
         let compact = compactNode(at: rawIndex)
         guard case .text = compact.payloadKind else { return nil }
         let start = Int(compact.payloadWord0)
-        let end = start + Int(compact.payloadWord1)
-        return try textBytes[start ..< end].withUnsafeBufferPointer { buffer in
-            try body(buffer.span)
-        }
+        let length = Int(compact.payloadWord1)
+        precondition(start + length <= textByteCount, "Text range out of range for this store")
+        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress + start, count: length)
+        return try body(textBuffer.span)
     }
 
     /// Allocation-free text comparison against an ASCII needle, with the
@@ -300,27 +320,19 @@ public final class NodeStore: Sendable {
     // MARK: - Buffer borrows (proposal 0008, B2)
 
     /// Borrows the three flat buffers at once for a tight read loop, hoisting
-    /// the class-property loads out of the loop. Axis-1 dual path: modern
-    /// runtimes take the `.span` properties directly, older ones bridge
-    /// through `withUnsafeBufferPointer`.
+    /// the class-property loads out of the loop.
+    ///
+    /// Single-path since the buffers became self-managed (proposal 0010,
+    /// step 1): `UnsafeBufferPointer.span` is available on every supported
+    /// runtime, so the 0008 dual path this method used to carry — modern
+    /// `.span` properties versus nested `withUnsafeBufferPointer` bridges —
+    /// collapsed into one spelling. `self` anchors the storage for the whole
+    /// call; the locals anchor the spans' borrows.
     func withSpans<Result>(_ body: (Span<CompactNode>, Span<UInt32>, Span<UInt8>) throws -> Result) rethrows -> Result {
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
-            // Local CoW copies (three retains, no element copies) anchor the
-            // buffers for the spans' scope — a span taken straight off a
-            // class property is scoped to the property access and cannot even
-            // reach the `body` call.
-            let nodesBuffer = nodes
-            let edgesBuffer = edges
-            let textBytesBuffer = textBytes
-            return try body(nodesBuffer.span, edgesBuffer.span, textBytesBuffer.span)
-        }
-        return try nodes.withUnsafeBufferPointer { nodeBuffer in
-            try edges.withUnsafeBufferPointer { edgeBuffer in
-                try textBytes.withUnsafeBufferPointer { textBuffer in
-                    try body(nodeBuffer.span, edgeBuffer.span, textBuffer.span)
-                }
-            }
-        }
+        let nodesBuffer = UnsafeBufferPointer(start: nodesStorage.baseAddress, count: nodeCount)
+        let edgesBuffer = UnsafeBufferPointer(start: edgesStorage.baseAddress, count: edgeCount)
+        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount)
+        return try body(nodesBuffer.span, edgesBuffer.span, textBuffer.span)
     }
 
     #if hasFeature(Lifetimes)
@@ -335,14 +347,13 @@ public final class NodeStore: Sendable {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
     @_lifetime(borrow self)
     public borrowing func textBytesSpan() -> Span<UInt8> {
-        // A span taken straight off the class property is scoped to that
-        // property access and may not leave the method; the local CoW copy
-        // (one retain, no element copies) anchors the shared buffer while the
-        // span is formed, and the override rebinds its dependence to `self`,
-        // which owns the same buffer through the immutable stored property —
-        // exactly the contract `@_lifetime(borrow self)` states.
-        let sharedBuffer = textBytes
-        let span = sharedBuffer.span
+        // The span is formed over the raw buffer and would otherwise be
+        // scoped to the local `UnsafeBufferPointer`; the override rebinds its
+        // dependence to `self`, which owns the allocation through the
+        // immutable stored `StoreBuffer` — exactly the contract
+        // `@_lifetime(borrow self)` states.
+        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount)
+        let span = textBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }
 
@@ -352,8 +363,8 @@ public final class NodeStore: Sendable {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
     @_lifetime(borrow self)
     borrowing func nodesSpan() -> Span<CompactNode> {
-        let sharedBuffer = nodes
-        let span = sharedBuffer.span
+        let nodesBuffer = UnsafeBufferPointer(start: nodesStorage.baseAddress, count: nodeCount)
+        let span = nodesBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }
 
@@ -363,8 +374,8 @@ public final class NodeStore: Sendable {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
     @_lifetime(borrow self)
     borrowing func edgesSpan() -> Span<UInt32> {
-        let sharedBuffer = edges
-        let span = sharedBuffer.span
+        let edgesBuffer = UnsafeBufferPointer(start: edgesStorage.baseAddress, count: edgeCount)
+        let span = edgesBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }
     #endif
@@ -383,7 +394,8 @@ public final class NodeStore: Sendable {
         case .manyChildren:
             let edgesStart = Int(compact.payloadWord0)
             let childCount = Int(compact.payloadWord1)
-            return (edgesStart ..< (edgesStart + childCount)).map { edges[$0] }
+            precondition(edgesStart + childCount <= edgeCount, "Edge range out of range for this store")
+            return (edgesStart ..< (edgesStart + childCount)).map { edgesStorage.baseAddress[$0] }
         }
     }
 

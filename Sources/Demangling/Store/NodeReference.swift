@@ -107,20 +107,27 @@ public struct NodeReference: Sendable {
         store.textOfNode(at: nodeIndex.rawValue)
     }
 
-    /// Zero-copy view of this node's text as UTF-8 bytes in the store's
-    /// string table. Only covers text physically stored in the table;
+    /// This node's text as UTF-8 bytes from the store's string table. Only
+    /// covers text physically stored in the table;
     /// `.dependentGenericParamType`'s synthesized name is not included
     /// (use `text` for the composed form).
     ///
-    /// Retained for source stability. New code should prefer
-    /// ``withTextUTF8(_:)`` (or, on modern runtimes, ``textUTF8Span()``):
-    /// the slice carries an owner reference, so every access pays a
-    /// retain/release the borrowed forms avoid.
+    /// Retained for source stability, and a **copying** bridge since the
+    /// string table moved off `ContiguousArray` into self-managed storage
+    /// (proposal 0010, step 1): every access allocates the returned slice.
+    /// New code should prefer ``withTextUTF8(_:)`` (or, on modern runtimes,
+    /// ``textUTF8Span()``), which borrow the stored bytes without copying.
     public var textUTF8: ArraySlice<UInt8>? {
         let compact = compactNode
         guard case .text = compact.payloadKind else { return nil }
-        let start = Int(compact.payloadWord0)
-        return store.textBytes[start ..< start + Int(compact.payloadWord1)]
+        return store.withTextUTF8(at: nodeIndex.rawValue) { spanBytes in
+            var copiedBytes = [UInt8]()
+            copiedBytes.reserveCapacity(spanBytes.count)
+            for byteOffset in 0 ..< spanBytes.count {
+                copiedBytes.append(spanBytes[byteOffset])
+            }
+            return copiedBytes[...]
+        }
     }
 
     /// Borrows this node's text as UTF-8 bytes in the store's string table
@@ -150,12 +157,14 @@ public struct NodeReference: Sendable {
         let compact = compactNode
         guard case .text = compact.payloadKind else { return nil }
         let start = Int(compact.payloadWord0)
-        // Local CoW copy anchors the buffer while the span forms; the
-        // override rebinds the dependence to `self`, which keeps the store —
-        // and with it the same buffer — alive. See
-        // `NodeStore.textBytesSpan()` for the full reasoning.
-        let sharedBuffer = store.textBytes
-        let span = sharedBuffer.span.extracting(start ..< start + Int(compact.payloadWord1))
+        let length = Int(compact.payloadWord1)
+        precondition(start + length <= store.textByteCount, "Text range out of range for this store")
+        // The span is formed over the raw storage; the override rebinds its
+        // dependence to `self`, which keeps the store — and with it the
+        // allocation — alive. See `NodeStore.textBytesSpan()` for the full
+        // reasoning.
+        let textBuffer = UnsafeBufferPointer(start: store.textStorage.baseAddress + start, count: length)
+        let span = textBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }
     #endif

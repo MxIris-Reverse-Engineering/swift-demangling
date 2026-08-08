@@ -6,7 +6,7 @@
 /// invariant of `Node.Payload`: a node carries either contents (text/index)
 /// or children, never both.
 @usableFromInline
-struct CompactNode: Hashable, Sendable {
+struct CompactNode: Hashable, Sendable, BitwiseCopyable {
     /// Bits 0-8: kind ordinal (see `Node.Kind.storeOrdinal`).
     /// Bits 9-11: payload kind. Bits 12-15: reserved.
     @usableFromInline

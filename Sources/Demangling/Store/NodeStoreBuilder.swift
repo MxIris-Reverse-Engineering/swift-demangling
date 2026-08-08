@@ -26,9 +26,15 @@ import SwiftStdlibToolbox
 /// ``NodeReference`` for the boundary and `Documentations/NodeStoreArena.md`
 /// for the measurements.
 public struct NodeStoreBuilder: ~Copyable, Sendable {
-    private var nodes: ContiguousArray<CompactNode> = []
-    private var edges: ContiguousArray<UInt32> = []
-    private var textBytes: ContiguousArray<UInt8> = []
+    // The three flat buffers live in self-managed `StoreBuffer` allocations
+    // (proposal 0010, step 1): `freeze()` hands them to the frozen store as an
+    // ownership transfer, and the shared store (step 4) controls growth
+    // retirement explicitly. The builder being `~Copyable` is load-bearing
+    // here — a copied builder would alias the class-backed storage with a
+    // divergent count, which `ContiguousArray`'s CoW used to make impossible.
+    private var nodes = GrowableStoreBuffer<CompactNode>()
+    private var edges = GrowableStoreBuffer<UInt32>()
+    private var textBytes = GrowableStoreBuffer<UInt8>()
 
     // Interning tables are open-addressing slot arrays that store only node
     // (or text) indices — 4 bytes per slot, no separate key storage. Keys are
@@ -181,10 +187,16 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// Freezes the builder into an immutable, `Sendable` store.
     ///
     /// Consumes the builder; interning tables are dropped, only the flat
-    /// buffers survive. Indices minted by this builder remain valid in the
-    /// frozen store.
+    /// buffers survive — as an ownership handover of the underlying
+    /// allocations, not a copy (proposal 0010, step 1). Indices minted by
+    /// this builder remain valid in the frozen store.
     public consuming func freeze() -> NodeStore {
-        NodeStore(nodes: nodes, edges: edges, textBytes: textBytes, storeTag: storeTag)
+        NodeStore(
+            nodesStorage: nodes.storage, nodeCount: nodes.count,
+            edgesStorage: edges.storage, edgeCount: edges.count,
+            textStorage: textBytes.storage, textByteCount: textBytes.count,
+            storeTag: storeTag
+        )
     }
 
     // MARK: - Statistics
@@ -533,7 +545,9 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
             return false
         }
         let edgesStart = Int(existing.payloadWord0)
-        return edges[edgesStart ..< edgesStart + childIndices.count].elementsEqual(childIndices)
+        return edges.withBuffer { edgeBuffer in
+            edgeBuffer[edgesStart ..< edgesStart + childIndices.count].elementsEqual(childIndices)
+        }
     }
 
     private mutating func internManyChildren(kind: Node.Kind, childIndices: [UInt32]) -> UInt32 {
@@ -581,10 +595,12 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
             let compact = nodes[Int(existing)]
             let edgesStart = Int(compact.payloadWord0)
             let childCount = Int(compact.payloadWord1)
-            var slot = Self.hashOfManyChildren(
-                kindAndPayloadKind: compact.kindAndPayloadKind,
-                childIndices: edges[edgesStart ..< edgesStart + childCount]
-            ) & mask
+            var slot = edges.withBuffer { edgeBuffer in
+                Self.hashOfManyChildren(
+                    kindAndPayloadKind: compact.kindAndPayloadKind,
+                    childIndices: edgeBuffer[edgesStart ..< edgesStart + childCount]
+                )
+            } & mask
             while grownSlots[slot] != Self.emptySlot {
                 slot = (slot + 1) & mask
             }
@@ -621,13 +637,15 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         let length = Int(location.length)
         guard length == textValue.utf8.count else { return false }
         let start = Int(location.offset)
-        let storedBytes = textBytes[start ..< start + length]
-        if let contiguousResult = textValue.utf8.withContiguousStorageIfAvailable({ buffer in
-            storedBytes.elementsEqual(buffer)
-        }) {
-            return contiguousResult
+        return textBytes.withBuffer { textBuffer in
+            let storedBytes = textBuffer[start ..< start + length]
+            if let contiguousResult = textValue.utf8.withContiguousStorageIfAvailable({ buffer in
+                storedBytes.elementsEqual(buffer)
+            }) {
+                return contiguousResult
+            }
+            return storedBytes.elementsEqual(textValue.utf8)
         }
-        return storedBytes.elementsEqual(textValue.utf8)
     }
 
     private mutating func internText(_ textValue: String) -> TextLocation {
@@ -642,7 +660,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
             if existing == Self.emptySlot {
                 precondition(textBytes.count + utf8Length <= UInt32.max, "NodeStore text buffer exceeded UInt32 offset space")
                 let location = TextLocation(offset: UInt32(textBytes.count), length: UInt32(utf8Length))
-                textBytes.append(contentsOf: textValue.utf8)
+                appendTextBytes(textValue)
                 textSlots[slot] = UInt32(uniqueTexts.count)
                 uniqueTexts.append(location)
                 return location
@@ -652,6 +670,22 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
                 return existingLocation
             }
             slot = (slot + 1) & mask
+        }
+    }
+
+    /// Appends a string's UTF-8 to the text buffer: native `String`s vend
+    /// contiguous storage (one bulk copy); only non-contiguous (bridged)
+    /// strings fall back to the per-byte loop (same strategy as
+    /// ``hashOfText(_:)``).
+    private mutating func appendTextBytes(_ textValue: String) {
+        let utf8View = textValue.utf8
+        let contiguouslyAppended: Void? = utf8View.withContiguousStorageIfAvailable { buffer in
+            textBytes.append(contentsOf: buffer)
+        }
+        if contiguouslyAppended == nil {
+            for byte in utf8View {
+                textBytes.append(byte)
+            }
         }
     }
 
@@ -668,7 +702,9 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         for existing in textSlots where existing != Self.emptySlot {
             let location = uniqueTexts[Int(existing)]
             let start = Int(location.offset)
-            var slot = Self.hashOfTextBytes(textBytes[start ..< start + Int(location.length)]) & mask
+            var slot = textBytes.withBuffer { textBuffer in
+                Self.hashOfTextBytes(textBuffer[start ..< start + Int(location.length)])
+            } & mask
             while grownSlots[slot] != Self.emptySlot {
                 slot = (slot + 1) & mask
             }
