@@ -158,12 +158,13 @@ public struct NodeReference: Sendable {
         guard case .text = compact.payloadKind else { return nil }
         let start = Int(compact.payloadWord0)
         let length = Int(compact.payloadWord1)
-        precondition(start + length <= store.textByteCount, "Text range out of range for this store")
+        let resolvedView = store.currentView
+        precondition(start + length <= resolvedView.textBytes.count, "Text range out of range for this store")
         // The span is formed over the raw storage; the override rebinds its
         // dependence to `self`, which keeps the store — and with it the
         // allocation — alive. See `NodeStore.textBytesSpan()` for the full
         // reasoning.
-        let textBuffer = UnsafeBufferPointer(start: store.textStorage.baseAddress + start, count: length)
+        let textBuffer = UnsafeBufferPointer(start: resolvedView.textBytes.baseAddress! + start, count: length)
         let span = textBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }

@@ -69,14 +69,11 @@ public final class NodeStore: @unchecked Sendable {
     @usableFromInline
     let textStorage: StoreBuffer<UInt8>
 
-    /// Number of unique nodes in the store.
-    public let nodeCount: Int
-
-    /// Number of child-edge slots used by nodes with three or more children.
-    public let edgeCount: Int
-
-    /// Number of deduplicated UTF-8 text bytes.
-    public let textByteCount: Int
+    /// The frozen store's constant view descriptor (proposal 0010, step 3):
+    /// built once at init from the handed-over buffers, resolved by every
+    /// read through ``withView(_:)``.
+    @usableFromInline
+    let view: BufferView
 
     /// Issuance tag inherited from the minting builder; see
     /// `NodeIndex.storeTag`. Stored in every configuration (2 bytes per
@@ -91,12 +88,33 @@ public final class NodeStore: @unchecked Sendable {
         storeTag: UInt16
     ) {
         self.nodesStorage = nodesStorage
-        self.nodeCount = nodeCount
         self.edgesStorage = edgesStorage
-        self.edgeCount = edgeCount
         self.textStorage = textStorage
-        self.textByteCount = textByteCount
+        self.view = BufferView(
+            nodes: UnsafeBufferPointer(start: nodesStorage.baseAddress, count: nodeCount),
+            edges: UnsafeBufferPointer(start: edgesStorage.baseAddress, count: edgeCount),
+            textBytes: UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount)
+        )
         self.storeTag = storeTag
+    }
+
+    /// Resolves the current view descriptor and runs `body` over it — the
+    /// single read gate every accessor and every walk entry goes through.
+    ///
+    /// For a frozen store this is a plain load of the constant descriptor.
+    /// The shared store (step 4) adds its mutable-slot branch here; walks pin
+    /// the resolved view for their whole duration, per-access reads resolve
+    /// fresh each time.
+    @usableFromInline
+    func withView<Result>(_ body: (BufferView) throws -> Result) rethrows -> Result {
+        try body(view)
+    }
+
+    /// The resolved view as a value, for direct-return borrows that cannot
+    /// take a closure (the `@_lifetime` span accessors).
+    @usableFromInline
+    var currentView: BufferView {
+        withView { $0 }
     }
 
     /// Wraps a raw index produced by in-store navigation (child resolution)
@@ -114,12 +132,23 @@ public final class NodeStore: @unchecked Sendable {
 
     // MARK: - Statistics
 
+    /// Number of unique nodes in the store.
+    public var nodeCount: Int { withView { $0.nodes.count } }
+
+    /// Number of child-edge slots used by nodes with three or more children.
+    public var edgeCount: Int { withView { $0.edges.count } }
+
+    /// Number of deduplicated UTF-8 text bytes.
+    public var textByteCount: Int { withView { $0.textBytes.count } }
+
     /// Total payload bytes of the flat buffers (excluding the buffers'
     /// own headers and growth slack).
     public var storageByteCount: Int {
-        nodeCount * MemoryLayout<CompactNode>.stride
-            + edgeCount * MemoryLayout<UInt32>.stride
-            + textByteCount
+        withView { resolvedView in
+            resolvedView.nodes.count * MemoryLayout<CompactNode>.stride
+                + resolvedView.edges.count * MemoryLayout<UInt32>.stride
+                + resolvedView.textBytes.count
+        }
     }
 
     // MARK: - Access
@@ -159,57 +188,25 @@ public final class NodeStore: @unchecked Sendable {
 
     @usableFromInline
     func compactNode(at rawIndex: UInt32) -> CompactNode {
-        // Bounds-checked in release too, matching the `ContiguousArray`
-        // subscript this replaced: an out-of-range index traps instead of
-        // reading past the allocation.
-        precondition(Int(rawIndex) < nodeCount, "Node index out of range for this store")
-        return nodesStorage.baseAddress[Int(rawIndex)]
+        withView { $0.compactNode(at: rawIndex) }
     }
 
     @usableFromInline
     func text(offset: UInt32, length: UInt32) -> String {
-        let start = Int(offset)
-        let end = start + Int(length)
-        precondition(end <= textByteCount, "Text range out of range for this store")
-        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress + start, count: Int(length))
-        // Every stored text was interned from a whole `String.utf8` payload,
-        // so any (offset, length) a node payload produces is a complete valid
-        // UTF-8 text — unchecked materialization skips only the revalidation
-        // scan (proposal 0008, B1). Legacy runtimes keep the validating
-        // decode.
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
-            return String(copying: UTF8Span(unchecked: textBuffer.span))
-        }
-        return String(decoding: textBuffer, as: UTF8.self)
+        withView { $0.text(offset: offset, length: length) }
     }
 
     // MARK: - Shared node accessors
 
-    // The single implementations behind both handle types (`NodeReference`
-    // and the walk-internal `UnretainedNodeReference`) — a parallel copy on
-    // either handle would silently drift (proposal 0008, B2).
+    // The single implementations live on `BufferView` (proposal 0010,
+    // step 3); these delegators keep the store-level entry points for
+    // per-access consumers (`NodeReference` and its children view). Walks pin
+    // a view once at their entry instead of coming through here per node.
 
     /// Raw index of the `position`-th child of `compact`.
     @usableFromInline
     func rawChildIndex(of compact: CompactNode, at position: Int) -> UInt32 {
-        switch compact.payloadKind {
-        case .oneChild:
-            precondition(position == 0, "Child index out of range")
-            return compact.payloadWord0
-        case .twoChildren:
-            switch position {
-            case 0: return compact.payloadWord0
-            case 1: return compact.payloadWord1
-            default: preconditionFailure("Child index out of range")
-            }
-        case .manyChildren:
-            precondition(position >= 0 && position < Int(compact.payloadWord1), "Child index out of range")
-            let edgeIndex = Int(compact.payloadWord0) + position
-            precondition(edgeIndex < edgeCount, "Edge index out of range for this store")
-            return edgesStorage.baseAddress[edgeIndex]
-        case .none, .index, .text:
-            preconditionFailure("Child index out of range for a node without children")
-        }
+        withView { $0.rawChildIndex(of: compact, at: position) }
     }
 
     /// Span-reading counterpart of ``rawChildIndex(of:at:)`` for walks that
@@ -239,82 +236,32 @@ public final class NodeStore: @unchecked Sendable {
     /// The index payload of `compact`, if it carries one.
     @usableFromInline
     func indexPayload(of compact: CompactNode) -> UInt64? {
-        guard case .index = compact.payloadKind else { return nil }
-        return UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32)
+        withView { $0.indexPayload(of: compact) }
     }
 
     /// The contents of `compact` in exactly the form ``Node/contents``
-    /// reports them — the single re-encoding point shared by
-    /// `NodeReference.nodeContents` and the structural-digest walk, kept
-    /// single so it cannot drift from `Node.hash(into:)`'s encoding.
-    ///
-    /// Deliberately reports `.none` for `.dependentGenericParamType` (whose
-    /// name ``textOfNode(at:)`` synthesizes): `Node` stores depth and index
-    /// as children there, so its `contents` is `.none` and so must this.
+    /// reports them; see `BufferView.contents(of:)`.
     @usableFromInline
     func contents(of compact: CompactNode) -> Node.Contents {
-        switch compact.payloadKind {
-        case .text:
-            return .text(text(offset: compact.payloadWord0, length: compact.payloadWord1))
-        case .index:
-            return .index(UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
-        case .none, .oneChild, .twoChildren, .manyChildren:
-            return .none
-        }
+        withView { $0.contents(of: compact) }
     }
 
     /// Text of the node at `rawIndex` in exactly the form `Node.text` reports
-    /// it: stored text for `.text` payloads, plus the synthesized generic
-    /// parameter name for `.dependentGenericParamType` (which stores depth and
-    /// index as children; the printer relies on the synthesis).
+    /// it; see `BufferView.textOfNode(at:)`.
     func textOfNode(at rawIndex: UInt32) -> String? {
-        let compact = compactNode(at: rawIndex)
-        if case .text = compact.payloadKind {
-            return text(offset: compact.payloadWord0, length: compact.payloadWord1)
-        }
-        if compact.kind == .dependentGenericParamType {
-            guard compact.childCount >= 2,
-                  let depth = indexPayload(of: compactNode(at: rawChildIndex(of: compact, at: 0))),
-                  let parameterIndex = indexPayload(of: compactNode(at: rawChildIndex(of: compact, at: 1)))
-            else { return nil }
-            return genericParameterName(depth: depth, index: parameterIndex)
-        }
-        return nil
+        withView { $0.textOfNode(at: rawIndex) }
     }
 
     /// Borrows the stored text bytes of the node at `rawIndex` (proposal
-    /// 0008, B1). Returns nil — without calling `body` — when the node stores
-    /// no text; `.dependentGenericParamType`'s synthesized name is not stored
-    /// text (use ``textOfNode(at:)`` for the composed form).
+    /// 0008, B1); see `BufferView.withTextUTF8(at:_:)`.
     func withTextUTF8<Result>(at rawIndex: UInt32, _ body: (Span<UInt8>) throws -> Result) rethrows -> Result? {
-        let compact = compactNode(at: rawIndex)
-        guard case .text = compact.payloadKind else { return nil }
-        let start = Int(compact.payloadWord0)
-        let length = Int(compact.payloadWord1)
-        precondition(start + length <= textByteCount, "Text range out of range for this store")
-        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress + start, count: length)
-        return try body(textBuffer.span)
+        try withView { try $0.withTextUTF8(at: rawIndex, body) }
     }
 
-    /// Allocation-free text comparison against an ASCII needle, with the
-    /// `String`-comparison fallback for non-ASCII needles (Unicode canonical
-    /// equivalence) and for nodes whose text is synthesized rather than
-    /// stored.
+    /// Allocation-free text comparison against an ASCII needle; see
+    /// `BufferView.nodeTextMatches(at:expected:)`.
     func nodeTextMatches(at rawIndex: UInt32, expected: String) -> Bool {
-        let expectedUTF8 = expected.utf8
-        guard expectedUTF8.allSatisfy({ $0 < 0x80 }) else {
-            return textOfNode(at: rawIndex) == expected
-        }
-        let storedByteComparison = withTextUTF8(at: rawIndex) { spanBytes -> Bool in
-            guard spanBytes.count == expectedUTF8.count else { return false }
-            var byteOffset = 0
-            for expectedByte in expectedUTF8 {
-                guard spanBytes[byteOffset] == expectedByte else { return false }
-                byteOffset += 1
-            }
-            return true
-        }
-        return storedByteComparison ?? (textOfNode(at: rawIndex) == expected)
+        withView { $0.nodeTextMatches(at: rawIndex, expected: expected) }
     }
 
     // MARK: - Buffer borrows (proposal 0008, B2)
@@ -329,10 +276,12 @@ public final class NodeStore: @unchecked Sendable {
     /// collapsed into one spelling. `self` anchors the storage for the whole
     /// call; the locals anchor the spans' borrows.
     func withSpans<Result>(_ body: (Span<CompactNode>, Span<UInt32>, Span<UInt8>) throws -> Result) rethrows -> Result {
-        let nodesBuffer = UnsafeBufferPointer(start: nodesStorage.baseAddress, count: nodeCount)
-        let edgesBuffer = UnsafeBufferPointer(start: edgesStorage.baseAddress, count: edgeCount)
-        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount)
-        return try body(nodesBuffer.span, edgesBuffer.span, textBuffer.span)
+        try withView { resolvedView in
+            let nodesBuffer = resolvedView.nodes
+            let edgesBuffer = resolvedView.edges
+            let textBuffer = resolvedView.textBytes
+            return try body(nodesBuffer.span, edgesBuffer.span, textBuffer.span)
+        }
     }
 
     #if hasFeature(Lifetimes)
@@ -349,10 +298,10 @@ public final class NodeStore: @unchecked Sendable {
     public borrowing func textBytesSpan() -> Span<UInt8> {
         // The span is formed over the raw buffer and would otherwise be
         // scoped to the local `UnsafeBufferPointer`; the override rebinds its
-        // dependence to `self`, which owns the allocation through the
-        // immutable stored `StoreBuffer` — exactly the contract
-        // `@_lifetime(borrow self)` states.
-        let textBuffer = UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount)
+        // dependence to `self`, which owns the allocation through the stored
+        // `StoreBuffer` (for a shared store, through the retirement chain) —
+        // exactly the contract `@_lifetime(borrow self)` states.
+        let textBuffer = currentView.textBytes
         let span = textBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }
@@ -363,7 +312,7 @@ public final class NodeStore: @unchecked Sendable {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
     @_lifetime(borrow self)
     borrowing func nodesSpan() -> Span<CompactNode> {
-        let nodesBuffer = UnsafeBufferPointer(start: nodesStorage.baseAddress, count: nodeCount)
+        let nodesBuffer = currentView.nodes
         let span = nodesBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }
@@ -374,7 +323,7 @@ public final class NodeStore: @unchecked Sendable {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
     @_lifetime(borrow self)
     borrowing func edgesSpan() -> Span<UInt32> {
-        let edgesBuffer = UnsafeBufferPointer(start: edgesStorage.baseAddress, count: edgeCount)
+        let edgesBuffer = currentView.edges
         let span = edgesBuffer.span
         return _overrideLifetime(span, borrowing: self)
     }
@@ -382,111 +331,10 @@ public final class NodeStore: @unchecked Sendable {
 
     // MARK: - Materialization
 
-    /// Child indices of the given node, in order.
-    private func childIndices(of compact: CompactNode) -> [UInt32] {
-        switch compact.payloadKind {
-        case .none, .index, .text:
-            return []
-        case .oneChild:
-            return [compact.payloadWord0]
-        case .twoChildren:
-            return [compact.payloadWord0, compact.payloadWord1]
-        case .manyChildren:
-            let edgesStart = Int(compact.payloadWord0)
-            let childCount = Int(compact.payloadWord1)
-            precondition(edgesStart + childCount <= edgeCount, "Edge range out of range for this store")
-            return (edgesStart ..< (edgesStart + childCount)).map { edgesStorage.baseAddress[$0] }
-        }
-    }
-
-    /// Builds the `Node` for one store index from already-materialized children.
-    private func makeNode(from compact: CompactNode, children: [Node]) -> Node {
-        switch compact.payloadKind {
-        case .none:
-            return Node(kind: compact.kind)
-        case .index:
-            return Node(kind: compact.kind, index: UInt64(compact.payloadWord0) | (UInt64(compact.payloadWord1) << 32))
-        case .text:
-            return Node(kind: compact.kind, text: text(offset: compact.payloadWord0, length: compact.payloadWord1))
-        case .oneChild, .twoChildren, .manyChildren:
-            return Node(kind: compact.kind, children: children)
-        }
-    }
-
-    /// One suspended level of ``materializeNode(at:)``'s walk.
-    private struct MaterializeFrame {
-        let rawIndex: UInt32
-        let compact: CompactNode
-        let childIndices: [UInt32]
-        var nextChildPosition: Int
-        var materializedChildren: [Node]
-    }
-
-    /// Rebuilds a standalone `Node` tree for one store index.
-    ///
-    /// The returned tree is freshly constructed and does not interact with the
-    /// global `NodeCache`. The store is hash-consed, so a subtree referenced
-    /// from multiple parents is a single index; the memo rebuilds each index
-    /// once and reuses the instance, preserving the store's DAG shape.
-    /// Expanding instead would multiply node count for symbols with heavy
-    /// substitution sharing and defeat the printer's per-instance memoization.
-    ///
-    /// Walked with an explicit stack. This is reached from the remangling
-    /// bridge and from rich printer targets, both of which hand the result
-    /// straight to another whole-tree walk, so a recursive version would stack
-    /// two full-depth traversals of the deepest trees the store holds.
+    /// Rebuilds a standalone `Node` tree for one store index; see
+    /// `BufferView.materializeNode(at:)` for the walk and its
+    /// sharing-preservation contract.
     func materializeNode(at rawIndex: UInt32) -> Node {
-        var materializedByIndex: [UInt32: Node] = [:]
-        var frames: [MaterializeFrame] = []
-        var completedChild: Node?
-
-        func pushFrame(for index: UInt32) {
-            let compact = compactNode(at: index)
-            let indices = childIndices(of: compact)
-            var frame = MaterializeFrame(
-                rawIndex: index,
-                compact: compact,
-                childIndices: indices,
-                nextChildPosition: 0,
-                materializedChildren: []
-            )
-            frame.materializedChildren.reserveCapacity(indices.count)
-            frames.append(frame)
-        }
-
-        pushFrame(for: rawIndex)
-
-        while var frame = frames.popLast() {
-            if let child = completedChild {
-                frame.materializedChildren.append(child)
-                completedChild = nil
-            }
-
-            if frame.nextChildPosition < frame.childIndices.count {
-                let childIndex = frame.childIndices[frame.nextChildPosition]
-                frame.nextChildPosition += 1
-                frames.append(frame)
-
-                // The store is hash-consed, so a subtree referenced from several
-                // parents is one index; the memo rebuilds it once and reuses the
-                // instance, preserving the store's DAG shape.
-                if let shared = materializedByIndex[childIndex] {
-                    completedChild = shared
-                } else {
-                    pushFrame(for: childIndex)
-                }
-                continue
-            }
-
-            let node = makeNode(from: frame.compact, children: frame.materializedChildren)
-            materializedByIndex[frame.rawIndex] = node
-            if frames.isEmpty {
-                return node
-            }
-            completedChild = node
-        }
-
-        // Unreachable: the loop returns as soon as the root frame completes.
-        return Node(kind: compactNode(at: rawIndex).kind)
+        withView { $0.materializeNode(at: rawIndex) }
     }
 }

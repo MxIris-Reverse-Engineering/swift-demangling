@@ -290,26 +290,39 @@ extension NodeReference.ChildrenView: DemanglingNodeChildren {}
 extension NodeReference {
     /// Shadows the generic ``DemanglingNode`` `print(using:)` for the store
     /// path: the walk runs on `UnretainedNodeReference` handles — zero store
-    /// retain/release per visited child — inside a scope that anchors the
-    /// store strongly for the walk's whole duration. Output and
-    /// fragment-cache behavior are identical to the generic path (the cache
-    /// keys on store identity plus index either way); only the ARC traffic
-    /// differs.
+    /// retain/release per visited child — over one view descriptor pinned at
+    /// entry (proposal 0010, step 3), inside a scope that anchors the store
+    /// strongly for the walk's whole duration. Output and fragment-cache
+    /// behavior are identical to the generic path (the cache keys on
+    /// per-store node identity either way); only the ARC traffic differs.
+    ///
+    /// The pinned view stays valid across the `StackSafeExecutor` hop inside
+    /// the printer: the submitting frame blocks on the hop, so the
+    /// `withUnsafePointer` scope outlives the whole walk.
     public func print(using options: DemangleOptions = .default) -> String {
         withExtendedLifetime(store) {
-            DemanglingPrinter<String, UnretainedNodeReference>.print(
-                UnretainedNodeReference(store: store, rawIndex: nodeIndex.rawValue),
-                options: options
-            )
+            store.withView { pinnedView in
+                withUnsafePointer(to: pinnedView) { viewPointer in
+                    DemanglingPrinter<String, UnretainedNodeReference>.print(
+                        UnretainedNodeReference(viewPointer: viewPointer, rawIndex: nodeIndex.rawValue),
+                        options: options
+                    )
+                }
+            }
         }
     }
 
     /// Asynchronous variant of ``print(using:)``; the closure's strong `self`
-    /// capture anchors the store across the executor hop.
+    /// capture anchors the store across the executor hop, and the view is
+    /// pinned on the thread that runs the walk.
     public func print(using options: DemangleOptions = .default) async -> String {
         await StackSafeExecutor.executeAsync {
             var printer = DemanglingPrinter<String, UnretainedNodeReference>(options: options)
-            return printer.printRoot(UnretainedNodeReference(store: store, rawIndex: nodeIndex.rawValue))
+            return store.withView { pinnedView in
+                withUnsafePointer(to: pinnedView) { viewPointer in
+                    printer.printRoot(UnretainedNodeReference(viewPointer: viewPointer, rawIndex: nodeIndex.rawValue))
+                }
+            }
         }
     }
 }
