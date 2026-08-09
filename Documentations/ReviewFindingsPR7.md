@@ -28,8 +28,6 @@
 
 | # | 位置 | 一句话 | 是否本 PR 引入 | 优先级 |
 |---|---|---|---|---|
-| [F1](#f1) | `Demangler.swift:280` 等 4 处 | 公开入口吃到畸形输入整进程 SIGTRAP，`try?` 拦不住 | 否（`main` 既有） | **必修** |
-| [F2](#f2) | `Demangler.swift:177` | 0xFF 对齐填充跳过变成永不执行的死代码 | **是（功能回归）** | **必修** |
 | [F5](#f5) | `StoreBuffer.swift:129` | 空代跳过退休登记，已发布的描述符可指向已释放内存 | 是 | 应修 |
 | [F6](#f6) | `StoreBuffer.swift:88` | `withBuffer` 的 range 读丢了 release 边界陷阱 | 是 | 应修 |
 | [F7](#f7) | `NodeStoreBuilder.swift:473` | 整套内存安全论证依赖的不变量只用 `assert` 守，release 编译掉 | 是 | 应修 |
@@ -76,124 +74,6 @@
 `06a423c` → `4ec46d8` → 本轮的循环。
 
 ---
-
-# 第一部分：必修
-
-<a name="f1"></a>
-## F1. demangler 的整数陷阱：公开入口可被畸形输入整进程杀死
-
-- **位置**：`Sources/Demangling/Main/Demangle/Demangler.swift`
-  | 行 | 代码 | 触发条件 |
-  |---|---|---|
-  | 280 | `return value + 1`（`demangleIndex()`） | `value` 回绕到 `UInt64.max` |
-  | 301 | `let idx = Int(repeatCount + 27)` | `repeatCount` 接近 `UInt64.max` |
-  | 305 | `repeatCount = try Int(demangleNatural() ?? 0)` | 自然数 ≥ 2^63 |
-  | 1634 | `Int(demangleIndex() + 1)` | 同 280 |
-
-- **现象**：`demangleIndex()` 被几十处调用；`conditionalInt()` 刻意使用环绕算术
-  （`&*10 &+`，注释自述跟随 Swift 编译器对畸形输入允许溢出），因此任意落在
-  `[2^63, 2^64)` 的数字串都能走到这些点。它们是 **trap 不是 throw**，`try?` 拦不住，
-  整个进程死掉。
-
-- **已验证的复现**（在 PR tip 上实测）：
-  ```swift
-  demangleAsNode("$sBi18446744073709551615_")   // SIGTRAP，算术溢出 @ Demangler.swift:280
-  demangleAsNode("$sA18446744073709551000_")    // SIGTRAP @ :305
-                                                // "Not enough bits to represent the passed value"
-  ```
-
-### 四问
-
-1. **能复现吗**：能，见上。**不是误报**。
-2. **`main` 是否也有**：**有**，两处在 merge-base 上同样 trap。**非本 PR 引入。**
-3. **值不值得修**：**值得，且优先级高于它的「旧问题」身份**。理由有三：
-   - 这是 **public API 吃不可信输入**（逆向工具的常态就是喂二进制里捞出来的字符串），
-     后果是宿主进程死亡，不是错误值；
-   - 本 PR **自己做了同一族的加固**——`ec3769a` 新增了 `readRange(count: UInt64)`，
-     注释原文是「so oversized (or overflow-wrapped) counts fail cleanly instead of
-     trapping in an Int conversion」，并转换了三个长度前缀点，**唯独漏了 demangler 的
-     这一族**。按项目「确认为真的问题必须横向排查同类」的规矩，这是同一批次里没扫干净的
-     半个修复；
-   - `KnownIssues.md` §1 的 2026-08-02 更正**已经预言过这个坑**：「清点不全会把从未
-     裁决过的崩溃点静默转为『已裁决』」。
-4. **以前修过吗**：**修过同类三次，这是第四次**。
-
-   | 次序 | commit | 修的是什么 | 建了什么防线 | 这道防线对本次为什么是瞎的 |
-   |---|---|---|---|---|
-   | 1 | `06a423c` | 32 位平台 hash 常量字面量溢出 | 交叉编译 | 本类编译全绿，交叉编译看不见 |
-   | 2 | `4ec46d8` | `Int(UInt32.max)` 被常量折叠成无条件 trap（watchOS 上第一个入库节点就杀进程） | 源码扫描测试 `librarySourceAvoidsWordSizeDependentIntegerConversions` | 只扫**三个字面量**——`KnownIssues.md` N5 明确写「只扫三个字面量，与其目的是匹配的，并非守卫太窄」。它防常量折叠型，`value + 1` 是运行时值溢出型 |
-   | 3 | `ec3769a` | 长度前缀的 `Int(numChars)`（0008 决策日志记为「偏差③」） | `readRange(count: UInt64)` | 只覆盖长度前缀那三处 |
-   | 4 | **本次** | `demangleIndex()` 一族 4 处 | — | — |
-
-   **为什么这次又出现**：不是回归（这几行从 `6036eaa` Initial commit 起就是这样），
-   而是**同一族问题的第四次露头，且落在一个从未被清点过的文件里**。
-
-- **修法方向**：
-  1. 四处全部改为 `Int(exactly:)` / 显式上界比较，超范围抛 `DemanglingError`（与
-     `readRange` 同一策略：在 `UInt64` 域内先比界再转换）；
-  2. **同步扩大 `KnownIssues.md` §1 的清点范围**，从 `TypeDecoder.swift` 扩到
-     `Demangler.swift` / `Remangler.swift`，并全库重扫一次 `Int(` / `UInt32(` 的
-     非 `exactly` 形式——这一步比修那四行更重要；
-  3. 回归测试用 Swift Testing 的 exit test（`processExitsWith: .success`，body 内
-     catch 后正常退出），与 `KnownIssues.md` §1 记录的「复现测试形态」一致；
-  4. 回答元模式那句话：新测试对**哪一类**整数陷阱是瞎的？（答案是「源码里写不出、
-     由运行时值决定的转换」——所以除了 exit test，还应把源码扫描从三个字面量扩成
-     一条「非 `exactly` 的窄化转换」规则。）
-
-<a name="f2"></a>
-## F2. 0xFF 对齐填充跳过变成永不执行的死代码 —— 本 PR 引入的功能回归
-
-- **位置**：`Sources/Demangling/Main/Demangle/Demangler.swift:176-179`
-  ```swift
-  var scalar = try scanner.readScalar()
-  while scalar.value == 0xFF {        // ← 永远不会为真
-      scalar = try scanner.readScalar()
-  }
-  ```
-
-- **根因**：`ec3769a` 把扫描器从 `Collection<UnicodeScalar>` 换成原始 UTF-8 字节
-  （`Span<UInt8>`，每字节按 Latin-1 交出）。**0xFF 不可能是合法 UTF-8 的任何一个字节**，
-  所以这个循环再也不会执行。原来 `String` 里的 U+00FF scalar 会被 `utf8Span` 展开成
-  `C3 BF` 两个字节，`readScalar()` 拿到的是 U+00C3。
-
-- **A/B 已验证**：
-  | | 输入 `"$s4main1AV\u{FF}6methodyyF"` |
-  |---|---|
-  | merge-base `f913742` | `main.A.method() -> ()` ✅ |
-  | PR tip `9464265` | 抛 `matchFailed(wanted: "(read test function to succeed)", at: 10)` ❌ |
-
-- **可达性**：这种填充出现在 **metadata 里的 mangled name**，被读进 `String` 时是
-  Latin-1 scalar——正是本 PR 通过把 `demangleAsNodeTransient` 转正为 public
-  （0011）所扩大的那类批量索引场景。
-
-### 四问
-
-1. **能复现吗**：能，见上表。**不是误报**。
-2. **`main` 是否也有**：**没有，`main` 是对的**。**本 PR 引入的功能回归。**
-3. **值不值得修**：**必修**。这是本 PR 唯一一条「原来能解、现在解不了」的行为倒退，
-   而且踩到它的正是本 PR 主打的使用场景。
-4. **以前修过吗**：**修过，这次是回归**。
-   - **谁修的**：`8d0b396`（2026-06-21），group-a 对齐工作里的 **A9** 项。
-   - **依据**：开源 `Demangler.cpp:1029`，并用 IDA 逆向 Apple Swift 6.3.2 的
-     `swift-demangle` 核对过。
-   - **当年靠什么守**：452 万 dyld 符号 + 374 个单元测试。
-   - **关键事实**：**从来没有一个针对 0xFF 的测试**（全 `Tests/` 目录搜 `0xFF` /
-     `u{FF}`，零命中）。
-   - **为什么 diff review 没发现**：`while scalar.value == 0xFF` **这行字面量一个字符
-     都没被改过**——`git log -S'0xFF'` 全历史只命中 `8d0b396`。代码还在、编译通过、
-     语义已死。
-   - **判定**：属于「当年只修了表面」——修了行为，没留能证明行为的测试，把守卫外包给了
-     一个结构上永远覆盖不到它的语料库（符号表全 ASCII）。
-
-- **修法方向**：
-  1. 在字节域判断填充：`while byte == 0xFF`，即在 `readScalar()` **之前**按原始字节
-     跳过（或让扫描器提供 `peekByte()`）。注意不能简单改成比较 `UnicodeScalar(0xFF)`，
-     那在字节扫描器里同样不可达；
-  2. **补一个针对性单元测试**——这是本条的重点，不是附赠品。测试必须构造带 0xFF 填充的
-     输入并断言解出正确结果，在修复前失败、修复后通过，永久保留；
-  3. 同步更新 `Documentations/AlignmentGaps.md:97`——A9 现在还标着 `✅ 已合并`；
-  4. **横向排查**：group-a 那批（`8d0b396`）一共 8 项改动，其余 7 项是否也依赖
-     scalar 域语义而在字节化后失效？逐项过一遍。这是本条最容易被漏掉的部分。
 
 # 第二部分：应修
 
@@ -808,12 +688,19 @@
    的差值即此 11 个，当年被记成 remangle 不可达，实为 demangle 失败）；经 stdlib
    分类确认为一致拒绝（stdlib 同样解不开的符号表内容），非本库回归。
 
-**第 1 步 —— 修确认的行为缺陷**
+**第 1 步 —— ✅ 已完成（2026-08-09，F1 与 F2 条目已按本文件契约移除）**
 
-4. **F2**（0xFF 死代码）：修 + **补针对性测试** + 更新 `AlignmentGaps.md:97` +
-   **横向排查 `8d0b396` 那批 8 项改动里其余 7 项是否也在字节化后失效**。
-5. **F1**（整数陷阱）：修那 4 处 + **把 `KnownIssues.md` §1 的清点范围从 `TypeDecoder.swift`
-   扩到 `Demangler.swift` / `Remangler.swift` 并全库重扫**。清点范围这件事比修那 4 行更重要。
+4. **F2 落地**：字节域跳过（raw `FF` + `C3 BF` 两种拼写）；针对性测试修复前红、修复后
+   绿（`AppleAlignmentTests.alignmentPaddingBeforeOperatorIsSkipped`）；`AlignmentGaps.md`
+   A9 行已注记回归与复修；**横向排查完成**——group-a 其余 7 项全部为 ASCII 域比较或
+   不经扫描器，全 Demangler 唯一的非 ASCII scalar 比较就是 0xFF 这一处，无同类失效。
+   决策日志行在 0008（回归由其字节化引入）。
+5. **F1 落地**：清点范围扩到 `Demangler.swift` / `Remangler.swift` / `NodePrinter.swift`
+   并全库重扫，**找到的比 review 点名的多**——Demangler 六处（点名的 4 处 + `count = index + 1`
+   环绕 + Swift 3 `nameStack` 下标先窄化后检查）+ Remangler substitution 哈希一处，全部
+   无符号域界检查后再窄化，超界抛 `DemanglingError`；exit test（review 的两条触发字符串，
+   红→绿）+ 致陷拼写扫描测试双防线入库，盲区互补已言明。清点全文在 `KnownIssues.md`
+   2026-08-09 更新；决策日志行在 0004（整数陷阱家族）。TypeDecoder 8 处维持暂缓不变。
 
 **第 2 步 —— 内存安全与存储**
 

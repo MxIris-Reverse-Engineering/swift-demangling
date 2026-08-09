@@ -173,10 +173,18 @@ extension Demangler {
     }
 
     private mutating func demangleOperator() throws(DemanglingError) -> Node {
-        var scalar = try scanner.readScalar()
-        while scalar.value == 0xFF {
-            scalar = try scanner.readScalar()
-        }
+        // Alignment padding: skip 0xFF fill before the operator (upstream
+        // Demangler.cpp; alignment item A9, merged in 8d0b396). The scalar
+        // scanner saw a Latin-1-decoded String's U+00FF padding as one 0xFF
+        // scalar; this byte scanner hands out single bytes, so that padding
+        // arrives as its UTF-8 encoding C3 BF and a `scalar.value == 0xFF`
+        // check can never fire (ReviewFindingsPR7 F2). Both byte spellings are
+        // skipped: the raw 0xFF byte (upstream's form — unreachable from a
+        // valid-UTF-8 String, but what a byte-level entry would deliver) via
+        // the single-byte scalar match, and the C3 BF pair via the UTF-8
+        // string match.
+        while scanner.conditional(scalar: "\u{FF}") || scanner.conditional(string: "\u{FF}") {}
+        let scalar = try scanner.readScalar()
         switch scalar {
         case "\u{1}",
              "\u{2}",
@@ -277,6 +285,12 @@ extension Demangler {
         }
         let value = try require(demangleNatural())
         try scanner.match(scalar: "_")
+        // conditionalInt deliberately wraps on absurd digit strings
+        // (upstream behavior), so a malformed input can park the natural at
+        // UInt64.max and the increment below would trap — public entries
+        // must throw on malformed input, never trap (integer-trap family;
+        // exit-tested in DefectRegressionTests).
+        try require(value != UInt64.max)
         return value + 1
     }
 
@@ -298,11 +312,17 @@ extension Demangler {
             } else if c.isUpper {
                 return try pushMultiSubstitutions(repeatCount: repeatCount, index: Int(c.value - UnicodeScalar("A").value))
             } else if c == "_" {
-                let idx = Int(repeatCount + 27)
+                let idx = repeatCount + 27
                 return try require(substitutions.at(idx))
             } else {
                 try scanner.backtrack()
-                repeatCount = try Int(demangleNatural() ?? 0)
+                let naturalValue = try demangleNatural() ?? 0
+                // Bound in the unsigned domain before narrowing: Int(_:) on
+                // an attacker-sized repeat count traps (32-bit Int included),
+                // and pushMultiSubstitutions rejects anything above
+                // maxRepeatCount anyway.
+                try require(naturalValue <= maxRepeatCount)
+                repeatCount = Int(naturalValue)
             }
         }
     }
@@ -1622,16 +1642,24 @@ extension Demangler {
     private mutating func demangleGenericParamIndex() throws(DemanglingError) -> Node {
         switch try scanner.readScalar() {
         case "d":
-            let depth = try demangleIndex() + 1
-            let index = try demangleIndex()
-            return try getDependentGenericParamType(depth: Int(depth), index: Int(index))
+            let depthValue = try demangleIndex()
+            let indexValue = try demangleIndex()
+            // Bound before narrowing and incrementing: Int(_:) traps past
+            // the platform Int.max on these attacker-controlled indices.
+            try require(depthValue < Int.max)
+            try require(indexValue <= Int.max)
+            return try getDependentGenericParamType(depth: Int(depthValue) + 1, index: Int(indexValue))
         case "z":
             return try getDependentGenericParamType(depth: 0, index: 0)
         case "s":
             return NodeFactory.constrainedExistentialSelf
         default:
             try scanner.backtrack()
-            return try getDependentGenericParamType(depth: 0, index: Int(demangleIndex() + 1))
+            let indexValue = try demangleIndex()
+            // Same bound-before-narrow discipline as the depth/index case
+            // above.
+            try require(indexValue < Int.max)
+            return try getDependentGenericParamType(depth: 0, index: Int(indexValue) + 1)
         }
     }
 
@@ -2578,7 +2606,11 @@ extension Demangler {
             while !scanner.conditional(scalar: "l") {
                 var count: UInt64 = 0
                 if !scanner.conditional(scalar: "z") {
-                    count = try demangleIndex() + 1
+                    let indexValue = try demangleIndex()
+                    // The increment must not wrap to 0 and silently mean
+                    // "z" (zero params); reject the malformed input instead.
+                    try require(indexValue != UInt64.max)
+                    count = indexValue + 1
                 }
                 paramCounts.append(createNode(kind: .dependentGenericParamCount, contents: .index(count)))
             }
@@ -3508,7 +3540,9 @@ extension Demangler {
         default:
             try scanner.backtrack()
             let index = try demangleSwift3Index()
-            if Int(index) >= nameStack.count {
+            // Heterogeneous comparison: Int(_:) on an attacker-sized index
+            // would trap before the bound check could reject it.
+            if index >= nameStack.count {
                 throw scanner.unexpectedError()
             }
             return nameStack[Int(index)]

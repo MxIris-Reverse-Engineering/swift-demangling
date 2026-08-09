@@ -35,14 +35,28 @@
   第 3 条引用的 `maxPrintDepth = 512`（同上，现为 768）。第二部分 N3 的残留待办
   （`DemanglingPrinter.init(options:)` 降为 internal）经查证已在 `5cc30c9` 完成。
   **裁决结论本身没有变化**，只是把过期的数字对上。
-- **2026-08-09 注记（PR #7 review，尚未裁决）**：本轮 15 条发现的完整记录与四问答案在
-  [ReviewFindingsPR7.md](ReviewFindingsPR7.md)，**还没有一条进入本文件**——裁决为
-  「不修 / 误报」的条目才迁进来。其中一条直接指向本文件的机制缺口，先在此挂号：
-  **第 1 条的清点范围只有 `TypeDecoder.swift`，`Demangler.swift` 从未被清点过**，
-  而那里至少有 4 处同族的 trap（`Demangler.swift` 的 280 / 301 / 305 / 1634）。
-  这正是本条 2026-08-02 更正所警告的情形——「清点不全会把从未裁决过的崩溃点静默转为
-  『已裁决』」——只不过这次漏的不是几行，是整个文件。修复该条时**必须同时扩大清点范围
-  并全库重扫**，详见 `ReviewFindingsPR7.md` 的 F1。
+- **2026-08-09 注记（PR #7 review）**：本轮 15 条发现的完整记录与四问答案在
+  [ReviewFindingsPR7.md](ReviewFindingsPR7.md)——裁决为「不修 / 误报」的条目才迁进
+  本文件，已修复的条目从那里移除。
+- **2026-08-09 更新（清点范围扩大并已修复，PR #7 review F1）**：review 指出第 1 条的
+  清点范围只有 `TypeDecoder.swift`，`Demangler.swift` 从未被清点过——正是 2026-08-02
+  更正所警告的「清点不全会把从未裁决过的崩溃点静默转为『已裁决』」，只不过这次漏的是
+  整个文件。本轮把清点范围扩到 `Demangler.swift` / `Remangler.swift` / `NodePrinter.swift`
+  并全库重扫（`Int(` 的非 `exactly`、非 ASCII 常量算术形式逐处过目），**找到的全部即修**，
+  与 TypeDecoder 的暂缓裁决不同——demangle 入口是吃不可信输入的第一线：
+  - `Demangler.swift` 六处：`demangleIndex` 的 `value + 1` 环绕、`demangleMultiSubstitutions`
+    的 `Int(natural)` 窄化（连带 `Int(repeatCount + 27)` 化简）、依赖泛型参数 depth/index
+    两处「先窄化后检查」、`demangleGenericSignature` 的 `count = index + 1` 环绕、
+    Swift 3 路径 `nameStack` 下标的「`Int()` 先于界检查」——全部改为无符号域内
+    `require` 界检查后再窄化/自增，超界抛 `DemanglingError`；
+  - `Remangler.swift` 一处：substitution 哈希的 `Int(index)` 对调用方组装的超大
+    payload 会 trap，改 `Int(truncatingIfNeeded:)`（哈希语义不变）；
+  - `NodePrinter.swift` 重扫零发现。
+  行为守卫：exit test `DefectRegressionTests.malformedIndexArithmeticThrowsInsteadOfTrapping`
+  （review 验证过的两条触发字符串，修复前 SIGTRAP、修复后抛错）；拼写守卫：
+  `demanglerSourceAvoidsUncheckedNarrowingOfParsedNumbers` 钉住三种致陷拼写不得回归
+  （对经中间变量洗过的转换失明——由 exit test 兜底，两道防线的盲区互补）。
+  第 1 条本体（TypeDecoder 8 处）维持暂缓裁决不变。
 
 ---
 

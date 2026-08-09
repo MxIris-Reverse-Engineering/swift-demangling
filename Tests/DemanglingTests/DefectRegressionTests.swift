@@ -742,4 +742,55 @@ struct DefectRegressionTests {
 
         #expect(violations.isEmpty, "word-size-dependent conversions found — compare against the unsigned bound directly (heterogeneous comparison) instead:\n\(violations.sorted().joined(separator: "\n"))")
     }
+
+    /// Companion scan covering the runtime-value side of the same hazard
+    /// family: naturals parsed from a mangled string are `UInt64` and
+    /// attacker-controlled, so converting one with `Int(_:)` — or
+    /// incrementing one before its bound check — traps on malformed input.
+    /// The demangler bounds these in the unsigned domain (`require`) before
+    /// narrowing. This scan pins the spellings that used to trap
+    /// (ReviewFindingsPR7 F1); it cannot see a conversion laundered through
+    /// an intermediate variable — the exit test below is the behavioral
+    /// guard for those.
+    @Test func demanglerSourceAvoidsUncheckedNarrowingOfParsedNumbers() throws {
+        let demanglerSource = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Demangling/Main/Demangle/Demangler.swift")
+        let forbiddenSpellings = ["Int(demangleIndex", "Int(demangleNatural", "demangleIndex() + 1"]
+        let fileContents = try String(contentsOf: demanglerSource, encoding: .utf8)
+
+        var violations: [String] = []
+        for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmedLine.hasPrefix("//") else { continue }
+            for forbiddenSpelling in forbiddenSpellings where trimmedLine.contains(forbiddenSpelling) {
+                violations.append("Demangler.swift:\(lineOffset + 1): \(trimmedLine)")
+            }
+        }
+
+        #expect(violations.isEmpty, "unchecked narrowing of a parsed number — bound it in the unsigned domain (require) before converting:\n\(violations.sorted().joined(separator: "\n"))")
+    }
+
+    /// The demangler's index arithmetic must reject numbers that overflow
+    /// instead of trapping: `demangleAsNode` is public API fed untrusted
+    /// strings (reverse-engineering tools hand it whatever a binary
+    /// contains), and an arithmetic trap kills the host process where `try?`
+    /// cannot reach (ReviewFindingsPR7 F1 — fourth member of the integer-trap
+    /// family after KnownIssues N5's constant folding and `readRange`'s
+    /// length prefixes; this is the runtime-value overflow the three-literal
+    /// source scan above is deliberately blind to, which is why the guard is
+    /// behavioral). Pre-fix the child process dies on the trap; post-fix both
+    /// inputs throw `DemanglingError` and the child exits clean.
+    @Test func malformedIndexArithmeticThrowsInsteadOfTrapping() async throws {
+        await #expect(processExitsWith: .success) {
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$sBi18446744073709551615_")
+            }
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$sA18446744073709551000_")
+            }
+        }
+    }
 }

@@ -138,7 +138,10 @@ struct Remangler {
 
         // Combine index or text
         if let index = node.index {
-            hash = combineHash(hash, Int(index))
+            // Hash combine only: truncation keeps equal payloads hashing
+            // equally on every word size, where Int(_:) would trap on a
+            // caller-assembled node whose index exceeds the platform Int.max.
+            hash = combineHash(hash, Int(truncatingIfNeeded: index))
         } else if let text = node.text {
             for char in text {
                 hash = combineHash(hash, char.hashValue)

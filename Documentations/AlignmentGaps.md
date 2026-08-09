@@ -94,7 +94,7 @@ group-a 严格照搬开源源码删掉它们，正是其破坏功能的根因—
 | A5 | `NativePinningMutableAddressor` 字符 `p`→`P` | ✅ 已合并 | 开源 `Demangler.cpp:4140` |
 | A6 | `globalVariableOnceDeclList` 子节点 `.reverse()` | ✅ 已合并 | dyld 0 mismatch |
 | A7 | `$e`/`_$e` 设 `.embedded` flavor（+ EmbeddedFlavorTests） | ✅ 已合并 | 开源 `Demangler.cpp:759` |
-| A9 | `0xFF` 对齐填充字节跳过 | ✅ 已合并 | 开源 `Demangler.cpp:1029` |
+| A9 | `0xFF` 对齐填充字节跳过 | ✅ 已合并；**2026-08 字节化回归，2026-08-09 复修** | 开源 `Demangler.cpp:1029`。当年只修行为未留针对性测试（语料全 ASCII 覆盖不到），扫描器字节化（0008 的 `ec3769a`）后 scalar 比较静默变死代码——String 输入的 U+00FF 以 UTF-8 双字节 `C3 BF` 到达字节扫描器。复修改在字节域跳过（raw `FF` 与 `C3 BF` 两种拼写），针对性测试 `AppleAlignmentTests.alignmentPaddingBeforeOperatorIsSkipped` 永久入库；group-a 其余 7 项经横向排查均为 ASCII 域比较或不经扫描器，字节化不影响（全 Demangler 唯一的非 ASCII scalar 比较就是本项）。 |
 | A10 | concrete conformance 间距 `#N `（trailing space） | ✅ 已合并 | 开源 `NodePrinter.cpp:3264` |
 | **A1** | `'D'` typeMangling 走 `popFunctionParamLabels`（`[labelList, type]`） | ❌ **bug 排除** | 破坏 `functionTypes` 测试（main 通过、A1 失败 9 例 `.unexpected`）；下游 2-child 也不完整 |
 | **A8** | 删 metatype `case "d"`/`case "R"` | ❌ **bug，保留 d/R** | Apple 工具链发出，65,506 真实符号依赖（实证 + 逆向） |
