@@ -34,7 +34,9 @@
 3. [SpanBorrowedViews.md](SpanBorrowedViews.md) — 第三步：读路径。扫描器字节化、
    借用视图、打印 walk 去 ARC，以及为此引入的双路径门控结构。
 4. [StackSafety.md](StackSafety.md) — 与内存方向正交，处理的是递归深度和线程栈。
-5. [KnownIssues.md](KnownIssues.md) — 已知问题与 review 裁决记录，随时查。
+5. [KnownIssues.md](KnownIssues.md) — 已知问题与 review 裁决记录，随时查。正在处理
+   PR #7 的 review 发现时，配套看 [ReviewFindingsPR7.md](ReviewFindingsPR7.md)（未裁决的
+   本轮发现清单，闭环后清空）。
 6. [MeasurementToolbox.md](MeasurementToolbox.md) — 上面所有实测数字是怎么量出来的；
    自己要跑基准或做验收时先读这篇。
 
@@ -49,6 +51,7 @@
 | [KnownIssues.md](KnownIssues.md) | code-review 的**裁决记录**，两部分：① 已确认真实存在但暂缓修复的 6 条（含复现方式与修法方向）；② 判定为误报或刻意设计的 8 条（N1–N8）。 | 每次 code-review 之前——已裁决且理由仍成立的发现直接跳过，不必重新推导。 | [TraversalCost](Concepts/TraversalCost.md) |
 | [MeasurementToolbox.md](MeasurementToolbox.md) | **测量工具箱**：性能/内存结论背后的计量工具（malloc 事件计数 + 大分配阈值、footprint 峰值采样、retain/release interpose 计数）、三级语料、环境开关速查，以及「量错了还不自知」的坑——事件数看不见拷贝成本、同进程第二遍量不到 footprint 尖峰、机器不空闲计时作废（每条都真实踩过）。 | 要给任何改动做性能/内存验收、或复跑历史基准数字时。**跑基准前必读**。 | — |
 | [AlignmentGaps.md](AlignmentGaps.md) | 与上游 Swift 编译器 `Demangling` 源码的对齐缺口追踪（基准 `swift-6.3.2-RELEASE`，审计日期 2026-06-20，对照的是 `main`）。 | 跟进上游新增 kind、或排查与官方 demangler 行为不一致时。 | — |
+| [ReviewFindingsPR7.md](ReviewFindingsPR7.md) | **临时文件**：PR #7（`feature/node-store`）一轮 `max` 档 review 的 15 条发现，每条带四问答案与修法方向，外加 9 条未验证的补充发现和一份移交清单。开篇的「元模式」一节总结了 6 条发现共有的根因——验证方法对某一类问题结构性失明。 | 接手修 PR #7 的发现时；或想知道「为什么 520 个测试全绿却仍有回归」。**条目闭环后从本文件移除，清空即删档。** | [KnownIssues.md](KnownIssues.md) |
 
 ## 其他位置的文档
 
