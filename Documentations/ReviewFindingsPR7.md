@@ -28,9 +28,6 @@
 
 | # | 位置 | 一句话 | 是否本 PR 引入 | 优先级 |
 |---|---|---|---|---|
-| [F11](#f11) | `NodeStore+BufferView.swift:115` | legacy 文本物化分支没接进 seam，从未被任何配置执行过 | 是 | 应修 |
-| [F12](#f12) | `DualPathParityTests.swift:46` | 翻进程级全局开关，并行套件被静默拽到 legacy 路径 | 是 | 应修 |
-| [F13](#f13) | `SpanBorrowedViewsBenchmarks.swift:22` 等 3 处 | 三个 benchmark 套件测量窗口重叠，决策日志数字不可归因 | 是 | 应修 |
 | [F14](#f14) | `NodeStore.swift:148` | 共享 store 每次散点读都过锁，walk 内逐节点重进 `withView` | 是 | 应修 |
 | [F15](#f15) | `DemanglingNode.swift:318` | 异步 `print` 少了同步版有的生命周期锚点 | 否（`main` 既有） | 可延后 |
 
@@ -70,158 +67,6 @@
 ---
 
 # 第二部分：应修
-
-<a name="f11"></a>
-## F11. legacy 文本物化分支从未被任何配置执行过
-
-- **位置**：`Sources/Demangling/Store/NodeStore+BufferView.swift:104-115`
-  和 `DemanglerRuntimeSelection.swift` 的 `TextMaterializationStrategy.materialize`
-
-- **现象**：`DEMANGLING_FORCE_LEGACY_PATH` 这个 seam **只切 demangler 侧**
-  （输入借用方式 + 词表存储）。store 侧的文本物化只看 `#available`：
-  ```swift
-  return String(copying: UTF8Span(unchecked: textBuffer.span))   // :115，macOS 26+
-  ```
-  在 macOS 26 的开发/CI 机器上，**两次运行都走这一支**，
-  `String(decoding: textBuffer, as: UTF8.self)` 这条「所有 26 之前的部署目标实际会执行的」
-  分支**从来没有被执行过**。
-
-- **纪律与现实的落差**：`StorePrintParitySweep.swift:14` 和 `SharedNodeStoreTests` 都把
-  `DEMANGLING_FORCE_LEGACY_PATH=1 swift test -c release --filter ...` 记载为「覆盖
-  legacy 路径的那一跑」。实际覆盖范围严格小于文档所述。
-
-- **同一位置的第二个问题**：`BufferView.text` 用 `UTF8Span(unchecked:)`
-  **完全没有有效性闸门**。而 demangler 侧专门为此建了 `TextMaterializationStrategy`
-  并加了 `isKnownASCII` 门（0008 决策日志「偏差①」明确说：字节子区间可能切开非 ASCII
-  scalar，`UTF8Span(unchecked:)` 会伪造非法 `String`）。于是 release 下一个来自其它
-  store 的 `NodeIndex`（`reference(at:)` 的文档说这种情况「silently wrong, but
-  well-formed」）可以在这里**伪造出带非法 UTF-8 的 String**——这是那句文档没有点名的
-  第三种未定义行为形态。
-
-### 四问
-
-1. **能复现吗**：覆盖缺口可直接验证（两条运行路径在 macOS 26 上取同一分支）。
-   `UTF8Span(unchecked:)` 的伪造需要先有一个错误 index，属**二阶**。**不是误报**。
-2. **`main` 是否也有**：seam 由 `ec3769a` 建立（本 PR 内）。**本 PR 引入。**
-3. **值不值得修**：**应修**。这个库声明支持 macOS 10.15+，legacy 分支是**绝大多数部署
-   目标实际执行的代码**，而它一次都没跑过。
-4. **以前修过吗**：**没修过。是范围缺口，非回归。**
-   - seam 由 `ec3769a` 建立时，覆盖范围就只含 demangler 侧（0008 提案的「axis-1 选择」
-     一节列的三项——输入借用、文本物化、词表——里，「文本物化」指的是 **demangler 的**
-     文本物化）；
-   - `4ed790e` 引入 store 侧 `#available` 文本物化分支时，**没有把它接进 seam**。
-
-- **修法方向**：
-  1. 让 store 侧的物化也走 seam（`forcesLegacyPath` 为真时强制走 `String(decoding:)`）；
-  2. 给 `BufferView.text` 补上与 demangler 侧同等的有效性闸门（`isKnownASCII` 或
-     校验解码）；
-  3. 修正 `StorePrintParitySweep.swift:14` 与 `SharedNodeStoreTests` 里关于双跑覆盖范围
-     的注释——它们现在说的比实际做的多；
-  4. 元模式那句话在这里的答案：双跑纪律对「没有接进 seam 的分支」是瞎的。所以还需要一条
-     元测试或清单，枚举所有 `#available` 分支并断言每条都有 seam 覆盖。
-
-<a name="f12"></a>
-## F12. 翻进程级全局开关，并行套件被静默拽到 legacy 路径
-
-- **位置**：`Tests/DemanglingTests/DualPathParityTests.swift:44-47`
-  ```swift
-  let originalSeamValue = DemanglingRuntimePath.forcesLegacyPath
-  DemanglingRuntimePath.forcesLegacyPath = true
-  defer { DemanglingRuntimePath.forcesLegacyPath = originalSeamValue }
-  ```
-  套件声明在 `:14`：`@Suite("0008 dual-path parity", .serialized)`
-
-- **现象**：`swift test` **默认并行跑各个套件**，而 `.serialized` **只排序本套件内部的
-  测试**。当 `assertParity` 持有 seam 为真的这段时间里，
-  `BorrowedTextViewTests`、`SharedNodeStoreTests`、`TransientRemangleParityTests`、
-  `NodeStoreTests`（以及 `DEMANGLING_BENCHMARK=1` 下的三个 benchmark 套件）
-  **全部走的是 legacy 分支**，而不是它们以为自己在测的现代分支。
-
-- **两个后果**：
-  1. 现代路径的覆盖**非确定性地丢失**——恰恰是这个 seam 存在的目的被反转了；
-  2. 任何真实的分歧会表现为**某个不相关套件的偶发失败**，而且 `--filter` 单跑时
-     **必然复现不出来**。
-
-- **明确不是什么**：**不是数据竞争**（seam 由 `Mutex` 保护）。缺陷在于「进程级全局模式
-  没有作用域」。
-
-### 四问
-
-1. **能复现吗**：机制确凿；表现为偶发。**不是误报**。
-2. **`main` 是否也有**：`DualPathParityTests` 由 `ec3769a` 引入（本 PR 内）。
-   **本 PR 引入。**
-3. **值不值得修**：**应修**。它污染的是**其它所有套件的可信度**——本轮「520 全绿」的
-   含金量直接受它影响。
-4. **以前修过吗**：**修过一次，只修了一半。这是同一根因的第二次露头。**
-   - **前科**：`4d08c9a` 的 commit message 原文——「DualPathParityTests no longer
-     preconditions the seam clean: under a CI double-run
-     (`DEMANGLING_FORCE_LEGACY_PATH=1`) the flag is legitimately set process-wide and
-     **the old assertion trapped the whole test process**; the seam is now snapshotted
-     and restored」。
-   - **当时的修法**：快照 + 恢复。
-   - **只修了哪一半**：处理了「**本套件被外部设置影响**」这个方向（别人设了 seam，
-     我不要断言失败）；**没有处理「本套件影响其它并行套件」**这个方向。
-   - 也就是说，这个进程级全局开关已经因为「作用域」问题出过一次事故，当时的修复没有
-     触及作用域本身。
-
-- **修法方向**（按推荐顺序）：
-  1. 把 seam 从进程全局改成 **task-local** 或显式参数传递的策略——这是唯一真正消除
-     根因的做法；
-  2. 退而求其次：让所有 demangling 相关套件共享同一把锁；
-  3. 最低限度：`--no-parallel`（但这会拖慢整个套件，且靠约定维持，容易失效）。
-
-<a name="f13"></a>
-## F13. 三个 benchmark 套件的测量窗口重叠，决策日志的数字不可归因
-
-- **位置**：
-  | 文件:行 | 套件 |
-  |---|---|
-  | `SpanBorrowedViewsBenchmarks.swift:22` | `@Suite(.enabled(if: ...DEMANGLING_BENCHMARK == "1"), .serialized)` |
-  | `SharedNodeStoreBenchmarks.swift:26` | 同一个 gate |
-  | `NodeStoreReservationBenchmarks.swift:33` | 同一个 gate |
-
-- **现象**：三个套件共用一个 `DEMANGLING_BENCHMARK=1` 开关，`.serialized` 只排序**套件
-  内部**，于是三者**并行交错**。而 `MallocCounter.swift:9-11` 自己写着：
-
-  > a measurement window is only attributable when the workload under measurement is
-  > the sole activity in the process. **Windows must not overlap.**
-
-  交错的后果：套件 B 的 `start()` 把套件 A 的计数器清零；B 的 `stop()` 在 A 还在计时时
-  卸载了 hook；两个并发的 `PhysicalFootprintSampler` 各自把对方的峰值算成自己的。
-
-- **同一区域的另外两处污染**：
-  1. `NodeStoreReservationBenchmarks.swift:77-78` 在 malloc 窗口**内部**启动采样线程
-     （Thread + 栈 + NSLock 上下文都被计入），并且先停计数器（:97）后停采样器（:99）；
-  2. `CMallocCounter.c:55/59` **覆写进程全局 `malloc_logger` 且不保存原值**，退出时写 0
-     而非恢复——**此后整个进程的 MallocStackLogging / Instruments / `leaks` 全部失效**。
-     另外这个全局写是非原子的，与其它线程的分配存在竞争（TSan 会报）。
-
-### 四问
-
-1. **能复现吗**：机制确凿（三个套件同一 gate、`.serialized` 语义明确）。**不是误报**。
-2. **`main` 是否也有**：`main` 上没有这些 benchmark。**本 PR 引入。**
-3. **值不值得修**：**应修，但它的性质与其它条不同**——它不影响产品代码的正确性，影响的是
-   **0009 / 0010 决策日志里那些分配与 footprint 数字的可信度**。也就是说，它动摇的是
-   「这个 PR 的性能主张」的证据基础，而不是运行时行为。`malloc_logger` 不恢复那一条
-   独立于此，应当单独修（它会坑到任何在同进程里后续做内存诊断的人）。
-4. **以前修过吗**：**没修过，但纪律是本项目自己定的，而且这类坑已经吃过亏。**
-   - 「窗口不得重叠」这条纪律写于 `6874f6f`——**引入 `MallocCounter` 的同一个 commit**，
-     当时只有一组 benchmark（0008 Phase 0 的三个测量在一个套件里）；
-   - `e2d885c` 的 `MeasurementToolbox.md` 专门收录了「pitfalls that **have produced
-     wrong numbers before**」（事件数看不见拷贝成本、同进程第二遍量不到 footprint 尖峰、
-     机器不空闲计时作废）——说明**测量污染这一类以前就实际产生过错误数字**；
-   - 套件从一组长到三组（`99100c3` 加了 reservation、`bb1f81c` 加了 shared store）时，
-     **没有人重新检查这条重叠约束**。
-   - `malloc_logger` 不保存不恢复：引入即有，无前科。
-
-- **修法方向**：
-  1. 给三个 benchmark 套件一把共享的全局互斥（或各自独立的 env gate，一次只跑一个）；
-  2. `NodeStoreReservationBenchmarks`：把采样线程的启动挪到 malloc 窗口之外，并把
-     停止顺序改为「先采样器后计数器」；
-  3. `CMallocCounter.c`：保存原 `malloc_logger` 并在卸载时恢复；全局写改为原子；
-  4. **重跑并订正 0009 / 0010 决策日志里受影响的数字**——如果重测结果与已记录的不同，
-     按项目惯例**如实记录差异，不要回头改提案让它符合新数字**；
-  5. 在 `MeasurementToolbox.md` 补一条：新增 benchmark 套件时必须检查窗口互斥。
 
 <a name="f14"></a>
 ## F14. 共享 store 每次散点读都过锁，walk 内逐节点重进 `withView`
@@ -409,10 +254,19 @@
    内部使用点同批迁移，不做 `Array` 归一化的内容钉测试入库；README 陈旧注释与
    AGENTS.md 同步。决策日志行分别在 0008（F9）与 0010（F10）。
 
-**第 4 步 —— 测试与测量基础设施**
+**第 4 步 —— ✅ 已完成（2026-08-09，F11–F13 条目已按本文件契约移除）**
 
-9. **F12**（并行污染 seam）、**F11**（legacy 分支接进 seam）、**F13**（benchmark 窗口 +
-   `malloc_logger` 恢复）。F13 完成后需要**重测并订正 0009 / 0010 决策日志里的数字**。
+9. **F12 落地**：legacy 腿抽为 internal 直接入口 `demangleAsNodeOnLegacyRuntimePath`，
+   `DualPathParityTests` 显式驱动双腿、全程不碰进程状态；task-local 方案经论证否决
+   （seam 在 `StackSafeExecutor` 闭包内读取，pthread hop 不传播）；「测试 target 无
+   seam 赋值点」扫描测试入库。**F11 落地**：store 创建时快照 seam + builder 增量
+   维护的全表 ASCII 位随视图发布（全 ASCII 表 → 任意界内子区间自成合法 UTF-8，
+   与 demangler 侧同构；非 ASCII 表降级带校验解码）；`#available` 分流点清单进
+   `SpanBorrowedViews.md`。**F13 落地**：跨套件 `ExclusiveMeasurementWindow` 互斥、
+   `malloc_logger` 保存/恢复 + `__atomic` 读写、采样线程启动挪出 malloc 窗口（停止
+   顺序保留计数器先停，与 review 建议的偏差及理由见 0008 决策日志行）；
+   `MeasurementToolbox.md` 增补新套件必包窗口规则。三条的决策日志行均在 0008；
+   重测数字的 0009/0010 订正行随 benchmark 重跑同批。
 
 **第 5 步 —— 性能与收尾**
 

@@ -60,6 +60,9 @@ final class NodeStoreReservationBenchmarks: DyldCacheSymbolTests, @unchecked Sen
         try #require(!corpus.isEmpty, "store corpus unavailable on this machine")
         MallocCounter.setLargeAllocationThreshold(Self.largeAllocationThresholdBytes)
 
+        // Measurement inside the cross-suite exclusive window
+        // (ReviewFindingsPR7 F13); the corpus load above stays outside.
+        ExclusiveMeasurementWindow.run {
         for reservesCapacity in Self.selectedModes {
             let modeName = reservesCapacity ? "reserved" : "unreserved"
             var durations: [Duration] = []
@@ -74,8 +77,17 @@ final class NodeStoreReservationBenchmarks: DyldCacheSymbolTests, @unchecked Sen
                 let footprintSampler = PhysicalFootprintSampler()
                 if isColdPass { footprintSampler.start() }
                 if isFinalPass {
-                    MallocCounter.start()
+                    // Sampler before counter: its thread creation (stack,
+                    // lock context) must not land inside the malloc window.
+                    // The stop order below keeps the other end clean too —
+                    // the counter stops first, so the sampler's thread join
+                    // never enters the window either (ReviewFindingsPR7 F13;
+                    // the review suggested stopping the sampler first, which
+                    // would put the join's allocations back in the window —
+                    // the footprint peak is insensitive to stop order, so
+                    // malloc purity wins).
                     footprintSampler.start()
+                    MallocCounter.start()
                 }
                 let start = ContinuousClock.now
                 var builder = NodeStoreBuilder()
@@ -113,6 +125,7 @@ final class NodeStoreReservationBenchmarks: DyldCacheSymbolTests, @unchecked Sen
                     + " finalPassFootprintGrowth=\(String(format: "%.1f", Double(finalPassFootprintGrowth) / 1_048_576)) MiB"
             )
             print("[0009-benchmark] store-build(\(modeName)) utilization: \(utilizationReport)")
+        }
         }
     }
 

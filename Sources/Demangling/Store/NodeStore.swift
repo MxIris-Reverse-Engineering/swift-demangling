@@ -93,21 +93,35 @@ public final class NodeStore: @unchecked Sendable {
     @usableFromInline
     let storeTag: UInt16
 
+    /// Snapshot of ``DemanglingRuntimePath/forcesLegacyPath`` at store
+    /// creation, copied into every view this store publishes — the store
+    /// side of the dual-path seam (ReviewFindingsPR7 F11). A per-access
+    /// read would put a `Mutex` acquisition on every text materialization;
+    /// the supported way to force the legacy leg is the process-wide env
+    /// var, which predates every store the process creates.
+    @usableFromInline
+    let usesLegacyTextMaterialization: Bool
+
     init(
         nodesStorage: StoreBuffer<CompactNode>, nodeCount: Int,
         edgesStorage: StoreBuffer<UInt32>, edgeCount: Int,
         textStorage: StoreBuffer<UInt8>, textByteCount: Int,
+        textTableIsKnownASCII: Bool,
         storeTag: UInt16
     ) {
+        let usesLegacyTextMaterialization = DemanglingRuntimePath.forcesLegacyPath
         self.nodesStorage = nodesStorage
         self.edgesStorage = edgesStorage
         self.textStorage = textStorage
         self.view = BufferView(
             nodes: UnsafeBufferPointer(start: nodesStorage.baseAddress, count: nodeCount),
             edges: UnsafeBufferPointer(start: edgesStorage.baseAddress, count: edgeCount),
-            textBytes: UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount)
+            textBytes: UnsafeBufferPointer(start: textStorage.baseAddress, count: textByteCount),
+            textTableIsKnownASCII: textTableIsKnownASCII,
+            usesLegacyTextMaterialization: usesLegacyTextMaterialization
         )
         self.sharedViewState = nil
+        self.usesLegacyTextMaterialization = usesLegacyTextMaterialization
         self.storeTag = storeTag
     }
 
@@ -121,15 +135,19 @@ public final class NodeStore: @unchecked Sendable {
         textStorage: StoreBuffer<UInt8>,
         storeTag: UInt16
     ) {
+        let usesLegacyTextMaterialization = DemanglingRuntimePath.forcesLegacyPath
         self.nodesStorage = nodesStorage
         self.edgesStorage = edgesStorage
         self.textStorage = textStorage
         self.view = BufferView(
             nodes: UnsafeBufferPointer(start: nodesStorage.baseAddress, count: 0),
             edges: UnsafeBufferPointer(start: edgesStorage.baseAddress, count: 0),
-            textBytes: UnsafeBufferPointer(start: textStorage.baseAddress, count: 0)
+            textBytes: UnsafeBufferPointer(start: textStorage.baseAddress, count: 0),
+            textTableIsKnownASCII: true,
+            usesLegacyTextMaterialization: usesLegacyTextMaterialization
         )
         self.sharedViewState = sharedViewState
+        self.usesLegacyTextMaterialization = usesLegacyTextMaterialization
         self.storeTag = storeTag
     }
 

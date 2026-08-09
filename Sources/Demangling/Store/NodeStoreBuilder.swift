@@ -208,6 +208,15 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         (nodes.storage, nodes.count, edges.storage, edges.count, textBytes.storage, textBytes.count)
     }
 
+    /// Whether every byte in the text table is ASCII. Maintained on the
+    /// intern miss path — punycode-decoded identifiers are the one
+    /// non-ASCII source — and carried into every published view: an
+    /// all-ASCII table makes any in-bounds subrange valid UTF-8 on its own,
+    /// which is what licenses revalidation-free text materialization even
+    /// for a wrong-but-in-bounds index, the case the whole-entry validity
+    /// argument cannot cover (ReviewFindingsPR7 F11).
+    private(set) var textTableIsKnownASCII = true
+
     /// Installs the grown-generation keepalive hook on all three flat
     /// buffers; see `GrowableStoreBuffer.retirementSink`.
     mutating func installRetirementSink(_ sink: @escaping @Sendable (AnyObject) -> Void) {
@@ -227,6 +236,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
             nodesStorage: nodes.storage, nodeCount: nodes.count,
             edgesStorage: edges.storage, edgeCount: edges.count,
             textStorage: textBytes.storage, textByteCount: textBytes.count,
+            textTableIsKnownASCII: textTableIsKnownASCII,
             storeTag: storeTag
         )
     }
@@ -739,6 +749,12 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
             for byte in utf8View {
                 textBytes.append(byte)
             }
+        }
+        // Miss-path-only scan: interned repeats never re-run it, and the
+        // flag rides every published view (ReviewFindingsPR7 F11 — see
+        // `textTableIsKnownASCII`).
+        if textTableIsKnownASCII, !utf8View.allSatisfy({ $0 < 0x80 }) {
+            textTableIsKnownASCII = false
         }
     }
 

@@ -1,4 +1,26 @@
 import DemanglingTestingSupportC
+import Foundation
+
+/// Serializes measurement windows across benchmark suites. Swift Testing's
+/// `.serialized` only orders tests *within* one suite, so the
+/// `DEMANGLING_BENCHMARK` suites used to interleave freely: one suite's
+/// `MallocCounter.start()` zeroed another's live counter, its `stop()`
+/// unhooked a window still timing, and two concurrent
+/// `PhysicalFootprintSampler`s attributed each other's peaks to themselves —
+/// violating the windows-must-not-overlap contract right below
+/// (ReviewFindingsPR7 F13). Every benchmark test body runs its measurement
+/// section inside ``run(_:)``; a new benchmark suite that skips it
+/// reintroduces the overlap silently, which is why `MeasurementToolbox.md`
+/// lists the wrap as a requirement for new suites.
+public enum ExclusiveMeasurementWindow {
+    private static let windowLock = NSRecursiveLock()
+
+    public static func run<Result>(_ body: () throws -> Result) rethrows -> Result {
+        windowLock.lock()
+        defer { windowLock.unlock() }
+        return try body()
+    }
+}
 
 /// Counts gross allocation events (malloc/calloc/valloc plus the allocation
 /// half of realloc) through libmalloc's `malloc_logger` hook.

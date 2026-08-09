@@ -124,6 +124,26 @@ struct BorrowedTextViewTests {
         #expect(laterBytes.startIndex == 0)
     }
 
+    /// The store-side materialization gate (ReviewFindingsPR7 F11) keys off
+    /// the builder-maintained whole-table ASCII flag: an all-ASCII table
+    /// licenses revalidation-free materialization for *any* in-bounds
+    /// subrange (even a wrong index's), a non-ASCII table (punycode-decoded
+    /// identifiers) demotes to the validating decode. This pins the flag's
+    /// bookkeeping; byte-parity of the two materializations is pinned by
+    /// `nonASCIIStoredTextMaterializesExactly` below.
+    @Test func textMaterializationGateTracksTableASCIIness() throws {
+        var asciiBuilder = NodeStoreBuilder()
+        _ = asciiBuilder.intern(kind: .identifier, text: "plainASCII")
+        let asciiStore = asciiBuilder.freeze()
+        #expect(asciiStore.currentView.textTableIsKnownASCII)
+
+        var nonASCIIBuilder = NodeStoreBuilder()
+        _ = try nonASCIIBuilder.demangle("$s8mangling0022egbpdajGbuEbxfgehfvwxnyyF")
+        let nonASCIIStore = nonASCIIBuilder.freeze()
+        #expect(!nonASCIIStore.currentView.textTableIsKnownASCII,
+                "the punycode-decoded identifier must flip the whole-table ASCII flag")
+    }
+
     /// Non-ASCII stored text (punycode-decoded identifiers) must round-trip
     /// identically through the revalidation-free materialization path.
     @Test func nonASCIIStoredTextMaterializesExactly() throws {

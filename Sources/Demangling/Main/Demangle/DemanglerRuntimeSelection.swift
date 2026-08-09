@@ -32,8 +32,20 @@ public enum DemanglingRuntimePath {
         ProcessInfo.processInfo.environment["DEMANGLING_FORCE_LEGACY_PATH"] == "1"
     )
 
-    /// When true, demangle entries behave as on a pre-macOS 26 runtime.
-    /// Process-wide; intended for tests and CI double-runs only.
+    /// When true, demangle entries behave as on a pre-macOS 26 runtime, and
+    /// stores created while it is true snapshot legacy text materialization.
+    /// Process-wide; the supported way to set it is the env var at process
+    /// launch (CI double-runs).
+    ///
+    /// Do NOT flip this from a test mid-run: `.serialized` only orders tests
+    /// within one suite, so a flipped seam drags every concurrently running
+    /// suite onto the legacy path and non-deterministically un-covers the
+    /// modern one — exactly how `DualPathParityTests` polluted the rest of
+    /// the suite before it switched to calling
+    /// `demangleAsNodeOnLegacyRuntimePath` directly (ReviewFindingsPR7 F12).
+    /// This guard is documentation, not enforcement — it cannot stop a new
+    /// call site; the reviewable surface is that no test in the repo assigns
+    /// here.
     public static var forcesLegacyPath: Bool {
         get { forcedLegacyPathStorage.withLockUnchecked { $0 } }
         set { forcedLegacyPathStorage.withLockUnchecked { $0 = newValue } }

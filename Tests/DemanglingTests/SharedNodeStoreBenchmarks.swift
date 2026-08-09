@@ -58,6 +58,9 @@ struct SharedNodeStoreBenchmarks {
         // the same instances, and tree construction is not what is measured.
         let uniqueTrees = (0 ..< Self.uniqueTreeCount).map { Self.nameTree($0) }
 
+        // Measurement inside the cross-suite exclusive window
+        // (ReviewFindingsPR7 F13).
+        ExclusiveMeasurementWindow.run {
         for usesSharedStore in Self.selectedModes {
             let modeName = usesSharedStore ? "shared" : "mini-stores"
             var durations: [Duration] = []
@@ -136,6 +139,7 @@ struct SharedNodeStoreBenchmarks {
                     + " coldPassFootprintGrowth=\(String(format: "%.1f", Double(coldPassFootprintGrowth) / 1_048_576)) MiB"
                     + " \(retainedDescription)"
             )
+        }
         }
     }
 }

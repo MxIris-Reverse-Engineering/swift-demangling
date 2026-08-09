@@ -25,15 +25,34 @@ extension NodeStore {
         @usableFromInline
         let textBytes: UnsafeBufferPointer<UInt8>
 
+        /// Whether every byte in `textBytes` is ASCII (builder-maintained);
+        /// gates revalidation-free materialization in ``text(offset:length:)``
+        /// (ReviewFindingsPR7 F11).
+        @usableFromInline
+        let textTableIsKnownASCII: Bool
+
+        /// Snapshot of ``DemanglingRuntimePath/forcesLegacyPath`` taken when
+        /// the owning store was created, so the store side of the dual-path
+        /// seam is honored without a per-materialization lock read. The
+        /// supported way to drive the legacy leg is the process-wide env var
+        /// set at launch, which every store created in that process inherits
+        /// (ReviewFindingsPR7 F11).
+        @usableFromInline
+        let usesLegacyTextMaterialization: Bool
+
         @usableFromInline
         init(
             nodes: UnsafeBufferPointer<CompactNode>,
             edges: UnsafeBufferPointer<UInt32>,
-            textBytes: UnsafeBufferPointer<UInt8>
+            textBytes: UnsafeBufferPointer<UInt8>,
+            textTableIsKnownASCII: Bool,
+            usesLegacyTextMaterialization: Bool
         ) {
             self.nodes = nodes
             self.edges = edges
             self.textBytes = textBytes
+            self.textTableIsKnownASCII = textTableIsKnownASCII
+            self.usesLegacyTextMaterialization = usesLegacyTextMaterialization
         }
 
         // MARK: - Node access
@@ -106,13 +125,20 @@ extension NodeStore {
             let end = start + Int(length)
             precondition(end <= textBytes.count, "Text range out of range for this store")
             let textBuffer = UnsafeBufferPointer(start: textBytes.baseAddress! + start, count: Int(length))
-            // Every stored text was interned from a whole `String.utf8`
-            // payload, so any (offset, length) a node payload produces is a
-            // complete valid UTF-8 text — unchecked materialization skips
-            // only the revalidation scan (proposal 0008, B1). Legacy runtimes
-            // keep the validating decode.
-            if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
-                return String(copying: UTF8Span(unchecked: textBuffer.span))
+            // Unchecked materialization needs a validity argument that holds
+            // even for a wrong-but-in-bounds index (a foreign store's index
+            // is documented UB, but it must not escalate into forging an
+            // invalid `String`): when the whole table is ASCII, *any*
+            // in-bounds subrange is valid UTF-8 on its own — the same gate
+            // the demangler's `TextMaterializationStrategy` uses. Non-ASCII
+            // tables (punycode-decoded identifiers) take the validating
+            // decode, as does a store created under the legacy-path seam so
+            // the dual-path double-run actually exercises this branch
+            // (ReviewFindingsPR7 F11; proposal 0008, B1).
+            if !usesLegacyTextMaterialization, textTableIsKnownASCII {
+                if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
+                    return String(copying: UTF8Span(unchecked: textBuffer.span))
+                }
             }
             return String(decoding: textBuffer, as: UTF8.self)
         }

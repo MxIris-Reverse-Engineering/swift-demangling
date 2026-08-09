@@ -4,14 +4,17 @@ import Testing
 
 /// Proposal 0008 dual-path parity: on a modern OS the default entry takes the
 /// `utf8Span` path (revalidation-free materialization, inline word table)
-/// while ``DemanglingRuntimePath/forcesLegacyPath`` forces the `withUTF8`
-/// path (validating materialization, heap word table). The two must agree
-/// byte for byte on every product — tree dump, printed output, remangled
-/// string — and throw identical errors on invalid input.
+/// while the legacy leg (`withUTF8` borrowing, validating materialization,
+/// heap word table) is driven *directly* through its internal entry. The two
+/// must agree byte for byte on every product — tree dump, printed output,
+/// remangled string — and throw identical errors on invalid input.
 ///
-/// Serialized because the seam is process-wide state; each assertion restores
-/// it before returning.
-@Suite("0008 dual-path parity", .serialized)
+/// The suite deliberately never touches
+/// ``DemanglingRuntimePath/forcesLegacyPath``: the seam is process-wide, and
+/// flipping it here silently dragged every concurrently running suite onto
+/// the legacy path — `.serialized` only orders tests *within* a suite
+/// (ReviewFindingsPR7 F12).
+@Suite("0008 dual-path parity")
 struct DualPathParityTests {
     private struct PathOutcome: Equatable {
         var treeDump: String?
@@ -21,9 +24,13 @@ struct DualPathParityTests {
         var errorDescription: String?
     }
 
-    private static func outcome(for mangled: String, isType: Bool) -> PathOutcome {
+    private static func outcome(
+        for mangled: String,
+        isType: Bool,
+        demangle: (String, Bool) throws(DemanglingError) -> Node
+    ) -> PathOutcome {
         do {
-            let node = try demangleAsNode(mangled, isType: isType, internsSubtrees: false)
+            let node = try demangle(mangled, isType)
             return PathOutcome(
                 treeDump: node.description,
                 printedDefault: node.print(using: .default),
@@ -36,17 +43,18 @@ struct DualPathParityTests {
         }
     }
 
-    /// Under a CI double-run (`DEMANGLING_FORCE_LEGACY_PATH=1`) the first
-    /// outcome is already legacy and the comparison degrades to legacy vs
-    /// legacy — trivially equal, harmless. The seam is snapshotted and
-    /// restored rather than asserted clean so that mode does not trap.
+    /// Under a CI double-run (`DEMANGLING_FORCE_LEGACY_PATH=1`, set at
+    /// process launch) the default entry is already on the legacy leg and
+    /// the comparison degrades to legacy vs legacy — trivially equal,
+    /// harmless.
     private static func assertParity(_ mangled: String, isType: Bool = false, sourceLocation: SourceLocation = #_sourceLocation) {
-        let originalSeamValue = DemanglingRuntimePath.forcesLegacyPath
-        let firstOutcome = outcome(for: mangled, isType: isType)
-        DemanglingRuntimePath.forcesLegacyPath = true
-        defer { DemanglingRuntimePath.forcesLegacyPath = originalSeamValue }
-        let legacyOutcome = outcome(for: mangled, isType: isType)
-        #expect(firstOutcome == legacyOutcome, "path divergence for \(mangled)", sourceLocation: sourceLocation)
+        let defaultPathOutcome = outcome(for: mangled, isType: isType) { (mangledSymbol, isTypeSymbol) throws(DemanglingError) in
+            try demangleAsNode(mangledSymbol, isType: isTypeSymbol, internsSubtrees: false)
+        }
+        let legacyPathOutcome = outcome(for: mangled, isType: isType) { (mangledSymbol, isTypeSymbol) throws(DemanglingError) in
+            try demangleAsNodeOnLegacyRuntimePath(mangledSymbol, isType: isTypeSymbol, internsSubtrees: false)
+        }
+        #expect(defaultPathOutcome == legacyPathOutcome, "path divergence for \(mangled)", sourceLocation: sourceLocation)
     }
 
     /// Long multi-word identifiers exercise the word-substitution table — the

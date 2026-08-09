@@ -109,23 +109,45 @@ private func demangleAsNodeFromMangledText(_ mangled: String, isType: Bool, symb
             internsLeaves: internsLeaves
         )
     } else {
-        var utf8Copy = mangled
-        let outcome = utf8Copy.withUTF8 { buffer in
-            Result { () throws(DemanglingError) -> Node in
-                try runDemangler(
-                    bytes: buffer.span,
-                    wordRangeStorageType: ArrayWordRanges.self,
-                    materialization: .decoding,
-                    mangled: mangled,
-                    isType: isType,
-                    symbolicReferenceResolver: symbolicReferenceResolver,
-                    internsSubtrees: internsSubtrees,
-                    internsLeaves: internsLeaves
-                )
-            }
-        }
-        return try outcome.get()
+        return try demangleAsNodeOnLegacyRuntimePath(
+            mangled,
+            isType: isType,
+            symbolicReferenceResolver: symbolicReferenceResolver,
+            internsSubtrees: internsSubtrees,
+            internsLeaves: internsLeaves
+        )
     }
+}
+
+/// The legacy (pre-macOS 26) runtime leg: `withUTF8` input borrowing,
+/// validating text materialization, heap-backed word table.
+///
+/// Internal — not merely an implementation detail of the seam branch above —
+/// so tests can drive this leg *directly* (`DualPathParityTests`). The
+/// alternative, flipping ``DemanglingRuntimePath/forcesLegacyPath`` mid-run,
+/// mutates process-wide state: `.serialized` only orders tests within one
+/// suite, so a flipped seam silently dragged every concurrently running
+/// suite onto the legacy path and non-deterministically un-covered the
+/// modern one (ReviewFindingsPR7 F12). A task-local seam was considered and
+/// rejected: the seam is read inside the `StackSafeExecutor` closure, which
+/// may run on a pooled pthread where task-locals do not propagate.
+func demangleAsNodeOnLegacyRuntimePath(_ mangled: String, isType: Bool, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool, internsLeaves: Bool = true) throws(DemanglingError) -> Node {
+    var utf8Copy = mangled
+    let outcome = utf8Copy.withUTF8 { buffer in
+        Result { () throws(DemanglingError) -> Node in
+            try runDemangler(
+                bytes: buffer.span,
+                wordRangeStorageType: ArrayWordRanges.self,
+                materialization: .decoding,
+                mangled: mangled,
+                isType: isType,
+                symbolicReferenceResolver: symbolicReferenceResolver,
+                internsSubtrees: internsSubtrees,
+                internsLeaves: internsLeaves
+            )
+        }
+    }
+    return try outcome.get()
 }
 
 /// The shared demangling core, generic over the word-table storage. `mangled`

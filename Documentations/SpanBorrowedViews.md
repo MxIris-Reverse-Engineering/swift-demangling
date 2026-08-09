@@ -38,6 +38,20 @@ mangled 符号是纯 ASCII，把扫描器从 `String.UnicodeScalarView` 换成�
    env `DEMANGLING_FORCE_LEGACY_PATH=1` 整进程生效）强制走旧路径，让一台 macOS 26
    机器把两条路径都测全。**不存在只被旧 OS 覆盖的分支**——新增 `#available` 分流时
    先想清楚 seam 能不能强制到它。
+   - **seam 的两条使用规矩（PR #7 review F11/F12，2026-08-09）**：
+     ① seam 只能在**进程启动时**经 env 设定；测试**绝不**在运行中翻它——它是进程级
+     状态，翻一下就把所有并行套件拽到旧路径（`DefectRegressionTests` 有扫描测试钉住
+     「测试 target 无赋值点」）。要单测旧腿，直接调 internal 的
+     `demangleAsNodeOnLegacyRuntimePath`。task-local 化被否：seam 在
+     `StackSafeExecutor` 闭包内被读取，pthread hop 不传播 task-local。
+     ② **`#available(macOS 26)` 分流点清单**（新增分流时在此登记并确认 seam 可达）：
+     `DemangleInterface.demangleAsNodeFromMangledText`（入口，读 seam ✓）、
+     `TextMaterializationStrategy.materialize`（策略仅在入口 seam 判定后被选中，
+     其内部 `#available` 不可达失配 ✓）、`NodeStore.BufferView.text`（store 侧物化，
+     经 store 创建时的 seam 快照 + 全表 ASCII 闸门 ✓——此前只看 `#available`，
+     双跑在这条分支上跑的是同一条路）、`NodeReference.textUTF8Span()` /
+     `NodeStore.textBytesSpan()` 等直接返回式借用视图（双门控 `hasFeature` +
+     `#available`，无物化语义分叉，seam 无需覆盖）。
 4. **实验特性圈在 SPI 里**：依赖 `hasFeature(Lifetimes)` 的 API 一律
    `@_spi(Internals)`，公共 API 面不随编译器版本变化。
 

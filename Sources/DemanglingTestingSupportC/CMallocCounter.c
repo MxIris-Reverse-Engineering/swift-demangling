@@ -47,16 +47,26 @@ static void demangling_counting_malloc_logger(uint32_t type, uintptr_t arg1,
     }
 }
 
+/* The hook installed before start(), restored by stop(). Without the
+ * save/restore, stop() wrote 0 unconditionally and permanently disabled
+ * whatever was logging before — MallocStackLogging, Instruments, `leaks` —
+ * for the rest of the process (ReviewFindingsPR7 F13). */
+static malloc_logger_t *demangling_saved_malloc_logger;
+
 void demangling_malloc_counter_start(void) {
     atomic_store_explicit(&demangling_allocation_event_count, 0,
                           memory_order_relaxed);
     atomic_store_explicit(&demangling_large_allocation_event_count, 0,
                           memory_order_relaxed);
-    malloc_logger = demangling_counting_malloc_logger;
+    /* Atomic builtins on the plain global: other threads read malloc_logger
+     * on every allocation, so a plain store is a data race (TSan-visible)
+     * even when the value transition is benign. */
+    demangling_saved_malloc_logger = __atomic_load_n(&malloc_logger, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&malloc_logger, demangling_counting_malloc_logger, __ATOMIC_RELEASE);
 }
 
 uint64_t demangling_malloc_counter_stop(void) {
-    malloc_logger = 0;
+    __atomic_store_n(&malloc_logger, demangling_saved_malloc_logger, __ATOMIC_RELEASE);
     return atomic_load_explicit(&demangling_allocation_event_count,
                                 memory_order_relaxed);
 }

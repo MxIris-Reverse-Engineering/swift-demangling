@@ -129,7 +129,9 @@ public final class SharedNodeStore: Sendable {
             initialView: NodeStore.BufferView(
                 nodes: UnsafeBufferPointer(start: snapshot.nodesStorage.baseAddress, count: 0),
                 edges: UnsafeBufferPointer(start: snapshot.edgesStorage.baseAddress, count: 0),
-                textBytes: UnsafeBufferPointer(start: snapshot.textStorage.baseAddress, count: 0)
+                textBytes: UnsafeBufferPointer(start: snapshot.textStorage.baseAddress, count: 0),
+                textTableIsKnownASCII: true,
+                usesLegacyTextMaterialization: DemanglingRuntimePath.forcesLegacyPath
             ),
             currentBuffers: [snapshot.nodesStorage, snapshot.edgesStorage, snapshot.textStorage]
         )
@@ -216,7 +218,9 @@ public final class SharedNodeStore: Sendable {
             view: NodeStore.BufferView(
                 nodes: UnsafeBufferPointer(start: snapshot.nodesStorage.baseAddress, count: snapshot.nodeCount),
                 edges: UnsafeBufferPointer(start: snapshot.edgesStorage.baseAddress, count: snapshot.edgeCount),
-                textBytes: UnsafeBufferPointer(start: snapshot.textStorage.baseAddress, count: snapshot.textByteCount)
+                textBytes: UnsafeBufferPointer(start: snapshot.textStorage.baseAddress, count: snapshot.textByteCount),
+                textTableIsKnownASCII: builder.textTableIsKnownASCII,
+                usesLegacyTextMaterialization: backingStore.usesLegacyTextMaterialization
             ),
             currentBuffers: [snapshot.nodesStorage, snapshot.edgesStorage, snapshot.textStorage]
         )

@@ -49,7 +49,14 @@ final class SpanBorrowedViewsBenchmarks: DyldCacheSymbolTests, @unchecked Sendab
     @Test func demangleThroughputOnTransientTrees() async throws {
         let corpus = try await printCorpus()
         try #require(!corpus.isEmpty, "print corpus unavailable on this machine")
+        Self.measureDemangleThroughputExclusively(corpus: corpus)
+    }
 
+    /// The synchronous measurement section, inside the cross-suite exclusive
+    /// window (ReviewFindingsPR7 F13); the corpus load above stays outside —
+    /// loading is not measured and must not hold the window.
+    private static func measureDemangleThroughputExclusively(corpus: [String]) {
+        ExclusiveMeasurementWindow.run {
         var failureCount = 0
         for mangled in corpus {
             _ = try? demangleAsNodeTransient(mangled)
@@ -72,12 +79,16 @@ final class SpanBorrowedViewsBenchmarks: DyldCacheSymbolTests, @unchecked Sendab
         }
         Self.reportPasses("demangle-transient", corpus: corpus, durations: durations, allocationEventCount: allocationEventCount)
         print("[0008-benchmark] demangle-transient: failures/pass=\(failureCount / Self.timedPassCount)")
+        }
     }
 
     @Test func storeBuildEndToEnd() async throws {
         let corpus = try await storeCorpus()
         try #require(!corpus.isEmpty, "store corpus unavailable on this machine")
 
+        // Measurement inside the cross-suite exclusive window
+        // (ReviewFindingsPR7 F13); the corpus load stays outside.
+        ExclusiveMeasurementWindow.run {
         var durations: [Duration] = []
         var allocationEventCount: UInt64 = 0
         var reportedStoreDescription = ""
@@ -104,12 +115,16 @@ final class SpanBorrowedViewsBenchmarks: DyldCacheSymbolTests, @unchecked Sendab
         }
         Self.reportPasses("store-build", corpus: corpus, durations: durations, allocationEventCount: allocationEventCount)
         print("[0008-benchmark] store-build: \(reportedStoreDescription)")
+        }
     }
 
     @Test func storePrintThroughput() async throws {
         let corpus = try await printCorpus()
         try #require(!corpus.isEmpty, "print corpus unavailable on this machine")
 
+        // Measurement (and the store build it prints from) inside the
+        // cross-suite exclusive window (ReviewFindingsPR7 F13).
+        ExclusiveMeasurementWindow.run {
         var builder = NodeStoreBuilder()
         var rootIndices: [NodeStore.NodeIndex] = []
         rootIndices.reserveCapacity(corpus.count)
@@ -139,6 +154,7 @@ final class SpanBorrowedViewsBenchmarks: DyldCacheSymbolTests, @unchecked Sendab
             }
             Self.reportPasses("store-print(\(name))", corpus: corpus, durations: durations, allocationEventCount: allocationEventCount)
             withExtendedLifetime(checksum) {}
+        }
         }
     }
 

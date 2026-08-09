@@ -42,6 +42,13 @@ retain/release」）背后都有一件可复跑的进程内计量工具和一次
 - **计什么**：毛分配事件（`type & 2`：malloc / calloc / valloc / realloc 的分配半边）。
   释放事件**故意不计**——度量是「毛分配压力」，不是净存活。
 - **使用契约**：进程级独占，窗口不可重叠；量的是全进程，测量窗口内不能有无关工作。
+  **窗口互斥必须用代码兑现，不能靠 `.serialized`**——Swift Testing 的 `.serialized`
+  只排序**本套件内部**的测试，三个 benchmark 套件曾因此并行交错，一个套件的
+  `start()` 清掉另一个正在计数的窗口（PR #7 review F13，2026-08-09 修复）。每个
+  benchmark 测试的测量段必须包在 `ExclusiveMeasurementWindow.run { }` 里（语料装载
+  留在锁外），**新增 benchmark 套件同样必须**——漏包不会有任何报错，只会静默产出
+  被污染的数字。钩子自 F13 起还会**保存并恢复**前一个 `malloc_logger`（此前 `stop()`
+  无条件写 0，把 MallocStackLogging / Instruments / `leaks` 全部干掉到进程结束）。
 - **报告形式**：恒以 `mallocs/symbol` 之类的比值呈现并带上符号量（语料随机器变，
   绝对数没有跨机可比性）。
 

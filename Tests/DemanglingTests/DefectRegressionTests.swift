@@ -773,6 +773,36 @@ struct DefectRegressionTests {
         #expect(violations.isEmpty, "unchecked narrowing of a parsed number — bound it in the unsigned domain (require) before converting:\n\(violations.sorted().joined(separator: "\n"))")
     }
 
+    /// No test may assign `DemanglingRuntimePath.forcesLegacyPath`: the seam
+    /// is process-wide, `.serialized` only orders tests within one suite, so
+    /// a mid-run flip drags every concurrently running suite onto the legacy
+    /// path and non-deterministically un-covers the modern one — the legacy
+    /// leg is driven through `demangleAsNodeOnLegacyRuntimePath` instead
+    /// (ReviewFindingsPR7 F12). Scan-based, so it is blind to an assignment
+    /// laundered through a helper in another module; the reviewable surface
+    /// it pins is the test target itself, where the one historical offender
+    /// lived.
+    @Test func testTargetNeverAssignsTheRuntimePathSeam() throws {
+        let testTargetDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+        let fileEnumerator = try #require(FileManager.default.enumerator(at: testTargetDirectory, includingPropertiesForKeys: nil))
+        // Assembled at runtime so this file's own scanning line cannot match
+        // itself.
+        let seamAssignmentSpelling = "forcesLegacyPath" + " ="
+        var violations: [String] = []
+        for case let fileLocation as URL in fileEnumerator where fileLocation.pathExtension == "swift" {
+            let fileContents = try String(contentsOf: fileLocation, encoding: .utf8)
+            for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmedLine.hasPrefix("//") else { continue }
+                if trimmedLine.contains(seamAssignmentSpelling) {
+                    violations.append("\(fileLocation.lastPathComponent):\(lineOffset + 1): \(trimmedLine)")
+                }
+            }
+        }
+        #expect(violations.isEmpty, "tests must drive the legacy leg via demangleAsNodeOnLegacyRuntimePath, not by mutating the process-wide seam:\n\(violations.sorted().joined(separator: "\n"))")
+    }
+
     /// Mangling-prefix detection must compare bytes, not grapheme clusters:
     /// `String.hasPrefix` honors canonical equivalence, so a combining mark
     /// right after "$s" made `isSwiftSymbol` deny a prefix the byte scanner
