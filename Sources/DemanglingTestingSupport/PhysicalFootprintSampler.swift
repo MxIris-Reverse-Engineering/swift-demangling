@@ -43,11 +43,15 @@ public final class PhysicalFootprintSampler: @unchecked Sendable {
     }
 
     /// Stops sampling and returns the peak footprint growth over the
-    /// baseline, in bytes.
+    /// baseline, in bytes. Calling it without a matching ``start()`` returns
+    /// 0 instead of blocking forever on a semaphore no thread will ever
+    /// signal (PR #7 review, supplementary finding 2).
     public func stop() -> UInt64 {
         lock.lock()
+        let wasSampling = keepsSampling
         keepsSampling = false
         lock.unlock()
+        guard wasSampling else { return 0 }
         samplingFinished.wait()
         recordSample(Self.currentFootprint())
 

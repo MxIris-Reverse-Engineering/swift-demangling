@@ -242,7 +242,12 @@ public final class NodeStore: @unchecked Sendable {
             "NodeIndex was minted by a different builder/store — an index is only valid in the store whose builder issued it"
         )
         #endif
-        precondition(Int(nodeIndex.rawValue) < nodeCount, "NodeIndex out of range for this store")
+        // One view resolution, not two: the public `nodeCount` opens its own
+        // `withView`, which on a shared store is a second locked descriptor
+        // copy per minted reference (ReviewFindingsPR7 F14).
+        withView { resolvedView in
+            precondition(Int(nodeIndex.rawValue) < resolvedView.nodes.count, "NodeIndex out of range for this store")
+        }
         return NodeReference(store: self, nodeIndex: nodeIndex)
     }
 

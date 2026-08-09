@@ -371,3 +371,54 @@ builder 插入即 hash-consing，**同一 arena 内「索引相同」就是「�
 **教训**：这批常量的校准建立在一次语料扫描给出的「最深 41 层」上，而那次扫描的覆盖面
 不足以代表下游真实负载。**再次下调任何一个上限之前，必须先有来自下游工作负载的语料
 证据**，三处常量的注释里都写了这句话。
+
+## N9. `NodeStoreBuilder.slotCount` 在槽数为 0 时死循环（PR #7 补充发现 1）
+
+**发现**：`slotCount(holding:growingFrom:)` 用 `proposedSlotCount *= 2` 逼近目标，
+`currentSlotCount == 0` 时 `0 * 2 = 0` 永不前进。
+
+**裁决：属实但不可达，已用 `precondition` 把不可达性变成显式契约（2026-08-09）。**
+三张槽表初值 4096 / 1024 / 1024，`resizeXxxSlots` 一律 `guard newSlotCount > current`
+只增不减——0 从任何路径都到不了该函数。修法不是改循环（给不可达输入设计语义是过度
+设计），而是在函数入口 `precondition(currentSlotCount > 0)`：万一未来某个新构造路径
+把 0 递进来，得到确定性 trap 而非静默挂死。
+
+## N10. `RetainCountVerification` 的判据与计数窗口（PR #7 补充发现 3）
+
+**发现**：`unretained * 20 < retained` 在基线测到 0 时报 FAIL；且引用在计数窗口内创建。
+
+**裁决：误报（fail-loud 正是想要的行为），2026-08-09。**
+`retained == 0` 只在 interpose 没挂上或 watch 目标错误时发生——此时报 FAIL 是**正确**
+行为（测量装置坏了就该喊，静默通过才是缺陷）。「窗口内创建引用」两个引擎的窗口形态
+完全对称，比值判据不受影响；unretained 引擎实测 1.00 对/walk 恰为入口 `reference(at:)`
+那一次，0008 决策日志已记账。
+
+## N11. `forcesLegacyPath` 每次 demangle 过一次全局 `Mutex`（PR #7 补充发现 6）
+
+**发现**：seam 读取在每次 demangle 的入口，每次都是一次 `Mutex` 往返。
+
+**裁决：不修（成本不成立），2026-08-09。**
+一次无竞争 `Mutex` 往返在 10ns 量级，单次 demangle 在 10µs 量级，占比 ~0.1%；0008 的
+吞吐基准（77,893 symbols/s）就是带着这次读取测出来的。缓存化的前提是 seam 不可变，
+而 SPI setter 仍然存在（尽管测试已禁止运行中翻转）；为 0.1% 引入「缓存与真值不一致」
+的新状态空间不值。若未来 setter 移除、seam 降级为纯 env 常量，可顺手改为惰性 `let`。
+
+## N12. `NodeStore` 整类 `@unchecked Sendable`（PR #7 补充发现 7）
+
+**发现**：从「受检 `Sendable`」变成整类 `@unchecked`，检查面变宽。
+
+**裁决：刻意设计，声明处已有完整论证，2026-08-09。**
+`@unchecked` 的唯一原因是自管理缓冲（0010 步骤 1）编译器看不见其不可变性：每个存储
+属性都是 `let`、已发布元素 write-once、冻结 store 无写者、共享 store 的写者只在已发布
+计数之外追加并经锁槽重发布。论证完整记录在类型声明的 doc comment（`NodeStore.swift`），
+review 的关切（「检查面变宽」）已由该注释 + `SharedNodeStoreTests` 的 TSan 全绿覆盖。
+
+## N13. 三处重复代码（PR #7 补充发现 9）
+
+**发现**：子节点索引解析的 switch 有三份、语料配方重复、benchmark 脚手架重复。
+
+**裁决：不修（本轮），2026-08-09。**
+子节点索引解析的两份 switch 在 `NodeStore` 内互指注释要求 lockstep（0008 落地时的
+知情决策：数组版与 span 版无法共享实现）；语料配方与 benchmark 脚手架属清理项而非
+缺陷，不随 review 修复批次动——单独的清理不带行为验证反而引入回归面。留待下次真正
+触碰这些文件的批次顺手收敛。

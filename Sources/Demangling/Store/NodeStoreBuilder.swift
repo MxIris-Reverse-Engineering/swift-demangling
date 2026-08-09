@@ -359,6 +359,12 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// ``mix(_:_:)`` for the width-pinning rationale); the table is capped
     /// at 2^30 slots.
     private static func slotCount(holding expectedEntryCount: Int, growingFrom currentSlotCount: Int) -> Int {
+        // Zero would loop forever below (0 * 2 = 0 never advances). It is
+        // unreachable today — the three slot tables start at 4096/1024/1024
+        // and resizes only grow — so the invariant is enforced instead of
+        // designed around (KnownIssues N9, PR #7 review supplementary
+        // finding 1).
+        precondition(currentSlotCount > 0, "slot tables are never empty")
         var proposedSlotCount = currentSlotCount
         while proposedSlotCount < 1 << 30,
               (UInt64(expectedEntryCount) + 1) * 4 >= UInt64(proposedSlotCount) * 3 {

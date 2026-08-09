@@ -315,12 +315,22 @@ extension NodeReference {
     /// Asynchronous variant of ``print(using:)``; the closure's strong `self`
     /// capture anchors the store across the executor hop, and the view is
     /// pinned on the thread that runs the walk.
+    ///
+    /// The `withExtendedLifetime(store)` matches the synchronous variant's:
+    /// `UnretainedNodeReference`'s contract makes the calling scope
+    /// responsible for keeping the store — and through it every buffer
+    /// generation, retired ones included — strongly alive for the whole
+    /// walk, and that responsibility should not rest on the optimizer
+    /// choosing to keep the closure's implicit `self` capture live to the
+    /// end (ReviewFindingsPR7 F15).
     public func print(using options: DemangleOptions = .default) async -> String {
         await StackSafeExecutor.executeAsync {
-            var printer = DemanglingPrinter<String, UnretainedNodeReference>(options: options)
-            return store.withView { pinnedView in
-                withUnsafePointer(to: pinnedView) { viewPointer in
-                    printer.printRoot(UnretainedNodeReference(viewPointer: viewPointer, rawIndex: nodeIndex.rawValue))
+            withExtendedLifetime(store) {
+                var printer = DemanglingPrinter<String, UnretainedNodeReference>(options: options)
+                return store.withView { pinnedView in
+                    withUnsafePointer(to: pinnedView) { viewPointer in
+                        printer.printRoot(UnretainedNodeReference(viewPointer: viewPointer, rawIndex: nodeIndex.rawValue))
+                    }
                 }
             }
         }

@@ -26,8 +26,13 @@ final class SharedViewState: Sendable {
         /// The descriptor readers resolve; covers exactly the elements whose
         /// interning completed before the last publish.
         var view: NodeStore.BufferView
-        /// The current buffer generations backing `view`.
-        var currentBuffers: [AnyObject]
+        /// The current buffer generations backing `view` — three stored
+        /// fields, not an array: publish runs once per intern under the
+        /// writer lock, and an `[AnyObject]` literal there allocated on
+        /// every single intern (PR #7 review, supplementary finding 5).
+        var currentNodesBuffer: AnyObject
+        var currentEdgesBuffer: AnyObject
+        var currentTextBuffer: AnyObject
         /// Every grown-out generation a published view may still address —
         /// empty generations included, because a descriptor (or a
         /// zero-length span formed from it) records a generation's base
@@ -42,8 +47,14 @@ final class SharedViewState: Sendable {
     @usableFromInline
     let state: Mutex<State>
 
-    init(initialView: NodeStore.BufferView, currentBuffers: [AnyObject]) {
-        state = Mutex(State(view: initialView, currentBuffers: currentBuffers, retiredBuffers: []))
+    init(initialView: NodeStore.BufferView, nodesBuffer: AnyObject, edgesBuffer: AnyObject, textBuffer: AnyObject) {
+        state = Mutex(State(
+            view: initialView,
+            currentNodesBuffer: nodesBuffer,
+            currentEdgesBuffer: edgesBuffer,
+            currentTextBuffer: textBuffer,
+            retiredBuffers: []
+        ))
     }
 
     @usableFromInline
@@ -51,10 +62,14 @@ final class SharedViewState: Sendable {
         state.withLockUnchecked { $0.view }
     }
 
-    func publish(view: NodeStore.BufferView, currentBuffers: [AnyObject]) {
+    func publish(view: NodeStore.BufferView, nodesBuffer: AnyObject, edgesBuffer: AnyObject, textBuffer: AnyObject) {
         state.withLockUnchecked { lockedState in
             lockedState.view = view
-            lockedState.currentBuffers = currentBuffers
+            // Identity stores on the common no-growth publish; a reassignment
+            // only happens on the rare generation swap.
+            if lockedState.currentNodesBuffer !== nodesBuffer { lockedState.currentNodesBuffer = nodesBuffer }
+            if lockedState.currentEdgesBuffer !== edgesBuffer { lockedState.currentEdgesBuffer = edgesBuffer }
+            if lockedState.currentTextBuffer !== textBuffer { lockedState.currentTextBuffer = textBuffer }
         }
     }
 
@@ -133,7 +148,9 @@ public final class SharedNodeStore: Sendable {
                 textTableIsKnownASCII: true,
                 usesLegacyTextMaterialization: DemanglingRuntimePath.forcesLegacyPath
             ),
-            currentBuffers: [snapshot.nodesStorage, snapshot.edgesStorage, snapshot.textStorage]
+            nodesBuffer: snapshot.nodesStorage,
+            edgesBuffer: snapshot.edgesStorage,
+            textBuffer: snapshot.textStorage
         )
         builder.installRetirementSink { retiredBuffer in
             viewState.retire(retiredBuffer)
@@ -222,7 +239,9 @@ public final class SharedNodeStore: Sendable {
                 textTableIsKnownASCII: builder.textTableIsKnownASCII,
                 usesLegacyTextMaterialization: backingStore.usesLegacyTextMaterialization
             ),
-            currentBuffers: [snapshot.nodesStorage, snapshot.edgesStorage, snapshot.textStorage]
+            nodesBuffer: snapshot.nodesStorage,
+            edgesBuffer: snapshot.edgesStorage,
+            textBuffer: snapshot.textStorage
         )
     }
 }

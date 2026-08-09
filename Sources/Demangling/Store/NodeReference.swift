@@ -263,7 +263,15 @@ public struct NodeReference: Sendable {
     /// equal are skipped, so a maximally shared DAG costs its node count, not
     /// its path count.
     public func structurallyEquals(_ node: Node) -> Bool {
-        store.withSpans { nodeSpan, edgeSpan, textSpan in
+        // One view resolution for the whole walk (ReviewFindingsPR7 F14):
+        // on a shared store every `store.`-prefixed read re-enters the locked
+        // descriptor slot, so per-node calls inside the loop paid a lock
+        // round-trip each — and two of them could even read different views
+        // mid-walk. Everything below reads through this one resolved view.
+        store.withView { resolvedView in
+            let nodeSpan = resolvedView.nodes.span
+            let edgeSpan = resolvedView.edges.span
+            let textSpan = resolvedView.textBytes.span
             struct VisitedPair: Hashable {
                 let referenceIndex: UInt32
                 let nodeIdentity: ObjectIdentifier
@@ -295,7 +303,7 @@ public struct NodeReference: Sendable {
                         break
                     }
                 case .index(let indexValue):
-                    guard store.indexPayload(of: compact) == indexValue else { return false }
+                    guard resolvedView.indexPayload(of: compact) == indexValue else { return false }
                 case .text(let textValue):
                     guard case .text = compact.payloadKind else { return false }
                     // Exact bytes, not `String ==`: see the doc comment.
@@ -464,18 +472,21 @@ extension NodeReference: Hashable {
     /// The reference half of the structural digest; see ``Node/structuralDigest()``.
     ///
     /// Walks raw indices over span-borrowed buffers (proposal 0008, B2): the
-    /// buffers are borrowed once at the entry, so the loop neither constructs
-    /// a `NodeReference` per child (a store retain/release each) nor reloads
-    /// the arrays through the class property on every access. Text contents
-    /// still materialize through `store.contents(of:)` — hashing the same
-    /// `String` values `Node.hash(into:)` hashes is what keeps the two
+    /// view is resolved once at the entry (ReviewFindingsPR7 F14 — the
+    /// per-node `store.contents(of:)` calls used to re-enter a shared
+    /// store's locked descriptor slot on every visit), so the loop neither
+    /// constructs a `NodeReference` per child (a store retain/release each)
+    /// nor reloads anything through the class on any access. Text contents
+    /// still materialize through `resolvedView.contents(of:)` — hashing the
+    /// same `String` values `Node.hash(into:)` hashes is what keeps the two
     /// digests interchangeable.
     func structuralDigest() -> UInt64 {
-        let store = store
-        return store.withSpans { nodeSpan, edgeSpan, _ in
+        return store.withView { resolvedView in
+            let nodeSpan = resolvedView.nodes.span
+            let edgeSpan = resolvedView.edges.span
             let rootCompact = nodeSpan[Int(nodeIndex.rawValue)]
             if rootCompact.childCount == 0 {
-                let leafHasher = Node.seededDigestHasher(kind: rootCompact.kind, contents: store.contents(of: rootCompact), childCount: 0)
+                let leafHasher = Node.seededDigestHasher(kind: rootCompact.kind, contents: resolvedView.contents(of: rootCompact), childCount: 0)
                 return UInt64(bitPattern: Int64(leafHasher.finalize()))
             }
 
@@ -491,7 +502,7 @@ extension NodeReference: Hashable {
                 DigestFrame(
                     rawIndex: nodeIndex.rawValue,
                     childCount: rootCompact.childCount,
-                    hasher: Node.seededDigestHasher(kind: rootCompact.kind, contents: store.contents(of: rootCompact), childCount: rootCompact.childCount),
+                    hasher: Node.seededDigestHasher(kind: rootCompact.kind, contents: resolvedView.contents(of: rootCompact), childCount: rootCompact.childCount),
                     nextChildIndex: 0
                 ),
             ]
@@ -513,7 +524,7 @@ extension NodeReference: Hashable {
                     if let knownDigest = digestByIndex[childIndex] {
                         frame.hasher.combine(knownDigest)
                     } else if childCompact.childCount == 0 {
-                        let leafHasher = Node.seededDigestHasher(kind: childCompact.kind, contents: store.contents(of: childCompact), childCount: 0)
+                        let leafHasher = Node.seededDigestHasher(kind: childCompact.kind, contents: resolvedView.contents(of: childCompact), childCount: 0)
                         let leafDigest = UInt64(bitPattern: Int64(leafHasher.finalize()))
                         digestByIndex[childIndex] = leafDigest
                         frame.hasher.combine(leafDigest)
@@ -522,7 +533,7 @@ extension NodeReference: Hashable {
                         frames.append(DigestFrame(
                             rawIndex: childIndex,
                             childCount: childCompact.childCount,
-                            hasher: Node.seededDigestHasher(kind: childCompact.kind, contents: store.contents(of: childCompact), childCount: childCompact.childCount),
+                            hasher: Node.seededDigestHasher(kind: childCompact.kind, contents: resolvedView.contents(of: childCompact), childCount: childCompact.childCount),
                             nextChildIndex: 0
                         ))
                         descended = true
