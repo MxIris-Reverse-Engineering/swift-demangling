@@ -21,7 +21,7 @@
 
 | 发现 | 一句话 | 决策日志 |
 |---|---|---|
-| F1 | 整数陷阱家族第四次露头，清点范围扩到 Demangler/Remangler | 0004；清点全文在 KnownIssues 2026-08-09 更新 |
+| F1 | 整数陷阱家族第四次露头，清点范围扩到 Demangler/Remangler | 0004；清点全文在 KnownIssues 2026-08-09 更新。**补遗（同日）**：review 会话核实时发现第一轮横向排查按「窄化转换」特征扫、漏了 `demangleSwift3Index` 的纯环绕族（函数内 + 三个调用点共四处，无窄化），已实测确认可 trap 并同批补修；正确排查特征与元教训见 KnownIssues 补遗段 |
 | F2 | 0xFF 对齐填充跳过在字节化后死代码（功能回归） | 0008；AlignmentGaps A9 行注记 |
 | F3 | 测试 target 缺 `Lifetimes`，借用视图测试零覆盖 | 0008 |
 | F4 | 语料验收 `try?` 吞失败；重跑翻出 11 个 stdlib 同拒符号 | 0008 / 0010 / 0011 各一行 |

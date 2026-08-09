@@ -52,6 +52,16 @@
   - `Remangler.swift` 一处：substitution 哈希的 `Int(index)` 对调用方组装的超大
     payload 会 trap，改 `Int(truncatingIfNeeded:)`（哈希语义不变）；
   - `NodePrinter.swift` 重扫零发现。
+- **2026-08-09 补遗（第一轮扫漏的 Swift 3 环绕族，review 会话核实时发现并实测确认）**：
+  `Demangler.swift` 实为**十处**——上面六处之外，`demangleSwift3Index` 内部的
+  `readInt() + 1` 环绕与其三个调用点的再 `+ 1`（`demangleSwift3GenericParamIndex`
+  两分支、`demangleSwift3GenericSignature` 的参数计数）同批补修，四条触发字符串
+  （`_Ttq18446744073709551615_` 等）已进 exit test。**为什么第一轮漏了（元教训，比
+  多修四行更值钱）**：F1 头号站点 `demangleIndex()` 的缺陷本质是「环绕算术后自增」，
+  但横向排查按「窄化转换」这个**表面特征**去扫同类——而 Swift 3 孪生不含任何窄化，
+  纯 `UInt64` 域内 `+ 1` 环绕，按错误的特征扫必然漏。正确的排查特征是「**任何吃
+  `conditionalInt()` / `readInt()` 结果的算术**」；拼写守卫测试的注释已把这条特征
+  定义留档，新增同形拼写须入其禁止清单。
   行为守卫：exit test `DefectRegressionTests.malformedIndexArithmeticThrowsInsteadOfTrapping`
   （review 验证过的两条触发字符串，修复前 SIGTRAP、修复后抛错）；拼写守卫：
   `demanglerSourceAvoidsUncheckedNarrowingOfParsedNumbers` 钉住三种致陷拼写不得回归

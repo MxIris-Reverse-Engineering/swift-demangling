@@ -745,20 +745,27 @@ struct DefectRegressionTests {
 
     /// Companion scan covering the runtime-value side of the same hazard
     /// family: naturals parsed from a mangled string are `UInt64` and
-    /// attacker-controlled, so converting one with `Int(_:)` — or
-    /// incrementing one before its bound check — traps on malformed input.
-    /// The demangler bounds these in the unsigned domain (`require`) before
-    /// narrowing. This scan pins the spellings that used to trap
-    /// (ReviewFindingsPR7 F1); it cannot see a conversion laundered through
-    /// an intermediate variable — the exit test below is the behavioral
-    /// guard for those.
+    /// attacker-controlled, so converting one with `Int(_:)` — or doing any
+    /// arithmetic on one before its bound check — traps on malformed input.
+    /// The demangler bounds these in the unsigned domain (`require`) first.
+    /// This scan pins the spellings that used to trap (ReviewFindingsPR7 F1
+    /// and its addendum); it cannot see a conversion or an increment
+    /// laundered through an intermediate variable — the exit test below is
+    /// the behavioral guard for those.
+    ///
+    /// Lesson encoded in the list's composition: the first sweep searched by
+    /// the *narrowing-conversion* feature and missed `demangleSwift3Index`'s
+    /// wrap family, whose defect involves no narrowing at all. The sweep
+    /// feature for this hazard is "any arithmetic eating a
+    /// `conditionalInt()`/`readInt()` result", and new spellings of that
+    /// shape belong in this list.
     @Test func demanglerSourceAvoidsUncheckedNarrowingOfParsedNumbers() throws {
         let demanglerSource = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Sources/Demangling/Main/Demangle/Demangler.swift")
-        let forbiddenSpellings = ["Int(demangleIndex", "Int(demangleNatural", "demangleIndex() + 1"]
+        let forbiddenSpellings = ["Int(demangleIndex", "Int(demangleNatural", "demangleIndex() + 1", "demangleSwift3Index() + 1", "readInt()) + 1"]
         let fileContents = try String(contentsOf: demanglerSource, encoding: .utf8)
 
         var violations: [String] = []
@@ -839,6 +846,25 @@ struct DefectRegressionTests {
             }
             #expect(throws: DemanglingError.self) {
                 _ = try demangleAsNode("$sA18446744073709551000_")
+            }
+            // The Swift 3 twins (F1 addendum): demangleSwift3Index shares
+            // demangleIndex's wrap-then-increment shape, and its callers add
+            // another unguarded +1 on top. The first horizontal sweep missed
+            // them because it searched by the narrowing-conversion feature,
+            // while this family's defect is wrap arithmetic with no
+            // narrowing at all — found by re-sweeping for "any arithmetic on
+            // a parsed number".
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("_Ttq18446744073709551615_")
+            }
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("_Ttq18446744073709551614_")
+            }
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("_Ttqd18446744073709551615_0_")
+            }
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("_Ttqd0_18446744073709551615_")
             }
         }
     }

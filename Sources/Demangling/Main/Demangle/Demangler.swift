@@ -3553,7 +3553,17 @@ extension Demangler {
         var children = [Node]()
         var c = try scanner.requirePeek()
         while c != "R" && c != "r" {
-            try children.append(createNode(kind: .dependentGenericParamCount, contents: .index(scanner.conditional(scalar: "z") ? 0 : (demangleSwift3Index() + 1))))
+            let paramCount: UInt64
+            if scanner.conditional(scalar: "z") {
+                paramCount = 0
+            } else {
+                // Same caller-side wrap guard as demangleSwift3GenericParamIndex
+                // (F1 addendum).
+                let indexValue = try demangleSwift3Index()
+                try require(indexValue != UInt64.max)
+                paramCount = indexValue + 1
+            }
+            children.append(createNode(kind: .dependentGenericParamCount, contents: .index(paramCount)))
             c = try scanner.requirePeek()
         }
         if children.isEmpty {
@@ -3661,11 +3671,20 @@ extension Demangler {
         let depth: UInt64
         let index: UInt64
         switch try scanner.readScalar() {
-        case "d": (depth, index) = try (demangleSwift3Index() + 1, demangleSwift3Index())
+        case "d":
+            // demangleSwift3Index can legitimately return UInt64.max, so the
+            // caller-side increments carry their own wrap guards (F1
+            // addendum).
+            let depthBase = try demangleSwift3Index()
+            try require(depthBase != UInt64.max)
+            depth = depthBase + 1
+            index = try demangleSwift3Index()
         case "x": (depth, index) = (0, 0)
         default:
             try scanner.backtrack()
-            (depth, index) = try (0, demangleSwift3Index() + 1)
+            let indexBase = try demangleSwift3Index()
+            try require(indexBase != UInt64.max)
+            (depth, index) = (0, indexBase + 1)
         }
         return createNode(kind: .dependentGenericParamType, children: [createNode(kind: .index, index: depth), createNode(kind: .index, index: index)])
     }
@@ -3705,7 +3724,14 @@ extension Demangler {
         if scanner.conditional(scalar: "_") {
             return 0
         }
-        let value = try UInt64(scanner.readInt()) + 1
+        // Same wrap guard as demangleIndex(): readInt wraps on absurd digit
+        // strings, so the increment must reject UInt64.max instead of
+        // trapping — this Swift 3 twin was missed by the first F1 sweep,
+        // which searched by the narrowing-conversion feature while this
+        // family's defect is pure wrap arithmetic (F1 addendum).
+        let naturalValue = try scanner.readInt()
+        try require(naturalValue != UInt64.max)
+        let value = naturalValue + 1
         try scanner.match(scalar: "_")
         return value
     }
