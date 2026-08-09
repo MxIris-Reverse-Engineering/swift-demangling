@@ -83,10 +83,26 @@ struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
     }
 
     /// Borrows the initialized prefix for a range read (hashing, equality
-    /// probes over stored edges and text bytes).
+    /// probes over stored edges and text bytes). The range subscript on the
+    /// handed-out `UnsafeBufferPointer` only bounds-checks in debug — for a
+    /// checked range read use `withBuffer(in:_:)`.
     @usableFromInline
     func withBuffer<Result>(_ body: (UnsafeBufferPointer<Element>) -> Result) -> Result {
         body(UnsafeBufferPointer(start: storage.baseAddress, count: count))
+    }
+
+    /// Borrows a bounds-checked slice of the initialized prefix: the range
+    /// must sit inside the initialized count, trapping in release too — the
+    /// range counterpart of `subscript(index:)`, restoring the
+    /// `ContiguousArray` range-subscript semantics this storage replaced. A
+    /// raw `UnsafeBufferPointer` range subscript checks bounds only in
+    /// debug, and an unchecked over-read here would compare against
+    /// uninitialized capacity and could alias two different trees to one
+    /// index — silent data corruption, not a crash (ReviewFindingsPR7 F6).
+    @usableFromInline
+    func withBuffer<Result>(in range: Range<Int>, _ body: (UnsafeBufferPointer<Element>) -> Result) -> Result {
+        precondition(range.lowerBound >= 0 && range.upperBound <= count, "Range out of range")
+        return body(UnsafeBufferPointer(start: storage.baseAddress + range.lowerBound, count: range.count))
     }
 
     @usableFromInline
@@ -111,10 +127,18 @@ struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
 
     /// Growing only, like `ContiguousArray.reserveCapacity` as the builder
     /// uses it: a target at or below the current capacity is a no-op.
+    ///
+    /// Growth takes the doubling lower bound: under a shared store every
+    /// replaced generation is retired into the keepalive chain for the
+    /// store's lifetime, so exact-size growth would let k incremental
+    /// reservations retire k full-size generations — O(k²) held memory for
+    /// an indexer refining its estimate per image. Doubling caps the chain
+    /// at a geometric series (less than one current buffer's worth of bytes)
+    /// at the cost of at most 2× over-reservation (ReviewFindingsPR7 F8).
     @usableFromInline
     mutating func reserveCapacity(_ minimumCapacity: Int) {
         guard minimumCapacity > capacity else { return }
-        grow(to: minimumCapacity)
+        grow(to: Swift.max(minimumCapacity, capacity * 2))
     }
 
     @usableFromInline
@@ -128,13 +152,18 @@ struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
         let grownStorage = StoreBuffer<Element>(capacity: newCapacity)
         if count > 0 {
             grownStorage.baseAddress.initialize(from: storage.baseAddress, count: count)
-            // Only a generation that ever held elements can be addressed by a
-            // published view that dereferences: a view over an empty
-            // generation has count 0 everywhere and every bounds check on it
-            // fails before any pointer is chased. So empty generations free
-            // immediately even under a sink.
-            retirementSink?(storage)
         }
+        // Every replaced generation enters the sink, empty ones included: a
+        // published descriptor (and a zero-length Span formed from it) can
+        // record an empty generation's base address without ever
+        // dereferencing it, and the shared store's contract is that any
+        // descriptor a reader obtained keeps addressing live memory for the
+        // store's whole lifetime — unconditionally. An empty generation's
+        // keepalive costs one element's allocation, so the promise is cheap
+        // to keep whole (ReviewFindingsPR7 F5, plan A; the earlier
+        // free-empty-generations reasoning covered dereferences only and is
+        // superseded in the 0010 decision log).
+        retirementSink?(storage)
         storage = grownStorage
     }
 }

@@ -773,6 +773,25 @@ struct DefectRegressionTests {
         #expect(violations.isEmpty, "unchecked narrowing of a parsed number — bound it in the unsigned domain (require) before converting:\n\(violations.sorted().joined(separator: "\n"))")
     }
 
+    /// Mangling-prefix detection must compare bytes, not grapheme clusters:
+    /// `String.hasPrefix` honors canonical equivalence, so a combining mark
+    /// right after "$s" made `isSwiftSymbol` deny a prefix the byte scanner
+    /// would then match — the entry and the scanner disagreed about the same
+    /// input, and the symbol mis-routed to the Swift 3 demangler
+    /// (ReviewFindingsPR7 F9; only non-ASCII — therefore necessarily
+    /// malformed — inputs are affected, which is why no corpus test could
+    /// see it). Byte-wise matching restores the `main` behavior.
+    @Test func prefixDetectionComparesBytesNotGraphemeClusters() {
+        let combiningMarkAfterPrefix = "$s\u{0301}4main4testyyF"
+        #expect(combiningMarkAfterPrefix.isSwiftSymbol,
+                "the \"$s\" bytes are present, so the prefix must be recognized regardless of what follows")
+        #expect(combiningMarkAfterPrefix.stripManglePrefix != combiningMarkAfterPrefix,
+                "a recognized prefix must be stripped")
+        // Plain ASCII behavior is unchanged in both directions.
+        #expect("$s4main4testyyF".isSwiftSymbol)
+        #expect(!"NotAMangledName".isSwiftSymbol)
+    }
+
     /// The demangler's index arithmetic must reject numbers that overflow
     /// instead of trapping: `demangleAsNode` is public API fed untrusted
     /// strings (reverse-engineering tools hand it whatever a binary

@@ -6,6 +6,27 @@ import Testing
 @Suite
 struct NodeStoreTests {
 
+    // MARK: - Buffer bounds
+
+    /// The checked range read must trap deterministically in every
+    /// configuration when the range leaves the initialized prefix — the
+    /// `ContiguousArray` range-subscript semantics the self-managed storage
+    /// replaced. The raw `UnsafeBufferPointer` range subscript the builder's
+    /// probes used before only bounds-checks in debug, and a release
+    /// over-read would compare against uninitialized capacity — a false
+    /// interning hit aliasing two different trees to one index, silent data
+    /// corruption rather than a crash (ReviewFindingsPR7 F6).
+    @Test func rangeReadPastTheInitializedCountTraps() async {
+        await #expect(processExitsWith: .failure) {
+            var buffer = GrowableStoreBuffer<UInt8>()
+            buffer.append(7)
+            // Capacity is at least 16 after one append, so this range is
+            // inside the *allocation* — only the initialized-count check can
+            // catch it.
+            _ = buffer.withBuffer(in: 0 ..< 2) { $0.count }
+        }
+    }
+
     // MARK: - Kind Ordinal Mapping
 
     @Test func kindOrdinalRoundTripsForAllKinds() {
@@ -304,8 +325,8 @@ struct NodeStoreTests {
                 #expect(reference.isSwiftModule == node.isSwiftModule)
                 #expect(reference.isIdentifier(desired: "Array") == node.isIdentifier(desired: "Array"))
                 #expect(reference.isIdentifier(desired: "Int") == node.isIdentifier(desired: "Int"))
-                if let bytes = reference.textUTF8 {
-                    #expect(Array(bytes) == Array((node.text ?? "").utf8), "textUTF8 should be the exact stored bytes")
+                if let bytes = reference.textUTF8Bytes {
+                    #expect(bytes == Array((node.text ?? "").utf8), "textUTF8Bytes should be the exact stored bytes")
                 }
             }
         }

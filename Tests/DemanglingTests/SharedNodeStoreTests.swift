@@ -82,7 +82,7 @@ import Testing
         #expect(earlyReference.structurallyEquals(expectedTree))
     }
 
-    @Test func reservationKeepsTheRetirementChainEmpty() {
+    @Test func reservationRetiresOnlyTheInitialEmptyGenerations() {
         let sharedStore = SharedNodeStore()
         // The 0009 coefficients are calibrated per real-corpus symbol (heavy
         // text dedup, ~2.2 text bytes each); these synthetic name trees carry
@@ -94,14 +94,77 @@ import Testing
         for treeIndex in 0 ..< 3000 {
             references.append(sharedStore.intern(Self.nameTree(treeIndex)))
         }
-        #expect(sharedStore.retiredBufferCountForTesting == 0,
-                "a sufficient up-front reservation means growth never happens, so nothing retires")
+        // Three, not zero: the reservation itself replaces the three initial
+        // capacity-zero generations (nodes/edges/text), and empty generations
+        // enter the keepalive chain too (F5 plan A — a descriptor records a
+        // base address without dereferencing it). What the reservation must
+        // still rule out is growth *during* interning: no further retirement
+        // after the reservation's own.
+        #expect(sharedStore.retiredBufferCountForTesting == 3,
+                "a sufficient up-front reservation retires exactly the three initial empty generations and nothing during interning")
         // Reservation must not change interning results.
         let unreservedStore = SharedNodeStore()
         for treeIndex in 0 ..< 3000 {
             let unreservedReference = unreservedStore.intern(Self.nameTree(treeIndex))
             #expect(references[treeIndex].structurallyEquals(unreservedReference))
         }
+    }
+
+    /// F5 (plan A): every replaced generation enters the keepalive chain,
+    /// empty generations included. "An empty generation cannot be addressed"
+    /// was the wrong safety currency — a descriptor published between two
+    /// reservations records the empty generation's base address without
+    /// dereferencing it, and the chain is what keeps that address alive.
+    /// Pre-fix, empty generations were freed on growth and both counts below
+    /// read 0.
+    @Test func emptyGenerationsAlsoEnterTheRetirementChain() {
+        let sharedStore = SharedNodeStore()
+        sharedStore.reserveCapacity(expectedSymbolCount: 10)
+        #expect(sharedStore.retiredBufferCountForTesting == 3,
+                "the three initial capacity-zero generations (nodes/edges/text) retire on the first growth")
+        // A reader between the reservations: its reference resolves a
+        // descriptor over the current generations (the edges generation
+        // still empty — the case the freed-empty-generations reasoning
+        // missed).
+        let reference = sharedStore.intern(Self.nameTree(0))
+        let printedBeforeGrowth = reference.print(using: .default)
+        // A second, much larger reservation replaces the reserved
+        // generations; every one of them must be kept alive, not freed
+        // behind the descriptor resolved above.
+        sharedStore.reserveCapacity(expectedSymbolCount: 100_000)
+        #expect(sharedStore.retiredBufferCountForTesting == 6,
+                "the replaced reserved generations (empty edges included) retire into the chain instead of being freed")
+        #expect(reference.print(using: .default) == printedBeforeGrowth,
+                "a reference resolved between reservations keeps reading valid memory after growth")
+    }
+
+    /// F8: `reserveCapacity` growth takes the doubling lower bound, so an
+    /// indexer refining its estimate image by image retires a logarithmic
+    /// number of generations instead of one full-size generation per call —
+    /// with the whole chain alive for the store's lifetime, exact-size growth
+    /// was O(k²) held memory over k reservations. The assertion targets the
+    /// policy, not a total count (the exact total also folds in the intern's
+    /// own growth and the F5 empty-generation keepalive): on a linear ramp
+    /// the doubling floor makes step 3 reserve past step 4's target and
+    /// step 5 reserve past step 8's, so steps 4, 6, 7 and 8 must retire
+    /// nothing. Pre-fix every step grew and all four no-op assertions fail
+    /// (the review measured the linear pattern 2, 4, 6, … 16 on this shape).
+    @Test func incrementalReservationsRetireBoundedGenerations() {
+        let sharedStore = SharedNodeStore()
+        _ = sharedStore.intern(Self.nameTree(0))
+        var retiredCountAfterStep: [Int] = []
+        for step in 1 ... 8 {
+            sharedStore.reserveCapacity(expectedSymbolCount: step * 10_000)
+            retiredCountAfterStep.append(sharedStore.retiredBufferCountForTesting)
+        }
+        #expect(retiredCountAfterStep[3] == retiredCountAfterStep[2],
+                "step 4 (40k) must be a no-op: step 3 grew to at least twice step 2's capacity")
+        #expect(retiredCountAfterStep[5] == retiredCountAfterStep[4],
+                "step 6 (60k) must be a no-op: step 5 grew to at least twice step 4's capacity")
+        #expect(retiredCountAfterStep[6] == retiredCountAfterStep[4],
+                "step 7 (70k) must be a no-op under the doubling floor")
+        #expect(retiredCountAfterStep[7] == retiredCountAfterStep[4],
+                "step 8 (80k) must be a no-op under the doubling floor")
     }
 
     @Test func referencesOutliveTheSharedStore() {

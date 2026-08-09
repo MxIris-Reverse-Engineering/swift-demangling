@@ -107,17 +107,24 @@ public struct NodeReference: Sendable {
         store.textOfNode(at: nodeIndex.rawValue)
     }
 
-    /// This node's text as UTF-8 bytes from the store's string table. Only
-    /// covers text physically stored in the table;
+    /// This node's text as a freshly copied UTF-8 byte array. Only covers
+    /// text physically stored in the store's string table;
     /// `.dependentGenericParamType`'s synthesized name is not included
     /// (use `text` for the composed form).
     ///
-    /// Retained for source stability, and a **copying** bridge since the
-    /// string table moved off `ContiguousArray` into self-managed storage
-    /// (proposal 0010, step 1): every access allocates the returned slice.
-    /// New code should prefer ``withTextUTF8(_:)`` (or, on modern runtimes,
-    /// ``textUTF8Span()``), which borrow the stored bytes without copying.
-    public var textUTF8: ArraySlice<UInt8>? {
+    /// A **copying** accessor since the string table moved off
+    /// `ContiguousArray` into self-managed storage (proposal 0010, step 1):
+    /// every access allocates the returned array. This was `textUTF8:
+    /// ArraySlice<UInt8>?` before, whose indices were *store-table* offsets
+    /// on `main` but silently became 0-based when the implementation turned
+    /// into a copy — the rename and the `Array` return type make both the
+    /// copy and the 0-based indices part of the signature, so downstream
+    /// code that related slice indices to the string table fails to compile
+    /// instead of silently misreading (ReviewFindingsPR7 F10, maintainer
+    /// decision: surface at compile time). New code should prefer
+    /// ``withTextUTF8(_:)`` (or, on modern runtimes, ``textUTF8Span()``),
+    /// which borrow the stored bytes without copying.
+    public var textUTF8Bytes: [UInt8]? {
         let compact = compactNode
         guard case .text = compact.payloadKind else { return nil }
         return store.withTextUTF8(at: nodeIndex.rawValue) { spanBytes in
@@ -126,7 +133,7 @@ public struct NodeReference: Sendable {
             for byteOffset in 0 ..< spanBytes.count {
                 copiedBytes.append(spanBytes[byteOffset])
             }
-            return copiedBytes[...]
+            return copiedBytes
         }
     }
 
@@ -134,7 +141,7 @@ public struct NodeReference: Sendable {
     /// (proposal 0008, B1) — the all-platform baseline form.
     ///
     /// Returns nil, without calling `body`, when the node stores no text.
-    /// Like ``textUTF8``, this covers only text physically stored in the
+    /// Like ``textUTF8Bytes``, this covers only text physically stored in the
     /// table; `.dependentGenericParamType`'s synthesized name is not stored
     /// text (use ``text`` for the composed form).
     public func withTextUTF8<Result>(_ body: (Span<UInt8>) throws -> Result) rethrows -> Result? {

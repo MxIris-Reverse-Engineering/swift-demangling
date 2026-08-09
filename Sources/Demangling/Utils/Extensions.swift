@@ -1,12 +1,21 @@
 /// Length of the recognized mangling prefix at the start of `mangled`, or 0
 /// when there is none. Note `_T` alone (the extinct Swift 3 grammar) is not a
 /// listed prefix: callers that get 0 fall through to the Swift 3 demangler.
+///
+/// Matching is byte-wise (`UTF8View.starts(with:)`), deliberately aligned
+/// with the byte scanner's `conditional(string:)` so the entry and the
+/// scanner share one definition of "has this prefix". `String.hasPrefix` is
+/// not usable here: it compares grapheme clusters under canonical
+/// equivalence, so a combining mark right after "$s" made the entry deny a
+/// prefix the scanner then matched — the two ends of the pipeline disagreed
+/// about the same input (ReviewFindingsPR7 F9).
 func getManglingPrefixLength(_ mangled: some StringProtocol) -> Int {
-    if mangled.hasPrefix("_T0") || mangled.hasPrefix("_$S") || mangled.hasPrefix("_$s") || mangled.hasPrefix("_$e") {
+    let utf8Bytes = mangled.utf8
+    if utf8Bytes.starts(with: "_T0".utf8) || utf8Bytes.starts(with: "_$S".utf8) || utf8Bytes.starts(with: "_$s".utf8) || utf8Bytes.starts(with: "_$e".utf8) {
         return 3
-    } else if mangled.hasPrefix("$S") || mangled.hasPrefix("$s") || mangled.hasPrefix("$e") {
+    } else if utf8Bytes.starts(with: "$S".utf8) || utf8Bytes.starts(with: "$s".utf8) || utf8Bytes.starts(with: "$e".utf8) {
         return 2
-    } else if mangled.hasPrefix("@__swiftmacro_") {
+    } else if utf8Bytes.starts(with: "@__swiftmacro_".utf8) {
         return 14
     }
 

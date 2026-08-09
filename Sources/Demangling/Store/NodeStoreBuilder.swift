@@ -470,7 +470,16 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         // published view that covers a root index covers the root's whole
         // subtree, so a reader pinned to an older view can never chase an
         // edge past its view's bounds.
-        assert(
+        // `precondition`, not `assert`: the stale-view safety argument above
+        // is a release-configuration memory-safety claim, so its enforcement
+        // must survive release — a future insertion path that violates the
+        // invariant would otherwise ship silently and turn "read a stale
+        // view" into "read past a retired generation's bounds". This is the
+        // single minting funnel for interior nodes (one/two/many-child paths
+        // converge here before any edge is written), and the many-children
+        // path walks `childIndices` anyway, so the check is near-free
+        // (ReviewFindingsPR7 F7).
+        precondition(
             childIndices.allSatisfy { Int($0) < nodes.count },
             "interior node interned before one of its children — the bottom-up invariant is broken"
         )
@@ -589,8 +598,8 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
             return false
         }
         let edgesStart = Int(existing.payloadWord0)
-        return edges.withBuffer { edgeBuffer in
-            edgeBuffer[edgesStart ..< edgesStart + childIndices.count].elementsEqual(childIndices)
+        return edges.withBuffer(in: edgesStart ..< edgesStart + childIndices.count) { edgeBuffer in
+            edgeBuffer.elementsEqual(childIndices)
         }
     }
 
@@ -639,10 +648,10 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
             let compact = nodes[Int(existing)]
             let edgesStart = Int(compact.payloadWord0)
             let childCount = Int(compact.payloadWord1)
-            var slot = edges.withBuffer { edgeBuffer in
+            var slot = edges.withBuffer(in: edgesStart ..< edgesStart + childCount) { edgeBuffer in
                 Self.hashOfManyChildren(
                     kindAndPayloadKind: compact.kindAndPayloadKind,
-                    childIndices: edgeBuffer[edgesStart ..< edgesStart + childCount]
+                    childIndices: edgeBuffer
                 )
             } & mask
             while grownSlots[slot] != Self.emptySlot {
@@ -681,8 +690,8 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         let length = Int(location.length)
         guard length == textValue.utf8.count else { return false }
         let start = Int(location.offset)
-        return textBytes.withBuffer { textBuffer in
-            let storedBytes = textBuffer[start ..< start + length]
+        return textBytes.withBuffer(in: start ..< start + length) { textBuffer in
+            let storedBytes = textBuffer
             if let contiguousResult = textValue.utf8.withContiguousStorageIfAvailable({ buffer in
                 storedBytes.elementsEqual(buffer)
             }) {
@@ -746,8 +755,8 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         for existing in textSlots where existing != Self.emptySlot {
             let location = uniqueTexts[Int(existing)]
             let start = Int(location.offset)
-            var slot = textBytes.withBuffer { textBuffer in
-                Self.hashOfTextBytes(textBuffer[start ..< start + Int(location.length)])
+            var slot = textBytes.withBuffer(in: start ..< start + Int(location.length)) { textBuffer in
+                Self.hashOfTextBytes(textBuffer)
             } & mask
             while grownSlots[slot] != Self.emptySlot {
                 slot = (slot + 1) & mask

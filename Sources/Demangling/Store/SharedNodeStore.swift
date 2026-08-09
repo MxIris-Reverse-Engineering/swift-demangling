@@ -28,10 +28,14 @@ final class SharedViewState: Sendable {
         var view: NodeStore.BufferView
         /// The current buffer generations backing `view`.
         var currentBuffers: [AnyObject]
-        /// Every grown-out generation a published view may still address.
-        /// Append-only; released as a whole when the store dies. Bounded by
-        /// the doubling growth policy at less than one current-buffer's worth
-        /// of bytes, and empty when capacity was reserved up front.
+        /// Every grown-out generation a published view may still address —
+        /// empty generations included, because a descriptor (or a
+        /// zero-length span formed from it) records a generation's base
+        /// address without dereferencing it. Append-only; released as a
+        /// whole when the store dies. Bounded by the doubling growth policy
+        /// — which `reserveCapacity` growth also takes — at less than one
+        /// current-buffer's worth of live bytes; reserving up front leaves
+        /// only the initial empty generations in the chain.
         var retiredBuffers: [AnyObject]
     }
 

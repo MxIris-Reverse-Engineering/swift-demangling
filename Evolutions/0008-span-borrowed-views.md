@@ -211,6 +211,15 @@ demangler 主体产生两份特化，代码体积约 ×2（demangler 编译单�
 偏移」。对合法 mangled 输入（纯 ASCII）两者恒等；仅对含非 ASCII 的**非法**输入
 数值不同。corpus oracle 比对的是 demangle 输出，不受影响。
 
+> **2026-08-09 补记（PR #7 review F9）**：本节当年漏记了一条——实现期
+> `getManglingPrefixLength` 从 scalar 比较改成了 `String.hasPrefix`，后者按字素簇 +
+> 规范等价比较，于是 `"$s"` 后紧跟组合符的输入在入口被判「无前缀」而扫描器按字节
+> 又能匹配，`isSwiftSymbol` / `stripManglePrefix` 两个 public API 的行为静默变化、
+> 符号误路由到 Swift 3 demangler。下节「源兼容已核实」论证的是编译期源兼容，没有
+> 覆盖运行时行为这一维。已于 review 第 3 步改为字节比较（与扫描器
+> `conditional(string:)` 同一定义）并以 `prefixDetectionComparesBytesNotGraphemeClusters`
+> 钉住；本条补记的是「当时漏了什么」。
+
 **源兼容已核实**：`DemangleInterface.swift` 的 public 入口全部 String 基底
 （sync / async / `@_spi` transient 三个），泛型 `demangleAsNode<C>` 是 `private`，
 `Demangler<C>` 无访问修饰（internal），`getManglingPrefixLength` 只被同模块的
@@ -406,3 +415,4 @@ A、B1、B2、B3 相互独立，可各自成 PR；建议顺序 Phase 0 → A →
 | 2026-08-07 | 实现期核实三项（Swift 6.3.3 / Xcode 26.6 逐项 typecheck，`-target arm64-apple-macos10.15`） | ① Source Compatibility 遗留的「未知 experimental feature 名是否报错」：**不报错**，`-enable-experimental-feature` 收到未知名称时静默忽略（以伪造名实测），风险从「构建断裂」降级为「特性未开导致的正常编译错误」。② 新发现：**扫描器核心本身依赖 `Lifetimes` 特性**——不开该特性时，struct 存储 `Span` 属性直接是编译错误（"initializer cannot return a ~Escapable result"），因此「编译器不认识 feature 即退化为闭包式」只覆盖轴 2 的直接返回式 API；`Demangling` 模块整体要求编译器具备 `Lifetimes`（tools 6.2 起的 Apple 工具链均满足，Swift 6.2 原生行为仍待按提案在 Xcode 26.0 复核）。③ 轴 1 全部拼写在 10.15 target 下 typecheck 通过：`String.utf8Span`、`UTF8Span(unchecked:)`、`String(copying:)`、`Span.extracting(_:)`、`InlineArray<26, Range<Int>>(repeating:)`、`.span` 属性与 `withUnsafeBufferPointer { $0.span }` 桥接；含「~Escapable 扫描器持 `Span` 字段 + 泛型 `Demangler<Words>` + mutating 方法 + `withUTF8` 闭包内构造 + `Result` 桥回 typed throws」的组合探测。 |
 | 2026-08-09 | PR #7 review 第 0 步落地（F3/F4，同批 commit） | **F3**：测试 target 一直缺 `Lifetimes` 开关，`#if hasFeature(Lifetimes)` 的测试（`directReturnSpanAgreesWithClosureForm`）从未进过测试二进制而套件照绿——本提案核实记录只声明了「`Demangling` target 无条件开启」，测试 target 从不在视野内。testTarget 补开关 + 元测试守卫（先确认红再修复转绿），该测试首次真实执行并通过。**F4**：`StorePrintParitySweep` 等语料验收的 `try?` 在比较前吞掉失败符号，「439,522 symbols, 0 mismatches」实际含义是「两边都成功的那些无差异」。改造为：单边失败即 parity mismatch；双边失败按 stdlib demangler（默认 oracle 同一裁判）分类，stdlib 也拒绝才算一致拒绝，stdlib 能解则断言失败。重跑揭示语料实为 439,533 个符号，其中 **11 个双路径皆败且 stdlib 同拒**（此前被静默吞掉），其余 439,522 双运行时路径 0 mismatch、0 单边失败。详见 `Documentations/ReviewFindingsPR7.md` 移交清单第 0 步。 |
 | 2026-08-09 | PR #7 review F2 修复：0xFF 对齐填充跳过在字节化中被静默杀死（功能回归） | `ec3769a` 把扫描器换成逐字节 Latin-1 交出后，`demangleOperator` 的 `scalar.value == 0xFF` 死代码化——String 输入的 U+00FF 填充以 UTF-8 双字节 `C3 BF` 到达，循环永不执行；452 万符号语料全 ASCII，结构上覆盖不到（A9 自 `8d0b396` 合并起就没有针对性测试）。复修在字节域跳过 raw `FF` 与 `C3 BF` 两种拼写，`AppleAlignmentTests.alignmentPaddingBeforeOperatorIsSkipped` 修复前红、修复后绿并永久入库；横向排查 group-a 其余 7 项全部为 ASCII 域或不经扫描器（全 Demangler 唯一的非 ASCII scalar 比较即此处），无同类失效。防线盲区自答：该测试只覆盖 String 入口的 `C3 BF` 形态与本机运行时路径——raw `FF` 形态要等字节入口（0012 若立项）才可达，由注释与本行留档。 |
+| 2026-08-09 | PR #7 review F9 修复：前缀匹配回到字节域 | `ec3769a` 把 `getManglingPrefixLength` 改成 `String.hasPrefix`（字素簇 + 规范等价），`"$s"` 后跟组合符的输入在入口被判无前缀而扫描器按字节能匹配——`isSwiftSymbol`/`stripManglePrefix` 行为静默变化、误路由 Swift 3 demangler；提案「源兼容已核实」只论证了编译期，且「行为差异，明示」一节漏了这条（已就地补记）。改为 `UTF8View.starts(with:)` 字节比较，与扫描器 `conditional(string:)` 同一定义；非 ASCII 前缀判定测试入库。仅影响非 ASCII（必然非法）输入，`main` 行为恢复。 |

@@ -324,7 +324,8 @@ let reference = store.reference(at: rootIndices[0])
 let readable = reference.print(using: .default)
 
 for child in reference.children where child.kind == .identifier {
-    // `textUTF8` borrows the store's string table without allocating
+    // `withTextUTF8` borrows the store's string table without allocating;
+    // `textUTF8Bytes` is the copying convenience when the bytes must escape
     print(child.text ?? "")
 }
 ```

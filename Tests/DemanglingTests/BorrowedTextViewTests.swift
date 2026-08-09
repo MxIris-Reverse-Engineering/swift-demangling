@@ -35,8 +35,8 @@ struct BorrowedTextViewTests {
                     }
                     return copied
                 }
-                let sliceBytes = node.textUTF8.map(Array.init)
-                #expect(borrowedBytes == sliceBytes, "withTextUTF8 and textUTF8 must expose the same bytes")
+                let copiedBytes = node.textUTF8Bytes
+                #expect(borrowedBytes == copiedBytes, "withTextUTF8 and textUTF8Bytes must expose the same bytes")
                 if let borrowedBytes {
                     visitedTextNodeCount += 1
                     #expect(String(decoding: borrowedBytes, as: UTF8.self) == node.text)
@@ -97,7 +97,7 @@ struct BorrowedTextViewTests {
                     }
                     directBytes = copied
                 }
-                #expect(directBytes == node.textUTF8.map(Array.init))
+                #expect(directBytes == node.textUTF8Bytes)
             }
         }
         // Store-level span accessor covers the whole table.
@@ -105,6 +105,24 @@ struct BorrowedTextViewTests {
         #expect(wholeTable.count == store.textByteCount)
     }
     #endif
+
+    /// `textUTF8Bytes` (formerly `textUTF8: ArraySlice<UInt8>?`) pins its
+    /// bytes without `Array(...)` normalization — the old suite normalized
+    /// every comparison, which is exactly how the slice's index base silently
+    /// changing from store-table offsets to 0 went unseen
+    /// (ReviewFindingsPR7 F10). The `[UInt8]` return type now carries the
+    /// 0-base in the signature; this test pins the content for a node whose
+    /// text does *not* start the string table, the case where the two bases
+    /// diverged.
+    @Test func copiedTextBytesMatchTheStoredTextForALaterTableEntry() throws {
+        var builder = NodeStoreBuilder()
+        _ = builder.intern(kind: .identifier, text: "AAAAAAAA")
+        let laterIndex = builder.intern(kind: .identifier, text: "BBBB")
+        let store = builder.freeze()
+        let laterBytes = try #require(store.reference(at: laterIndex).textUTF8Bytes)
+        #expect(laterBytes == Array("BBBB".utf8))
+        #expect(laterBytes.startIndex == 0)
+    }
 
     /// Non-ASCII stored text (punycode-decoded identifiers) must round-trip
     /// identically through the revalidation-free materialization path.

@@ -28,12 +28,6 @@
 
 | # | 位置 | 一句话 | 是否本 PR 引入 | 优先级 |
 |---|---|---|---|---|
-| [F5](#f5) | `StoreBuffer.swift:129` | 空代跳过退休登记，已发布的描述符可指向已释放内存 | 是 | 应修 |
-| [F6](#f6) | `StoreBuffer.swift:88` | `withBuffer` 的 range 读丢了 release 边界陷阱 | 是 | 应修 |
-| [F7](#f7) | `NodeStoreBuilder.swift:473` | 整套内存安全论证依赖的不变量只用 `assert` 守，release 编译掉 | 是 | 应修 |
-| [F8](#f8) | `StoreBuffer.swift:115` | `reserveCapacity` 精确扩容 + 退休链只增不减 = O(k²) | 是 | 应修 |
-| [F9](#f9) | `Extensions.swift:5` | 前缀匹配改按字素簇比较，两个 public API 语义静默变化 | 是 | 应修 |
-| [F10](#f10) | `NodeReference.swift:120` | `textUTF8` 签名不变但索引基从 store 绝对索引变 0 基 | 是 | 应修 |
 | [F11](#f11) | `NodeStore+BufferView.swift:115` | legacy 文本物化分支没接进 seam，从未被任何配置执行过 | 是 | 应修 |
 | [F12](#f12) | `DualPathParityTests.swift:46` | 翻进程级全局开关，并行套件被静默拽到 legacy 路径 | 是 | 应修 |
 | [F13](#f13) | `SpanBorrowedViewsBenchmarks.swift:22` 等 3 处 | 三个 benchmark 套件测量窗口重叠，决策日志数字不可归因 | 是 | 应修 |
@@ -76,315 +70,6 @@
 ---
 
 # 第二部分：应修
-
-<a name="f5"></a>
-## F5. 空代跳过退休登记 —— 已发布的描述符可以指向已释放的内存
-
-- **位置**：`Sources/Demangling/Store/StoreBuffer.swift:127-136`
-  ```swift
-  private mutating func grow(to newCapacity: Int) {
-      ...
-      if count > 0 {          // ← 空代不进退休链
-          ...
-          retirementSink?(storage)
-      }
-  }
-  ```
-
-- **触发序列**：
-  1. `SharedNodeStore()`；
-  2. `reserveCapacity(10)` → edges 从 gen0 增长到 gen1，此时 `count == 0`，
-     **gen1 没有进退休链**（gen0 侥幸存活，因为 `NodeStore.edgesStorage` 钉住的是
-     **初代**）；随后 `publishCurrentState` 发布了一个 base 指向 gen1 的描述符；
-  3. 某个读者在此窗口解析视图，于是它手里的 `BufferView` 记着
-     `edges.baseAddress == gen1.base`；
-  4. `reserveCapacity(500_000)` → gen1 增长到 gen2，**仍然 `count == 0`**，
-     `retirementSink` 再次被跳过；`publishCurrentState` 覆写 `currentBuffers`，
-     gen1 的最后一个引用消失 → `StoreBuffer.deinit` → `deallocate()`；
-  5. 那个被钉住的描述符现在持有悬垂 base，`withSpans` 会在已释放内存上形成 `Span`。
-
-- **为什么今天不崩**：`count == 0` 让所有边界检查先失败。但——
-  - 这个理由论证的是**解引用**，而形成描述符和形成 `Span` 都不需要解引用；
-  - `BufferView.text` 在一个对 `(0, 0)` 恒成立的 `precondition` 之后就计算
-    `textBytes.baseAddress! + start`。
-
-- **它与文档直接冲突**：`SharedNodeStore.swift:9-11` 写的是「any descriptor a reader
-  ever obtained keeps addressing live memory for the store's whole lifetime」。
-  这句话与当前实现二者只能留一个。
-
-### 四问
-
-1. **能复现吗**：触发序列如上，可构造。**不是误报**，但**今天是良性的**——需要极其明确
-   地区分这两点。
-2. **`main` 是否也有**：`SharedNodeStore` 是本 PR 新增。**本 PR 引入。**
-3. **值不值得修**：**应修**。今天良性、明天不一定：任何让空代产生非零长度视图的改动
-   （或 `BufferView` 新增一个不走边界检查的取址路径）都会把它变成真的 use-after-free。
-   而它成本很低——去掉 `count > 0` 这个条件即可。
-4. **以前修过吗**：**没修过，而且这是刻意设计，理由已留档**。
-   - 0010 决策日志 2026-08-08 条目原文：「**空代直接释放**（count 0 的代不可能被任何
-     已发引用寻址）」。
-   - **这个理由今天是否仍成立**：结论（今天不崩）成立；**论证范围不成立**——它论证的是
-     「不可能被寻址」，而风险在于「描述符与 `Span` 的**形成**」，二者不是一回事。
-   - 所以本条不是「bug 重现」，是**一条已留档的设计决策与同一文件里另一句更强的承诺
-     自相矛盾**。
-
-- **修法方向**：二选一，**并把选择写进 0010 的决策日志**：
-  - **方案 A（推荐）**：去掉 `count > 0` 条件，空代也进退休链。代价是极少量内存
-    （空代本身没有数据），换取 `SharedNodeStore.swift:9-11` 那句承诺无条件成立。
-  - **方案 B**：保留优化，但把 9-11 行的承诺改写为「仅覆盖非空代」，并在
-    `BufferView` 所有取址路径上补上「空视图不得形成指针」的显式守卫。
-  - 无论选哪个，都要补一个测试钉住「预留 → 发布 → 再预留」这个序列下描述符仍然有效。
-
-<a name="f6"></a>
-## F6. `withBuffer` 的 range 读丢了 release 边界陷阱
-
-- **位置**：`Sources/Demangling/Store/StoreBuffer.swift:88`（`withBuffer` 交出裸
-  `UnsafeBufferPointer`），四个调用点在 `NodeStoreBuilder.swift`：
-
-  | 行 | 调用 |
-  |---|---|
-  | 592-593 | `manyChildrenNodeMatches`：`edgeBuffer[edgesStart ..< edgesStart + childIndices.count]` |
-  | 642-645 | `resizeManyChildrenSlots` |
-  | 684 | `textLocationMatches` |
-  | 749 | `resizeTextSlots` |
-
-- **现象**：`UnsafeBufferPointer` 的 **range 下标只有 `_debugPrecondition`**。这些位置
-  在本 PR 之前是 `ContiguousArray` 切片，**release 下会 trap**；现在不会。
-
-- **它与类型自己的文档冲突**：`StoreBuffer.swift:45` 写着「Reads are bounds-checked
-  against the initialized count in every configuration, matching the ContiguousArray
-  semantics this replaces: an out-of-range index traps deterministically instead of
-  reading foreign memory, **in release too**」。这句话**只对 `subscript(index:)` 成立**，
-  对每一个 range 读都不成立。
-
-- **后果**：被污染的 `payloadWord0` 或 `TextLocation` 会读过初始化前缀，
-  `elementsEqual` 拿未初始化的容量区做比较，**可能报告一个假的 interning 命中，从而把
-  两棵不同的树永久别名到同一个 index**。这是静默的数据损坏，不是崩溃。
-
-### 四问
-
-1. **能复现吗**：需要先有一个被污染的 payload/location 才能触发，属于**二阶**问题。
-   **不是误报**（语义倒退是确凿的），但触发它需要另一个 bug 先发生。
-2. **`main` 是否也有**：`main` 上这些是 `ContiguousArray` 切片，**release 下会 trap**。
-   **本 PR 引入的语义倒退。**
-3. **值不值得修**：**应修**。理由不在「今天会不会踩」，而在「它把一个确定性 trap 换成了
-   静默的树别名」——后者是这个库最难查的一类故障（interning 的全部正确性都建立在
-   「结构相等 ⟺ 同一 index」上）。
-4. **以前修过吗**：**没修过这一处，但风险在同一次迁移里被识别过、且只修了一半**。
-   - `9997830`（引入 `StoreBuffer` 的那个 commit）的 message **自己就写了**：
-     「Read-side bounds semantics preserved: explicit preconditions match the release
-     trapping the array subscripts provided.」
-   - 也就是说「从 `ContiguousArray` 换裸缓冲会丢掉 release 边界陷阱」这件事，作者
-     **识别到了、写进 commit message 了、在读侧补上了**——builder 侧的这四处 range 读
-     没补。读侧确实补了（`NodeStore+BufferView.swift` 的 46/66/107/151/192 五处
-     `precondition`），对比之下 builder 侧的缺失更像遗漏而非决策。
-   - 补充：同一个文件 `NodeStoreBuilder.swift` 在 `4ec46d8` 刚因为边界守卫问题修过
-     一次（那个 commit 自称「同一文件第二次」）。
-
-- **修法方向**：
-  1. 给 `StoreBuffer` 加一个 range 版访问器，内部做 `precondition(range.upperBound <= count)`
-     后再切片，四处调用点改用它；
-  2. 或者在四个调用点各自补 `precondition`——但那样下一个调用点还会漏，不推荐；
-  3. 修正 `StoreBuffer.swift:45` 的文档措辞，让它与实际保证一致。
-
-<a name="f7"></a>
-## F7. 内存安全论证依赖的不变量只用 `assert` 守，release 编译掉
-
-- **位置**：`Sources/Demangling/Store/NodeStoreBuilder.swift:473`
-  ```swift
-  // ...The shared store's stale-view safety (step 4) rests on exactly this — a
-  // published view that covers a root index covers the root's whole subtree, so a
-  // reader pinned to an older view can never chase an edge past its view's bounds.
-  assert(
-      childIndices.allSatisfy { Int($0) < nodes.count },
-      "interior node interned before one of its children — the bottom-up invariant is broken"
-  )
-  ```
-
-- **现象**：注释就写明了「`SharedNodeStore` 的 stale-view 内存安全**完全依赖**这个
-  不变量」，而 `assert` **在 release 里被编译掉**——release 正是发布配置。
-  release 下唯一的残余强制是 `intern(kind:children:)` 里一个附带的 `precondition`
-  （两个调用者之一）；`internInterior`、`appendNode`、`internManyChildren`
-  ——**边真正被写入的那个咽喉**——什么都不检查。
-
-- **后果**：任何未来的插入路径（批量 intern 快路径、延迟补子节点方案、mmap 反序列化器）
-  都能编译通过、debug 测试全绿，同时把「读到陈旧视图」变成「在已退休的代上越界读」。
-
-- **一致性问题**：本 PR 其它每一处内存安全边界都用 `precondition`
-  （`StoreBuffer.swift:81`、`NodeStoreBuilder.swift:178`、
-  `NodeStore+BufferView.swift` 的 46/66/107/151/192），唯独这一处不是。而 many-children
-  路径本来就要遍历 `childIndices`，改成 `precondition` 几乎零成本。
-
-### 四问
-
-1. **能复现吗**：当前代码路径下不可复现（不变量确实成立）。**不是误报，但它是一个
-   「护栏缺失」而非「当前有 bug」**——必须如实这样描述。
-2. **`main` 是否也有**：`main` 上没有 `SharedNodeStore`，也没有这个 assert。
-   **本 PR 引入。**
-3. **值不值得修**：**应修**。成本极低（`assert` → `precondition`），收益是让一个
-   「内存安全论证的基石」在发布配置里真的成立。
-4. **以前修过吗**：**没修过，但这是同一个文件在七天内第二次踩「守卫在 release 下失效」**。
-   - **谁引入的**：`1adf202`（2026-08-08），这个 commit 的**全部内容**就是
-     「pin the bottom-up child-before-parent invariant (evolution 0010, step 2)」。
-   - **当时为什么用 `assert`**：验收写的是「full-corpus store sweep **in debug** with
-     the assertion live — zero triggers」。也就是说作者把它当作**一次性验证工具**用
-     （跑一遍 debug 语料证明不变量成立），而不是当作运行时护栏。这个动机是合理的，
-     但它没有覆盖「以后新增插入路径」这个场景，而 commit 自己的注释恰恰声称它守护的是
-     step 4 的内存安全。
-   - **时间线**：2026-08-02（`4ec46d8`）刚把**同一个文件**的守卫改成 release 生效的
-     `precondition`，2026-08-08（`1adf202`）新加的安全不变量又用了 debug-only 的
-     `assert`。
-
-- **修法方向**：
-  1. `assert` → `precondition`，并**下沉到边真正写入的那个咽喉**（`internManyChildren`
-     写 edge 的位置），而不是留在 `internInterior`；
-  2. 顺手让另外两个入口（`appendNode`、`internInterior`）也走同一个检查；
-  3. 在 0010 的决策日志里记一行：这个不变量的强制点在哪、为什么必须是 `precondition`。
-
-<a name="f8"></a>
-## F8. `reserveCapacity` 精确扩容 + 退休链只增不减 = O(k²) 内存
-
-- **位置**：`Sources/Demangling/Store/StoreBuffer.swift:115-123`
-  ```swift
-  mutating func reserveCapacity(_ minimumCapacity: Int) {
-      ... grow(to: minimumCapacity)        // ← 精确尺寸，不翻倍
-  }
-  mutating func ensureCapacity(_ requiredCapacity: Int) {
-      ... grow(to: Swift.max(requiredCapacity, capacity * 2, 16))   // ← 这条才翻倍
-  }
-  ```
-
-- **现象**：在 `SharedNodeStore` 上，每次 `reserveCapacity` 都退休掉上一次的完整预留，
-  而退休链**只增不减**（整个 store 生命周期内不释放）。
-
-- **已实测**（PR tip）：首次 intern 之后连续八次递增的
-  `SharedNodeStore.reserveCapacity(expectedSymbolCount:)`，
-  `retiredBufferCountForTesting` 依次为 **2, 4, 6, 8, 10, 12, 14, 16**。
-  每一代退休的都是上一次的完整预留。
-
-- **谁会踩**：按镜像逐个细化估算的索引器（10k → 20k → 30k …）。
-  而 `reserveCapacity` 的文档明确写着「Callable at any point」——**增量负载正是这个类
-  存在的理由**。
-
-- **它与文档冲突**：`SharedNodeStore.swift:31-34` 写「Bounded by the doubling growth
-  policy at less than one current-buffer's worth of bytes」。这个界**只对 `ensureCapacity`
-  成立**，对 `reserveCapacity` 的 `grow(to: minimumCapacity)` 不成立。
-
-### 四问
-
-1. **能复现吗**：能，已实测（退休链 2→16）。**不是误报**。
-2. **`main` 是否也有**：`main` 没有 `SharedNodeStore`，也没有退休链。**本 PR 引入。**
-3. **值不值得修**：**应修**。它不会崩，只会让长跑索引器的内存缓慢膨胀——这类问题在
-   下游（`MachOSwiftSection` / RuntimeViewer 的批量索引）最难归因。
-4. **以前修过吗**：**没修过，是两个正确决策叠加出的新问题**。
-   - `99100c3`（0009）引入 `reserveCapacity`，验收数据**全部来自一次性预留**场景
-     （原文「>=1MiB allocation events 12 -> 4；the 4 are the reservations themselves」）
-     ——**反复预留从来没测过**；
-   - `9997830`（0010 步骤 1）换底层存储时，还把「精确尺寸分配」当作**优点**记进了决策
-     日志（「nodes reservation utilization 73% → 96% from exact-size allocation」）；
-   - `60afea0`（0010 步骤 4）加了退休链。
-   - 三者各自都对，叠起来才是 O(k²)。而现存的
-     `SharedNodeStoreTests.reservationKeepsTheRetirementChainEmpty` 只覆盖
-     「任何 intern 之前预留一次」——**恰好是退休链保持为空的那唯一一种配置**。
-
-- **修法方向**：
-  1. `reserveCapacity` 也走翻倍下界：`grow(to: max(minimumCapacity, capacity * 2))`；
-     或者在已有容量足够时直接跳过（`minimumCapacity <= capacity` 时 no-op）；
-  2. 或者让退休链可回收（引用计数 / 代际水位），但这明显更复杂，不推荐作为首选；
-  3. 修正 `SharedNodeStore.swift:31-34` 的界的措辞；
-  4. **测试要覆盖「反复预留」**，不能只测「预留一次」——现有测试的配置选择本身就是盲点。
-
-<a name="f9"></a>
-## F9. 前缀匹配改按字素簇比较，两个 public API 语义静默变化
-
-- **位置**：`Sources/Demangling/Utils/Extensions.swift:4-14`
-  ```swift
-  func getManglingPrefixLength(_ mangled: some StringProtocol) -> Int {
-      if mangled.hasPrefix("_T0") || ... // ← String.hasPrefix：按字素簇 + 规范等价
-  }
-  ```
-  影响 `Extensions.swift:17-24` 的两个 public 成员：`isSwiftSymbol`、`stripManglePrefix`。
-
-- **现象**：`String.hasPrefix` 按**字素簇**比较并遵守**规范等价**；原来的
-  `Demangler.getManglingPrefixLength` 走 `ScalarScanner.conditional(string:)`，其文档
-  明确写着「purely based on direct scalar comparison (no decomposition or normalization)」。
-
-- **A/B 已验证**，输入 `"$s" + U+0301 + "4main4testyyF"`（U+0301 是组合重音符）：
-  | | merge-base | PR tip |
-  |---|---|---|
-  | `isSwiftSymbol` | `true` | **`false`** |
-  | `stripManglePrefix` | 去掉前缀 | **原样返回** |
-  | `demangleAsNode` 路由 | `demangleSymbol()`，报 `matchFailed("(read test function to succeed)", at: 2)` | **走 `demangleSwift3TopLevelSymbol()`**（`DemangleInterface.swift:149` 的 else 分支），报 `matchFailed(wanted: "_T", at: 0)` |
-
-- **附带的内部不一致**：字节扫描器自己的 `conditional(string:)` 仍然是逐字节匹配。
-  于是**入口和扫描器现在对「什么算前缀」的定义不一致**。
-
-### 四问
-
-1. **能复现吗**：能，见上表。**不是误报**，但**只影响非 ASCII（因而必然非法）的输入**。
-2. **`main` 是否也有**：`main` 是 scalar 比较。**本 PR 引入的语义变化。**
-3. **值不值得修**：**应修，但优先级低于前面几条**。合法 mangled 符号全是 ASCII，所以
-   实际影响面窄；值得修的理由是「public API 行为未经宣告地变了」+「入口与扫描器定义
-   不一致」，而不是「会出错」。
-4. **以前修过吗**：**没修过。是有意改动，但影响评估漏了一维。**
-   - **谁改的**：`ec3769a`。
-   - **当时怎么论证的**：0008 提案有专门一节「**源兼容已核实**」讨论了这个函数，原文
-     是「`getManglingPrefixLength` 只被同模块的 String 扩展调用。改具体类型不破任何
-     公共 API」。
-   - **这个论证的盲区**：它论证的是**编译期源兼容**（谁调用它、签名变不变），没有论证
-     **运行时行为兼容**（它那两个 public 调用者的**行为**会不会变）。
-   - **更能说明问题的一点**：同一节还有一个小标题就叫「**行为差异，明示**」，里面只列了
-     「错误偏移从 scalar 计数变字节偏移」一条——提案自己**设了这个格子，却没把前缀匹配
-     语义填进去**。
-
-- **修法方向**：
-  1. 改回按 scalar（或直接按 UTF-8 字节）比较，与扫描器的 `conditional(string:)` 对齐——
-     推荐这条，因为它同时消除了入口与扫描器的定义分歧；
-  2. 补一个测试钉住非 ASCII 输入下的前缀判定；
-  3. 在 0008 提案的「行为差异，明示」一节补记这一条（**即使改回去也要补**——记录的是
-     「当时漏了什么」，这正是决策日志的价值）。
-
-<a name="f10"></a>
-## F10. `textUTF8` 签名不变，索引基从 store 绝对索引变成 0 基
-
-- **位置**：`Sources/Demangling/Store/NodeReference.swift:120`
-  ```swift
-  public var textUTF8: ArraySlice<UInt8>? { ... }
-  ```
-
-- **现象**：签名一个字符没变（还是 `ArraySlice<UInt8>?`），但语义变了两处：
-  | | merge-base | PR tip |
-  |---|---|---|
-  | 实现 | 零拷贝切片，索引是 **store 绝对索引** | 新分配的 0 基数组，逐字节 `append` 填充 |
-  | 实测（先 intern `"AAAAAAAA"` 再 `"BBBB"`，读第二个节点） | `startIndex=8, endIndex=12` | **`startIndex=0, endIndex=4`** |
-
-- **两个后果**：
-  1. 任何把切片索引与 store 字符串表关联的下游代码（`store.textBytesSpan()[slice.startIndex]`、
-     按 `startIndex` 排序条目）**语义静默改变**，且**没有一个调用点会编译失败**；
-  2. 每次访问现在都分配 + 逐字节 `append`（每字节一次唯一性检查 + 容量检查），
-     而以前零分配。本 PR 已经把所有内部调用者迁到 span 上，所以**这个成本 100% 落在
-     外部消费方头上**。
-
-### 四问
-
-1. **能复现吗**：能，已实测（8..12 → 0..4）。**不是误报**。
-2. **`main` 是否也有**：`main` 是零拷贝绝对索引。**本 PR 引入。**
-3. **值不值得修**：**应修**。这是一个「无声的下游破坏」——签名不变、编译通过、行为改变，
-   属于最难被下游发现的一类。考虑到下游（`MachOSwiftSection` 等）正在用 store API，
-   要么修，要么至少显式宣告。
-4. **以前修过吗**：**没修过。同 F9 一个形态：有意改动，影响评估漏了一维。**
-   - **谁改的**：`9997830`。
-   - **commit message 原文**：「NodeReference.textUTF8 becomes a copying bridge
-     (borrowed forms stay zero-copy)」——**承认了拷贝，没提索引基**。
-   - 文档注释同样只写了拷贝，没写索引重基。
-   - **没有任何测试钉住索引基**：`NodeStoreTests.swift:307` 和
-     `BorrowedTextViewTests.swift:38` 都用 `Array(...)` 做了归一化，正好把这个差异抹掉。
-
-- **修法方向**（三选一，需要决策）：
-  - **A**：保持绝对索引语义（返回真正的切片视图），恢复源兼容；
-  - **B**：接受 0 基，但**改签名**（例如改名或改返回类型），让下游编译失败而不是静默改变；
-  - **C**：接受 0 基并保持签名，但在文档、`README`、0010 决策日志里显式宣告为破坏性变更。
-  - 无论哪个，都要**补一个钉住索引基的测试**（不要用 `Array(...)` 归一化）。
 
 <a name="f11"></a>
 ## F11. legacy 文本物化分支从未被任何配置执行过
@@ -702,16 +387,27 @@
    红→绿）+ 致陷拼写扫描测试双防线入库，盲区互补已言明。清点全文在 `KnownIssues.md`
    2026-08-09 更新；决策日志行在 0004（整数陷阱家族）。TypeDecoder 8 处维持暂缓不变。
 
-**第 2 步 —— 内存安全与存储**
+**第 2 步 —— ✅ 已完成（2026-08-09，F5–F8 条目已按本文件契约移除）**
 
-6. **F5**（空代退休）、**F7**（`assert` → `precondition`）、**F6**（range 读边界）：
-   这三条同属「护栏」，一批做完，同时订正各自冲突的文档措辞。
-7. **F8**（`reserveCapacity` O(k²)）：修扩容策略 + 补「反复预留」测试。
+6. **F5 落地（维护者裁决方案 A）**：空代也进退休链，「描述符终生有效」承诺无条件成立；
+   红→绿测试 + 引用跨预留存活行为钉；`reservationKeepsTheRetirementChainEmpty` 更名为
+   `reservationRetiresOnlyTheInitialEmptyGenerations`。**F7 落地**：`internInterior`
+   的不变量 `assert` → `precondition`（release 生效；它是 interior 唯一铸造漏斗）。
+   **F6 落地**：四处 range 读收敛到 `withBuffer(in:)` 界检查访问器 + exit test；
+   `StoreBuffer` 与 `SharedViewState` 的冲突措辞全部订正。
+7. **F8 落地**：`reserveCapacity` 取加倍下界（首次预留仍精确，增量再预留 ≤2× 超配换
+   O(log) 代数）；策略测试断言坡道第 4/6/7/8 步为 no-op（修复前每步都增长，实测
+   17 个退休代）。**吞吐复测挂账到 F13 之后**（测量窗口修好才有可信数字）。
+   四条的决策记录合并为 0010 决策日志 2026-08-09 行。
 
-**第 3 步 —— 公开 API 语义**
+**第 3 步 —— ✅ 已完成（2026-08-09，F9 与 F10 条目已按本文件契约移除）**
 
-8. **F9**（前缀匹配）、**F10**（`textUTF8` 索引基）：F10 需要**先做决策**（保持语义 /
-   改签名 / 宣告破坏性变更），建议先问维护者再动手。
+8. **F9 落地**：`getManglingPrefixLength` 改 `UTF8View.starts(with:)` 字节比较，与
+   扫描器同一定义，`main` 行为恢复；非 ASCII 前缀判定测试入库；0008 的「行为差异，
+   明示」一节已就地补记当年漏了什么。**F10 落地（维护者裁决：改签名）**：更名
+   `textUTF8Bytes`、返回类型改 `[UInt8]?`——拷贝与 0 基进签名，旧拼写编译失败；
+   内部使用点同批迁移，不做 `Array` 归一化的内容钉测试入库；README 陈旧注释与
+   AGENTS.md 同步。决策日志行分别在 0008（F9）与 0010（F10）。
 
 **第 4 步 —— 测试与测量基础设施**
 
