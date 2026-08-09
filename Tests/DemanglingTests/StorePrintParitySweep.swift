@@ -42,17 +42,68 @@ final class StorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendable {
         var builder = NodeStoreBuilder()
         var rootBySymbol: [(symbol: String, root: NodeStore.NodeIndex)] = []
         rootBySymbol.reserveCapacity(corpus.count)
+        var storePathFailedSymbols: [String] = []
         for mangled in corpus {
-            if let root = try? builder.demangle(mangled) {
-                rootBySymbol.append((mangled, root))
+            do {
+                rootBySymbol.append((mangled, try builder.demangle(mangled)))
+            } catch {
+                storePathFailedSymbols.append(mangled)
             }
         }
         let store = builder.freeze()
 
+        // Failure visibility (ReviewFindingsPR7 F4): failures used to be
+        // swallowed with `try?` before the comparison, making the sweep blind
+        // to any regression that turns success into failure — F2 (the 0xFF
+        // padding regression) escaped exactly that way. A one-sided failure is
+        // a parity mismatch. A both-sided failure is classified against the
+        // Swift runtime's own demangler, the same referee the default-run
+        // corpus oracle uses: rejected by stdlib too → consistent rejection
+        // (symbol-table junk, counted and reported); demangled by stdlib →
+        // regression, asserted to zero. The classification stays blind to a
+        // symbol class absent from the all-ASCII symbol-table corpus —
+        // targeted unit tests carry those.
+        var oneSidedFailureCount = 0
+        var oneSidedFailureSamples: [String] = []
+        var consistentlyRejectedCount = 0
+        var consistentlyRejectedSamples: [String] = []
+        var regressedSymbolCount = 0
+        var regressedSymbolSamples: [String] = []
+        for mangled in storePathFailedSymbols {
+            do {
+                _ = try demangleAsNodeTransient(mangled)
+                oneSidedFailureCount += 1
+                if oneSidedFailureSamples.count < 10 {
+                    oneSidedFailureSamples.append("\(mangled) [store failed, transient succeeded]")
+                }
+            } catch {
+                if stdlib_demangleNodeTree(mangled) == nil {
+                    consistentlyRejectedCount += 1
+                    if consistentlyRejectedSamples.count < 20 {
+                        consistentlyRejectedSamples.append(mangled)
+                    }
+                } else {
+                    regressedSymbolCount += 1
+                    if regressedSymbolSamples.count < 10 {
+                        regressedSymbolSamples.append(mangled)
+                    }
+                }
+            }
+        }
+
         var mismatchCount = 0
         var mismatchSamples: [String] = []
         for (mangled, root) in rootBySymbol {
-            guard let node = try? demangleAsNodeTransient(mangled) else { continue }
+            let node: Node
+            do {
+                node = try demangleAsNodeTransient(mangled)
+            } catch {
+                oneSidedFailureCount += 1
+                if oneSidedFailureSamples.count < 10 {
+                    oneSidedFailureSamples.append("\(mangled) [store succeeded, transient failed]")
+                }
+                continue
+            }
             if let divergingOptionSet = Self.comparePrints(node, store.reference(at: root)) {
                 mismatchCount += 1
                 if mismatchSamples.count < 10 {
@@ -60,10 +111,21 @@ final class StorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendable {
                 }
             }
         }
-        print("[0008-print-parity] symbols=\(rootBySymbol.count) optionSets=\(Self.optionSets.count) mismatches=\(mismatchCount)")
+        print("[0008-print-parity] symbols=\(rootBySymbol.count) optionSets=\(Self.optionSets.count) mismatches=\(mismatchCount) oneSidedFailures=\(oneSidedFailureCount) consistentlyRejected=\(consistentlyRejectedCount) regressed=\(regressedSymbolCount)")
         if !mismatchSamples.isEmpty {
             print("[0008-print-parity] samples: \(mismatchSamples.joined(separator: ", "))")
         }
+        if !oneSidedFailureSamples.isEmpty {
+            print("[0008-print-parity] one-sided failures: \(oneSidedFailureSamples.joined(separator: ", "))")
+        }
+        if !consistentlyRejectedSamples.isEmpty {
+            print("[0008-print-parity] consistently rejected (stdlib fails these too): \(consistentlyRejectedSamples.joined(separator: ", "))")
+        }
+        if !regressedSymbolSamples.isEmpty {
+            print("[0008-print-parity] regressed (stdlib demangles these, this library does not): \(regressedSymbolSamples.joined(separator: ", "))")
+        }
+        #expect(oneSidedFailureCount == 0, "both paths must agree on which symbols demangle")
+        #expect(regressedSymbolCount == 0, "symbols the stdlib demangler handles must not fail here")
         #expect(mismatchCount == 0, "store-path printing must be byte-identical to the Node path")
     }
 }

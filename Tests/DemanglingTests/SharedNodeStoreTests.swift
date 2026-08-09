@@ -270,24 +270,61 @@ final class SharedStorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendab
         let sharedStore = SharedNodeStore()
         sharedStore.reserveCapacity(expectedSymbolCount: corpus.count)
 
+        // Failure visibility (ReviewFindingsPR7 F4): a one-sided demangle
+        // failure is a parity mismatch; a both-sided failure is classified
+        // against the stdlib demangler (see StorePrintParitySweep for the
+        // rationale and the classification's blind spot).
         var comparedCount = 0
+        var oneSidedFailureCount = 0
+        var oneSidedFailureSamples: [String] = []
+        var consistentlyRejectedCount = 0
+        var regressedSymbolCount = 0
+        var regressedSymbolSamples: [String] = []
         var mismatchCount = 0
         var mismatchSamples: [String] = []
         for mangled in corpus {
-            guard let reference = try? sharedStore.demangle(mangled),
-                  let node = try? demangleAsNodeTransient(mangled) else { continue }
-            comparedCount += 1
-            if let divergingOptionSet = Self.comparePrints(node, reference) {
-                mismatchCount += 1
-                if mismatchSamples.count < 10 {
-                    mismatchSamples.append("\(mangled) [\(divergingOptionSet)]")
+            let reference: NodeReference?
+            do { reference = try sharedStore.demangle(mangled) } catch { reference = nil }
+            let node: Node?
+            do { node = try demangleAsNodeTransient(mangled) } catch { node = nil }
+            switch (reference, node) {
+            case (nil, nil):
+                if stdlib_demangleNodeTree(mangled) == nil {
+                    consistentlyRejectedCount += 1
+                } else {
+                    regressedSymbolCount += 1
+                    if regressedSymbolSamples.count < 10 {
+                        regressedSymbolSamples.append(mangled)
+                    }
+                }
+            case (let reference?, let node?):
+                comparedCount += 1
+                if let divergingOptionSet = Self.comparePrints(node, reference) {
+                    mismatchCount += 1
+                    if mismatchSamples.count < 10 {
+                        mismatchSamples.append("\(mangled) [\(divergingOptionSet)]")
+                    }
+                }
+            default:
+                oneSidedFailureCount += 1
+                if oneSidedFailureSamples.count < 10 {
+                    let failedSide = reference == nil ? "shared store failed, transient succeeded" : "shared store succeeded, transient failed"
+                    oneSidedFailureSamples.append("\(mangled) [\(failedSide)]")
                 }
             }
         }
-        print("[0010-shared-print-parity] symbols=\(comparedCount) optionSets=\(Self.optionSets.count) mismatches=\(mismatchCount) retiredBuffers=\(sharedStore.retiredBufferCountForTesting)")
+        print("[0010-shared-print-parity] symbols=\(comparedCount) optionSets=\(Self.optionSets.count) mismatches=\(mismatchCount) oneSidedFailures=\(oneSidedFailureCount) consistentlyRejected=\(consistentlyRejectedCount) regressed=\(regressedSymbolCount) retiredBuffers=\(sharedStore.retiredBufferCountForTesting)")
         if !mismatchSamples.isEmpty {
             print("[0010-shared-print-parity] samples: \(mismatchSamples.joined(separator: ", "))")
         }
+        if !oneSidedFailureSamples.isEmpty {
+            print("[0010-shared-print-parity] one-sided failures: \(oneSidedFailureSamples.joined(separator: ", "))")
+        }
+        if !regressedSymbolSamples.isEmpty {
+            print("[0010-shared-print-parity] regressed (stdlib demangles these, this library does not): \(regressedSymbolSamples.joined(separator: ", "))")
+        }
+        #expect(oneSidedFailureCount == 0, "both paths must agree on which symbols demangle")
+        #expect(regressedSymbolCount == 0, "symbols the stdlib demangler handles must not fail here")
         #expect(mismatchCount == 0, "shared-store printing must be byte-identical to the Node path")
     }
 }

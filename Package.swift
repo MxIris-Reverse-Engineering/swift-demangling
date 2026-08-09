@@ -148,6 +148,14 @@ let package = Package(
                 "Demangling",
                 "DemanglingTestingSupport",
             ],
+            swiftSettings: [
+                // Must mirror the Demangling target: #if hasFeature(Lifetimes)
+                // tests compile out silently when the flag is missing here,
+                // leaving the direct-return borrowed views with zero coverage
+                // while the suite stays green (ReviewFindingsPR7 F3). Guarded
+                // by BorrowedTextViewTests.lifetimesFeatureIsEnabledInTestTarget.
+                .enableExperimentalFeature("Lifetimes"),
+            ],
         ),
     ] + (buildingRetainCountVerification ? [
         .executableTarget(

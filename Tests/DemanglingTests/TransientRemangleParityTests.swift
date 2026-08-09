@@ -134,14 +134,43 @@ import Testing
 /// ```
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["DEMANGLING_PRINT_PARITY"] == "1"), .serialized)
 final class TransientRemangleParitySweep: DyldCacheSymbolTests, @unchecked Sendable {
-    /// Synchronous so the sync `demangleAsNode` overload — the path under
-    /// test — is the one selected inside this async test.
-    private static func remangledOnBothPaths(_ mangled: String) -> (transient: String?, canonical: String?) {
-        let transientMangled = (try? demangleAsNodeTransient(mangled)).flatMap { try? mangleAsString($0) }
-        let canonicalMangled = (try? demangleAsNode(mangled)).flatMap { try? mangleAsString($0) }
-        return (transientMangled, canonicalMangled)
+    /// Full per-path outcome, so the comparison sees *which stage* failed and
+    /// with what error. The previous shape collapsed each path to `String?`
+    /// via `try?`, so two paths failing for different reasons — or both
+    /// regressing from success to failure — compared as `nil == nil` and
+    /// passed (ReviewFindingsPR7 F4).
+    private enum RemanglePathOutcome: Equatable {
+        case remangled(String)
+        case remangleFailed(String)
+        case demangleFailed(String)
     }
 
+    /// Synchronous so the sync demangle overloads — the paths under test —
+    /// are the ones selected inside this async test.
+    private static func pathOutcome(
+        _ mangled: String,
+        demangle: (String) throws(DemanglingError) -> Node
+    ) -> RemanglePathOutcome {
+        let node: Node
+        do {
+            node = try demangle(mangled)
+        } catch {
+            return .demangleFailed(String(describing: error))
+        }
+        do {
+            return .remangled(try mangleAsString(node))
+        } catch {
+            return .remangleFailed(String(describing: error))
+        }
+    }
+
+    // Demangle failures are classified against the stdlib demangler, the
+    // same referee the default-run corpus oracle uses (see
+    // StorePrintParitySweep for the rationale and the classification's blind
+    // spot). Remangle failures are parity-checked but not classified: both
+    // legs share `mangleAsString`, so this sweep can only ever see path
+    // divergence — symmetric remangler regressions are structurally invisible
+    // to it and belong to the default-run remangle oracles.
     @Test func transientRemangleMatchesCanonicalAcrossCorpus() async throws {
         let extracted = try await symbols(for: .SwiftUI, .SwiftUICore, .Foundation, .Combine)
         let corpus = Array(Set(extracted.map(\.stringValue))).sorted()
@@ -149,23 +178,50 @@ final class TransientRemangleParitySweep: DyldCacheSymbolTests, @unchecked Senda
 
         var comparedCount = 0
         var remangledCount = 0
+        var consistentlyRejectedCount = 0
+        var regressedSymbolCount = 0
+        var regressedSymbolSamples: [String] = []
+        var remangleFailedCount = 0
         var mismatchCount = 0
         var mismatchSamples: [String] = []
         for mangled in corpus {
-            let (transientMangled, canonicalMangled) = Self.remangledOnBothPaths(mangled)
+            let transientOutcome = Self.pathOutcome(mangled) { (mangledSymbol) throws(DemanglingError) in
+                try demangleAsNodeTransient(mangledSymbol)
+            }
+            let canonicalOutcome = Self.pathOutcome(mangled) { (mangledSymbol) throws(DemanglingError) in
+                try demangleAsNode(mangledSymbol)
+            }
             comparedCount += 1
-            if canonicalMangled != nil { remangledCount += 1 }
-            if transientMangled != canonicalMangled {
+            switch canonicalOutcome {
+            case .remangled:
+                remangledCount += 1
+            case .remangleFailed:
+                remangleFailedCount += 1
+            case .demangleFailed:
+                if stdlib_demangleNodeTree(mangled) == nil {
+                    consistentlyRejectedCount += 1
+                } else {
+                    regressedSymbolCount += 1
+                    if regressedSymbolSamples.count < 10 {
+                        regressedSymbolSamples.append(mangled)
+                    }
+                }
+            }
+            if transientOutcome != canonicalOutcome {
                 mismatchCount += 1
                 if mismatchSamples.count < 10 {
-                    mismatchSamples.append(mangled)
+                    mismatchSamples.append("\(mangled) [transient: \(transientOutcome), canonical: \(canonicalOutcome)]")
                 }
             }
         }
-        print("[0011-remangle-parity] symbols=\(comparedCount) remangled=\(remangledCount) mismatches=\(mismatchCount)")
+        print("[0011-remangle-parity] symbols=\(comparedCount) remangled=\(remangledCount) remangleFailed=\(remangleFailedCount) consistentlyRejected=\(consistentlyRejectedCount) regressed=\(regressedSymbolCount) mismatches=\(mismatchCount)")
         if !mismatchSamples.isEmpty {
             print("[0011-remangle-parity] samples: \(mismatchSamples.joined(separator: ", "))")
         }
-        #expect(mismatchCount == 0, "transient-path remangling must be byte-identical to the canonical path")
+        if !regressedSymbolSamples.isEmpty {
+            print("[0011-remangle-parity] regressed (stdlib demangles these, this library does not): \(regressedSymbolSamples.joined(separator: ", "))")
+        }
+        #expect(mismatchCount == 0, "transient-path remangling must agree with the canonical path, including on failures and their reasons")
+        #expect(regressedSymbolCount == 0, "symbols the stdlib demangler handles must not fail here")
     }
 }

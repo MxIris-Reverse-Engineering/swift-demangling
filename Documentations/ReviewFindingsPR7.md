@@ -17,9 +17,10 @@
 | 验证方式 | 在 PR tip 与 merge-base 各建独立 worktree 分别编译，用临时探针测试做 A/B 对比（探针已删） |
 | 当时的套件状态 | PR tip 全量 **520 个用例全绿** |
 
-**「全绿」这件事本身需要解释**：下面的 F2、F3、F11、F12 四条正是「为什么套件全绿却仍有
+**「全绿」这件事本身需要解释**：F2、F3、F11、F12 四条正是「为什么套件全绿却仍有
 问题」的答案——一条功能回归、一个被静默编译掉的测试、一类吞掉失败的语料验收、一条从未
-被执行过的分支。
+被执行过的分支。（F3 与 F4 已于 2026-08-09 落地并按本文件契约移除，落地记录见文末
+移交清单第 0 步；元模式一节保留它们的行作为本轮 review 的完整背景。）
 
 ## 总览
 
@@ -29,8 +30,6 @@
 |---|---|---|---|---|
 | [F1](#f1) | `Demangler.swift:280` 等 4 处 | 公开入口吃到畸形输入整进程 SIGTRAP，`try?` 拦不住 | 否（`main` 既有） | **必修** |
 | [F2](#f2) | `Demangler.swift:177` | 0xFF 对齐填充跳过变成永不执行的死代码 | **是（功能回归）** | **必修** |
-| [F3](#f3) | `Package.swift:145` | 测试 target 没开 `Lifetimes`，全 PR 最危险的新 unsafe 代码零覆盖 | 是 | **必修** |
-| [F4](#f4) | `StorePrintParitySweep.swift:46/55` 等 4 处 | 语料验收用 `try?` 吞掉失败符号，回归不可见 | 是 | **必修** |
 | [F5](#f5) | `StoreBuffer.swift:129` | 空代跳过退休登记，已发布的描述符可指向已释放内存 | 是 | 应修 |
 | [F6](#f6) | `StoreBuffer.swift:88` | `withBuffer` 的 range 读丢了 release 边界陷阱 | 是 | 应修 |
 | [F7](#f7) | `NodeStoreBuilder.swift:473` | 整套内存安全论证依赖的不变量只用 `assert` 守，release 编译掉 | 是 | 应修 |
@@ -195,93 +194,6 @@
   3. 同步更新 `Documentations/AlignmentGaps.md:97`——A9 现在还标着 `✅ 已合并`；
   4. **横向排查**：group-a 那批（`8d0b396`）一共 8 项改动，其余 7 项是否也依赖
      scalar 域语义而在字节化后失效？逐项过一遍。这是本条最容易被漏掉的部分。
-
-<a name="f3"></a>
-## F3. 测试 target 没开 `Lifetimes`，全 PR 最危险的新代码零覆盖
-
-- **位置**：`Package.swift:121-130`（`Demangling` target 开了）对
-  `Package.swift:145`（`testTarget` 没开）
-
-- **现象**：`.enableExperimentalFeature("Lifetimes")` 只加在库 target 上，于是测试
-  target 里 `#if hasFeature(Lifetimes)` **恒为假**。
-  `Tests/DemanglingTests/BorrowedTextViewTests.swift:66-67` 把
-  `directReturnSpanAgreesWithClosureForm` 整个包在这个门里，**它从来没有进过测试二进制**。
-
-- **已验证**：在 PR tip 的测试 target 里放一个 `#if hasFeature(Lifetimes)` 探针，
-  打印结果为 `OFF`。
-
-- **后果**：以下代码**零执行覆盖**，而套件报绿：
-  | 位置 | 是什么 |
-  |---|---|
-  | `NodeReference.swift:156-169` | `textUTF8Span()` 直接返回借用视图 |
-  | `NodeStore.swift` | `textBytesSpan()` / `nodesSpan()` / `edgesSpan()` |
-  | 4 处 `_overrideLifetime(span, borrowing: self)` | 手工重绑生命周期依赖，全 PR 风险最高的构造 |
-
-  而 `4ed790e` 的 commit message 写的是「New BorrowedTextViewTests pin: borrowed views
-  agree with the slice view byte for byte」。
-
-### 四问
-
-1. **能复现吗**：能（探针）。**不是误报**。
-2. **`main` 是否也有**：`main` 上没有这些代码。**本 PR 引入。**
-3. **值不值得修**：**必修，而且是四条必修里最便宜的**——加两行 `swiftSettings` 即可，
-   收益是让 PR 里最危险的一批 unsafe 代码第一次真正被执行。
-4. **以前修过吗**：**没有前科，引入即漏**。
-   - `ec3769a` 给 `Demangling` target 加了 flag；
-   - `4ed790e` 引入 `#if hasFeature(Lifetimes)` 使用点和 `BorrowedTextViewTests`，
-     **完全没有碰 `Package.swift`**；
-   - `afc58f6` 碰了 `Package.swift`，但只为加 `RetainCountVerification` 这个
-     executable target。
-   - 0008 提案的核实记录原文是「Package.swift 对 `Demangling` **无条件开启**」——
-     范围声明本身就只覆盖了库 target，测试 target 从来不在视野里。
-
-- **修法方向**：
-  1. `Package.swift:145` 的 `testTarget` 加同一份 `swiftSettings`；
-  2. **加完之后必须重跑**——这个测试从未执行过，不能假定它会通过。如果它失败，那才是
-     本条真正的价值所在；
-  3. 加一条元测试：断言 `hasFeature(Lifetimes)` 在测试 target 里为真，否则失败。
-     否则下次 target 增删时会重蹈覆辙。
-
-<a name="f4"></a>
-## F4. 语料级验收用 `try?` 吞掉失败符号 —— F2 能溜过 43.9 万符号扫描的直接原因
-
-- **位置**：
-  | 文件:行 | 代码 |
-  |---|---|
-  | `StorePrintParitySweep.swift:46` | `if let root = try? builder.demangle(mangled) {` |
-  | `StorePrintParitySweep.swift:55` | `guard let node = try? demangleAsNodeTransient(mangled) else { continue }` |
-  | `SharedNodeStoreTests.swift:277-278` | 同一形态 |
-  | `TransientRemangleParityTests.swift:140-141` | 两边都 `try?`，于是 `nil == nil` 恒真 |
-  | `Sources/RetainCountVerification/main.swift:57` | `symbols.compactMap { try? builder.demangle($0) }` |
-
-- **现象**：失败的符号在比较发生**之前**就被丢掉了。所以「439,522 symbols, 0 mismatches」
-  的真实含义是「**在两条路径都成功的那些符号上**没有差异」。一个把成功变成失败的回归，
-  对所有这些验收完全不可见。
-
-- **`TransientRemangleParityTests.swift:140-141` 尤其严重**：两侧都是
-  `(try? ...).flatMap { try? ... }`，双双失败时比较的是 `nil == nil`，**测试通过**。
-
-### 四问
-
-1. **能复现吗**：能——F2 就是活证据，它正是从这些 sweep 底下溜过去的。**不是误报**。
-2. **`main` 是否也有**：`StorePrintParitySweep` 由 `4d08c9a` 引入（在 PR 分支上）。
-   **本 PR 引入。**
-3. **值不值得修**：**必修**。这不是一个测试的瑕疵，是**整个 PR 的验收论据的效力问题**——
-   0008、0010 两份提案的决策日志都把这些数字当作通过依据。
-4. **以前修过吗**：**没有前科，首次引入即如此**。但有一条重要的传染链：
-   `4d08c9a` 声称的「measured 439,522 symbols with 0 mismatches」被 `60afea0`（0010
-   步骤 4）的决策日志**原样继承**为共享 store 的验收依据。也就是说这个盲点的影响面比
-   它的引入 commit 大。
-
-- **修法方向**：
-  1. 统计并断言跳过率（例如「跳过数必须为 0，或必须等于一个显式登记的已知失败清单」）；
-  2. 或者直接比较 `Result` 而非解包后的成功值——**`DualPathParityTests` 已经这么做了**
-     （比较 `errorDescription`），是正确示范，照抄即可；
-  3. `TransientRemangleParityTests:140-141` 的 `nil == nil` 必须单独修，它比其余几处更糟；
-  4. 修完后**重跑一遍全语料**，看跳过率是不是真的 0——这一步很可能会顺带暴露 F2 之外的
-     其它回归。
-
----
 
 # 第二部分：应修
 
@@ -881,11 +793,20 @@
 
 给接手实现的人。**顺序是有理由的，建议照做**：
 
-**第 0 步 —— 先解除验证盲区，否则后面每一步的「测试通过」都不可信**
-1. **F3**（`Package.swift` 加两行）——让被静默编译掉的测试真正进入二进制，然后重跑。
-2. **F4**（sweep 不再吞失败）——让语料验收能看见「成功变失败」的回归。
-3. 在 1 和 2 都落地之后，**重跑一次全语料 + 全套件**。这一跑的结果才是真实基线，
-   而且很可能会暴露 F2 之外的东西。
+**第 0 步 —— ✅ 已完成（2026-08-09，F3 与 F4 条目已按本文件契约移除）**
+1. **F3 落地**：元测试先行确认红（`Lifetimes` 未达测试 target）→ `Package.swift`
+   testTarget 补开关 → 元测试绿，`directReturnSpanAgreesWithClosureForm` **首次真实执行
+   并通过**（借用视图代码本身无缺陷，此前只是零覆盖）。
+2. **F4 落地**：四处吞失败全部改造——单边失败 = 对拍不匹配；双边失败改为按 stdlib
+   demangler（默认 oracle 的同一裁判）分类：stdlib 也拒绝 → 一致拒绝（计数并打印样本），
+   stdlib 能解而本库不能 → 回归，断言为 0。`nil == nil` 恒真形态消灭；
+   RetainCountVerification 改为拒绝测量缩水的输入。
+3. **重跑结果（真实基线）**：默认全套件 520 用例绿；对齐 oracle 4,573,306 符号
+   demangle failures 0；三个 corpus sweep × 双运行时路径 439,522 符号 0 mismatch、
+   0 单边失败。**果然抖出了东西**：语料实际是 439,533 个符号，其中 **11 个双路径
+   都解不开**——正是原来被 `try?` 静默吞掉的（0011 决策日志「remangle 可达 439,522」
+   的差值即此 11 个，当年被记成 remangle 不可达，实为 demangle 失败）；经 stdlib
+   分类确认为一致拒绝（stdlib 同样解不开的符号表内容），非本库回归。
 
 **第 1 步 —— 修确认的行为缺陷**
 

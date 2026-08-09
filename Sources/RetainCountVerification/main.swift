@@ -52,9 +52,26 @@ if CommandLine.arguments.count > 1, let contents = try? String(contentsOfFile: C
     symbols = defaultSymbols
 }
 
+// A silently skipped symbol changes what the harness measures without
+// changing what it reports measuring, so a demangle failure aborts the run
+// instead of shrinking the input (ReviewFindingsPR7 F4).
 func buildStore(from symbols: [String]) -> (NodeStore, [NodeStore.NodeIndex]) {
     var builder = NodeStoreBuilder()
-    let roots = symbols.compactMap { try? builder.demangle($0) }
+    var roots: [NodeStore.NodeIndex] = []
+    roots.reserveCapacity(symbols.count)
+    var failedSymbolCount = 0
+    for mangled in symbols {
+        do {
+            roots.append(try builder.demangle(mangled))
+        } catch {
+            failedSymbolCount += 1
+            print("[0008-retain-verification] failed to demangle \(mangled): \(error)")
+        }
+    }
+    if failedSymbolCount > 0 {
+        print("[0008-retain-verification] \(failedSymbolCount) of \(symbols.count) symbols failed to demangle; refusing to measure a different corpus than requested")
+        exit(1)
+    }
     return (builder.freeze(), roots)
 }
 

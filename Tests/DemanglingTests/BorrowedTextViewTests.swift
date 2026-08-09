@@ -63,6 +63,25 @@ struct BorrowedTextViewTests {
         #expect(checkedSynthesizedName, "symbol should contain a dependent generic parameter")
     }
 
+    /// Guards the gate right below: without `Lifetimes` enabled on the *test*
+    /// target, `directReturnSpanAgreesWithClosureForm` silently drops out of
+    /// the test binary and the suite stays green with the direct-return
+    /// borrowed views never executed (ReviewFindingsPR7 F3). This meta-test is
+    /// blind to gates in *other* targets and to `#available` runtime guards —
+    /// it only proves the feature flag reaches this target's compilation.
+    @Test func lifetimesFeatureIsEnabledInTestTarget() {
+        #if hasFeature(Lifetimes)
+        // Enabled: the gated test below is part of the binary.
+        #else
+        Issue.record("""
+        The DemanglingTests target compiles without the Lifetimes experimental \
+        feature, so every #if hasFeature(Lifetimes) test in this target is \
+        silently excluded from the test binary. Mirror the Demangling target's \
+        .enableExperimentalFeature("Lifetimes") in Package.swift's testTarget.
+        """)
+        #endif
+    }
+
     #if hasFeature(Lifetimes)
     @Test func directReturnSpanAgreesWithClosureForm() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) else { return }
