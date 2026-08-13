@@ -316,12 +316,23 @@ extension Demangler {
                 return try require(substitutions.at(idx))
             } else {
                 try scanner.backtrack()
-                let naturalValue = try demangleNatural() ?? 0
-                // Bound in the unsigned domain before narrowing: Int(_:) on
-                // an attacker-sized repeat count traps (32-bit Int included),
-                // and pushMultiSubstitutions rejects anything above
-                // maxRepeatCount anyway.
-                try require(naturalValue <= maxRepeatCount)
+                // Upstream bails here (`RepeatCount = demangleNatural(); if
+                // (RepeatCount < 0) return nullptr`). `?? 0` swallowed the
+                // failure instead, and since `backtrack()` had already
+                // restored the position and `demangleNatural` consumes
+                // nothing when it fails, the enclosing `while true` re-read
+                // the same byte forever — `$sA$` hung the process.
+                let naturalValue = try require(demangleNatural())
+                // Bound only what the narrowing needs. `maxRepeatCount` is
+                // upstream's limit on the *repeat* reading of this number,
+                // enforced inside pushMultiSubstitutions; the `A<N>_` form
+                // reads the same number as a substitution *index*, which
+                // upstream bounds by the substitution count instead. Bounding
+                // by maxRepeatCount here would reject large-but-legal indices
+                // that the substitution lookup should be the one to refuse.
+                // Compared heterogeneously so the check itself stays correct
+                // where Int is 32 bits (watchOS).
+                try require(naturalValue <= Int.max)
                 repeatCount = Int(naturalValue)
             }
         }
@@ -634,6 +645,10 @@ extension Demangler {
         if index == 1 {
             return NodeFactory.unknownIndex
         }
+        // Upstream has a third arm this port dropped (`if (index < 2) return
+        // nullptr`). Without it `_` — which demangleIndex maps to 0 — reached
+        // the subtraction and underflowed UInt64.
+        try require(index >= 2)
         return createNode(kind: .index, contents: .index(index - 2))
     }
 
@@ -970,25 +985,39 @@ extension Demangler {
         }
     }
 
-    private mutating func demangleBuiltinType() throws(DemanglingError) -> Node {
+    /// Reads a builtin type's bit width / element count, which the mangling
+    /// stores one higher than the value.
+    ///
+    /// Bounds *before* subtracting. `demangleIndex` maps a bare `_` to 0, and
+    /// `0 - 1` underflows `UInt64` at the subtraction — a `size > 0` check on
+    /// the result can never catch it, because the trap has already happened.
+    /// Upstream survives the same input only by accident: its `int size =
+    /// demangleIndex() - 1` truncates the wrapped value to `-1`, which the
+    /// following `size <= 0` then rejects.
+    private mutating func demangleBuiltinTypeSize() throws(DemanglingError) -> UInt64 {
         let maxTypeSize: UInt64 = 4096
+        let rawSize = try demangleIndex()
+        try require(rawSize > 1)
+        let size = rawSize - 1
+        try require(size <= maxTypeSize)
+        return size
+    }
+
+    private mutating func demangleBuiltinType() throws(DemanglingError) -> Node {
         switch try scanner.readScalar() {
         case "A": return createNode(swiftBuiltinType: .builtinTypeName, name: "Builtin.ImplicitActor")
         case "b": return createNode(swiftBuiltinType: .builtinTypeName, name: "Builtin.BridgeObject")
         case "B": return createNode(swiftBuiltinType: .builtinTypeName, name: "Builtin.UnsafeValueBuffer")
         case "e": return createNode(swiftBuiltinType: .builtinTypeName, name: "Builtin.Executor")
         case "f":
-            let size = try demangleIndex() - 1
-            try require(size > 0 && size <= maxTypeSize)
+            let size = try demangleBuiltinTypeSize()
             return createNode(swiftBuiltinType: .builtinTypeName, name: "Builtin.FPIEEE\(size)")
         case "i":
-            let size = try demangleIndex() - 1
-            try require(size > 0 && size <= maxTypeSize)
+            let size = try demangleBuiltinTypeSize()
             return createNode(swiftBuiltinType: .builtinTypeName, name: "Builtin.Int\(size)")
         case "I": return createNode(swiftBuiltinType: .builtinTypeName, name: "Builtin.IntLiteral")
         case "v":
-            let elts = try demangleIndex() - 1
-            try require(elts > 0 && elts <= maxTypeSize)
+            let elts = try demangleBuiltinTypeSize()
             let eltType = try popTypeAndGetChild()
             let text = try require(eltType.text)
             try require(eltType.kind == .builtinTypeName && text.starts(with: "Builtin.") == true)
@@ -1988,8 +2017,19 @@ extension Demangler {
         try scanner.backtrack()
         var tmpChildren: [Node] = []
         while scanner.conditional(scalar: "t") {
-            let n = try demangleNatural().map { Node.Contents.index($0 + 1) } ?? Node.Contents.index(0)
-            tmpChildren.append(createNode(kind: .droppedArgument, contents: n))
+            // Same wrap-then-increment shape demangleIndex guards six lines
+            // from here: conditionalInt deliberately wraps on absurd digit
+            // strings, so a parsed natural can sit at UInt64.max and the
+            // display increment traps. Laundering the operand through `$0` is
+            // why the source scan never saw this one.
+            let contents: Node.Contents
+            if let naturalValue = try demangleNatural() {
+                try require(naturalValue != UInt64.max)
+                contents = .index(naturalValue + 1)
+            } else {
+                contents = .index(0)
+            }
+            tmpChildren.append(createNode(kind: .droppedArgument, contents: contents))
         }
         let tmp = createNode(kind: .genericSpecialization, children: tmpChildren)
         let kind: Node.Kind = switch try scanner.readScalar() {
@@ -2162,12 +2202,25 @@ extension Demangler {
         return param.addingChildren([kindChild, payloadChild])
     }
 
+    /// Reads one decimal digit and returns its numeric value.
+    ///
+    /// Bounds *before* subtracting. `UnicodeScalar.value` is `UInt32`, so any
+    /// byte below `'0'` — control characters, space, `!"#$%&'()*+,-./` —
+    /// underflows the subtraction itself; a range check written on the result
+    /// runs too late to see it. Same hazard as the parsed-number arithmetic
+    /// elsewhere in this file, reached through `readScalar()` rather than
+    /// `conditionalInt()`, which is why sweeping for the latter missed it.
+    private mutating func demangleDecimalDigitValue() throws(DemanglingError) -> UInt32 {
+        let scalarValue = try scanner.readScalar().value
+        try require(scalarValue >= UnicodeScalar("0").value && scalarValue <= UnicodeScalar("9").value)
+        return scalarValue - UnicodeScalar("0").value
+    }
+
     private mutating func demangleSpecAttributes(kind: Node.Kind, demangleUniqueId: Bool = false) throws(DemanglingError) -> Node {
         let isSerialized = scanner.conditional(scalar: "q")
         let asyncRemoved = scanner.conditional(scalar: "a")
         let representationChanged = scanner.conditional(scalar: "r")
-        let passId = try scanner.readScalar().value - UnicodeScalar("0").value
-        try require((0 ... 9).contains(passId))
+        let passId = try demangleDecimalDigitValue()
         let contents = try demangleUniqueId ? (demangleNatural().map { Node.Contents.index($0) } ?? Node.Contents.none) : Node.Contents.none
         var children: [Node] = []
         if isSerialized {
@@ -3205,7 +3258,11 @@ extension Demangler {
         if scanner.conditional(scalar: "q") {
             children.append(NodeFactory.isSerialized)
         }
-        try children.append(createNode(kind: .specializationPassID, contents: .index(UInt64(scanner.readScalar().value - 48))))
+        // The Swift 3 twin of demangleSpecAttributes' pass ID. This one had no
+        // range check at all, so the underflowed value went straight into the
+        // node — third time the Swift 3 path has lagged its Swift 4+ twin on
+        // this family.
+        try children.append(createNode(kind: .specializationPassID, contents: .index(UInt64(demangleDecimalDigitValue()))))
         switch c {
         case "r": fallthrough
         case "g":

@@ -1,3 +1,5 @@
+import FoundationToolbox
+
 /// Generic tree-printing engine shared by the public `NodePrinter<Target>`
 /// (specialized on `Node`) and store-backed printing (specialized on
 /// `NodeReference`). See evolution proposal 0001, Phase 2.
@@ -16,7 +18,7 @@
 /// is deliberately not public, so no consumer can accidentally tie the depth a
 /// tree survives to the stack its calling thread happens to have left.
 @_spi(Internals)
-public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: Sendable {
+public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingNode>: DemanglingLogging, Sendable {
     /// Bails the print recursion with `<<too complex>>` once a single
     /// root-to-leaf path would exceed this many ``printName`` frames.
     ///
@@ -181,6 +183,37 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             return result
         }
         return dispatchPrintName(name, asPrefixContext: asPrefixContext)
+    }
+
+    /// The `#N` discriminator displayed for a node index.
+    ///
+    /// `demangleIndex` rejects `UInt64.max` and then returns `value + 1`, so a
+    /// mangled index of `UInt64.max - 1` legitimately arrives here already
+    /// saturated and the display increment has nowhere to go. Printing is
+    /// public and non-throwing — there is no error channel to reject it the
+    /// way `demangleAsNode` rejects a malformed index — so the value wraps and
+    /// the wrap is logged. Without the log a malformed symbol would render an
+    /// ordinary-looking `#0` and leave no trace at all.
+    ///
+    /// The unsaturated path keeps trapping `+`: the guard has already ruled
+    /// out the only value that could overflow it, so a trap here would mean
+    /// this invariant broke rather than that the input was malformed.
+    private func displayDiscriminator(_ rawIndex: UInt64, of kind: Node.Kind) -> UInt64 {
+        guard rawIndex != .max else {
+            reportSaturatedDiscriminator(of: kind)
+            return 0
+        }
+        return rawIndex + 1
+    }
+
+    /// Out of line so the dispatch switch carries one comparison and none of
+    /// the logging machinery.
+    @inline(never)
+    private func reportSaturatedDiscriminator(of kind: Node.Kind) {
+        #log(
+            .error,
+            "\(String(describing: kind), privacy: .public) discriminator saturates its display increment; printing #0 instead. Only a malformed mangled index reaches this value."
+        )
     }
 
     private mutating func dispatchPrintName(_ name: SomeNode, asPrefixContext: Bool = false) -> SomeNode? {
@@ -375,7 +408,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .enumCase: printFirstChild(name, prefix: "enum case for ", asPrefixContext: false)
         case .errorType: target.write("<ERROR TYPE>")
         case .existentialMetatype: printExistentialMetatype(name)
-        case .explicitClosure: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: options.contains(.showFunctionArgumentTypes) ? .functionStyle : .noType, hasName: false, extraName: "closure #", extraIndex: (name.children.at(1)?.index ?? 0) + 1)
+        case .explicitClosure: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: options.contains(.showFunctionArgumentTypes) ? .functionStyle : .noType, hasName: false, extraName: "closure #", extraIndex: displayDiscriminator(name.children.at(1)?.index ?? 0, of: name.kind))
         case .extendedExistentialTypeShape: printExtendedExistentialTypeShape(name)
         case .extension: printExtension(name)
         case .extensionAttachedMacroExpansion: return printMacro(name: name, asPrefixContext: asPrefixContext, label: "extension")
@@ -383,7 +416,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .extensionDescriptor: printFirstChild(name, prefix: "extension descriptor ")
         case .fieldOffset: printFieldOffset(name)
         case .firstElementMarker: target.write(" first-element-marker ")
-        case .freestandingMacroExpansion: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "freestanding macro expansion #", extraIndex: (name.children.at(2)?.index ?? 0) + 1)
+        case .freestandingMacroExpansion: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "freestanding macro expansion #", extraIndex: displayDiscriminator(name.children.at(2)?.index ?? 0, of: name.kind))
         case .fullObjCResilientClassStub: printFirstChild(name, prefix: "full ObjC resilient class stub for ")
         case .fullTypeMetadata: printFirstChild(name, prefix: "full type metadata for ")
         case .function,
@@ -435,7 +468,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .implFunctionConvention: printImplFunctionConvention(name)
         case .implFunctionConventionName: break
         case .implFunctionType: printImplFunctionType(name)
-        case .implicitClosure: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: options.contains(.showFunctionArgumentTypes) ? .functionStyle : .noType, hasName: false, extraName: "implicit closure #", extraIndex: (name.children.at(1)?.index ?? 0) + 1)
+        case .implicitClosure: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: options.contains(.showFunctionArgumentTypes) ? .functionStyle : .noType, hasName: false, extraName: "implicit closure #", extraIndex: displayDiscriminator(name.children.at(1)?.index ?? 0, of: name.kind))
         case .implInvocationSubstitutions: printImplInvocationSubstitutions(name)
         case .implParameterResultDifferentiability: printImplParameterName(name)
         case .implParameterSending,
@@ -467,10 +500,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .labelList: break
         case .lazyProtocolWitnessTableAccessor: printLazyProtocolWitnesstableAccessor(name)
         case .lazyProtocolWitnessTableCacheVariable: printLazyProtocolWitnesstableCacheVariable(name)
-        case .localDeclName: _ = printOptional(name.children.at(1), suffix: options.contains(.displayLocalNameContexts) ? " #\((name.children.at(0)?.index ?? 0) + 1)" : nil)
+        case .localDeclName: _ = printOptional(name.children.at(1), suffix: options.contains(.displayLocalNameContexts) ? " #\(displayDiscriminator(name.children.at(0)?.index ?? 0, of: name.kind))" : nil)
         case .macro: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: name.children.count == 3 ? .withColon : .functionStyle, hasName: true)
         case .macroExpansionLoc: printMacroExpansionLoc(name)
-        case .macroExpansionUniqueName: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "unique name #", extraIndex: (name.children.at(2)?.index ?? 0) + 1)
+        case .macroExpansionUniqueName: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "unique name #", extraIndex: displayDiscriminator(name.children.at(2)?.index ?? 0, of: name.kind))
         case .materializeForSet: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "materializeForSet")
         case .memberAttachedMacroExpansion: return printMacro(name: name, asPrefixContext: asPrefixContext, label: "member")
         case .memberAttributeAttachedMacroExpansion: return printMacro(name: name, asPrefixContext: asPrefixContext, label: "memberAttribute")
@@ -722,7 +755,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printMacro(name: SomeNode, asPrefixContext: Bool, label: String) -> SomeNode? {
-        return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "\(label) macro @\(name.children.at(2)?.print(using: options) ?? "") expansion #", extraIndex: (name.children.at(3)?.index ?? 0) + 1)
+        return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "\(label) macro @\(name.children.at(2)?.print(using: options) ?? "") expansion #", extraIndex: displayDiscriminator(name.children.at(3)?.index ?? 0, of: name.kind))
     }
 
     private mutating func printAnonymousContext(_ name: SomeNode) {

@@ -759,25 +759,67 @@ struct DefectRegressionTests {
     /// feature for this hazard is "any arithmetic eating a
     /// `conditionalInt()`/`readInt()` result", and new spellings of that
     /// shape belong in this list.
-    @Test func demanglerSourceAvoidsUncheckedNarrowingOfParsedNumbers() throws {
-        let demanglerSource = URL(fileURLWithPath: #filePath)
+    ///
+    /// That lesson was written down correctly and then narrowed twice in the
+    /// artifact built from it: the list held only the *increment* direction,
+    /// and the scan read only `Demangler.swift`. A fifth round found a
+    /// subtraction family (`demangleIndex() - 1`, `index - 2`,
+    /// `readScalar().value - '0'`) and an overflow in `NodePrinter.swift` that
+    /// neither restriction could ever have surfaced. Both restrictions are
+    /// lifted below — keep it that way, and note the scan still cannot see an
+    /// operand laundered through a variable or a `$0` closure, which is what
+    /// the behavioral exit tests are for.
+    @Test func librarySourceAvoidsUncheckedArithmeticOnParsedNumbers() throws {
+        let sourcesDirectory = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("Sources/Demangling/Main/Demangle/Demangler.swift")
-        let forbiddenSpellings = ["Int(demangleIndex", "Int(demangleNatural", "demangleIndex() + 1", "demangleSwift3Index() + 1", "readInt()) + 1"]
-        let fileContents = try String(contentsOf: demanglerSource, encoding: .utf8)
+            .appendingPathComponent("Sources")
+        // Both directions of the hazard. Subtraction is the half that four
+        // prior sweeps missed: in the unsigned domain a bound check written
+        // *after* the subtraction can never fire, because the subtraction has
+        // already trapped.
+        let forbiddenSpellings = [
+            "Int(demangleIndex",
+            "Int(demangleNatural",
+            "demangleIndex() + 1",
+            "demangleSwift3Index() + 1",
+            "readInt()) + 1",
+            "demangleIndex() - 1",
+            "demangleSwift3Index() - 1",
+            "demangleNatural() - 1",
+            "readScalar().value - ",
+            "readInt()) - 1",
+        ]
+        // Scanned beyond the demangler: the printer consumes the same parsed
+        // numbers one layer later, and `print(using:)` is non-throwing, so an
+        // overflow there has no error channel at all.
+        let scannedFileNames: Set<String> = [
+            "Demangler.swift",
+            "NodePrinter.swift",
+            "Remangler.swift",
+            "Punycode.swift",
+        ]
+        let fileEnumerator = try #require(FileManager.default.enumerator(at: sourcesDirectory, includingPropertiesForKeys: nil))
 
         var violations: [String] = []
-        for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmedLine.hasPrefix("//") else { continue }
-            for forbiddenSpelling in forbiddenSpellings where trimmedLine.contains(forbiddenSpelling) {
-                violations.append("Demangler.swift:\(lineOffset + 1): \(trimmedLine)")
+        var scannedCount = 0
+        for case let fileLocation as URL in fileEnumerator where scannedFileNames.contains(fileLocation.lastPathComponent) {
+            scannedCount += 1
+            let fileContents = try String(contentsOf: fileLocation, encoding: .utf8)
+            for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmedLine.hasPrefix("//") else { continue }
+                for forbiddenSpelling in forbiddenSpellings where trimmedLine.contains(forbiddenSpelling) {
+                    violations.append("\(fileLocation.lastPathComponent):\(lineOffset + 1): \(trimmedLine)")
+                }
             }
         }
 
-        #expect(violations.isEmpty, "unchecked narrowing of a parsed number — bound it in the unsigned domain (require) before converting:\n\(violations.sorted().joined(separator: "\n"))")
+        // A scan that silently stops finding its own inputs reports "clean"
+        // forever; pin the file count so a rename fails loudly instead.
+        #expect(scannedCount == scannedFileNames.count, "expected to scan \(scannedFileNames.count) files, scanned \(scannedCount) — did one get renamed or moved?")
+        #expect(violations.isEmpty, "unchecked arithmetic on a parsed number — bound it in the unsigned domain (require) before the arithmetic, not after:\n\(violations.sorted().joined(separator: "\n"))")
     }
 
     /// No test may assign `DemanglingRuntimePath.forcesLegacyPath`: the seam
@@ -866,6 +908,164 @@ struct DefectRegressionTests {
             #expect(throws: DemanglingError.self) {
                 _ = try demangleAsNode("_Ttqd0_18446744073709551615_")
             }
+        }
+    }
+
+    /// The *subtraction* half of the same family. Every input above overflows
+    /// upward (`UInt64.max`); every input here underflows, which is the shape
+    /// the source scan's `+ 1`-only spelling list could not express — the
+    /// reason these survived four prior sweeps of "the integer-trap family".
+    ///
+    /// All of them trap on `main` too. This is the standing cleanup, not a
+    /// regression introduced by this PR.
+    @Test func malformedIndexUnderflowThrowsInsteadOfTrapping() async throws {
+        await #expect(processExitsWith: .success) {
+            // demangleIndex maps a bare `_` to 0, and the builtin sizes
+            // subtracted 1 from it before their own bound check could run —
+            // `size > 0` can never catch that, the subtraction has already
+            // trapped.
+            for mangled in ["$sBf_", "$sBi_", "$sBv_"] {
+                #expect(throws: DemanglingError.self) {
+                    _ = try demangleAsNode(mangled)
+                }
+            }
+            // demangleDependentConformanceIndex subtracts 2; upstream's third
+            // arm (`if (index < 2) return nullptr`) was missing here.
+            for mangled in ["$sHA_", "$sHD_", "$sHI_"] {
+                #expect(throws: DemanglingError.self) {
+                    _ = try demangleAsNode(mangled)
+                }
+            }
+            // The dropped-argument count laundered its operand through `$0`,
+            // so no spelling of "demangleNatural() + 1" could match it.
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$sTt18446744073709551615")
+            }
+            // Specialization pass IDs subtract '0' from a raw scalar value, so
+            // any byte below '0' underflows UInt32 before the range check runs.
+            // Reached through eight dispatch letters, not the one the review
+            // first named; the Swift 3 twin (`_TTSg!`) had no range check at all.
+            for mangled in ["$sTG$", "$sTg!", "$sTB.", "$sTP%", "$sTi,", "_TTSg!"] {
+                #expect(throws: DemanglingError.self) {
+                    _ = try demangleAsNode(mangled)
+                }
+            }
+        }
+    }
+
+    /// `demangleMultiSubstitutions` must reject a repeat count that is not a
+    /// number instead of spinning on it forever.
+    ///
+    /// `?? 0` swallowed `demangleNatural`'s failure, and since `backtrack()`
+    /// had already restored the position and a failed parse consumes nothing,
+    /// the enclosing `while true` re-read the same byte with zero net
+    /// progress. Upstream bails explicitly (`if (RepeatCount < 0) return
+    /// nullptr`); the port dropped that arm. `main` hangs on these too.
+    ///
+    /// Runs each input on its own thread and waits with a deadline, rather
+    /// than through `#expect(processExitsWith:)` like the trap tests above.
+    /// A trap gives the child an exit status to assert on; a hang gives
+    /// nothing, and `.timeLimit` does not reach inside an exit test's child —
+    /// measured: against the unfixed demangler that spelling produced no test
+    /// output at all for 300s, i.e. it wedges the suite instead of failing it.
+    /// Waiting on a semaphore turns the same regression into a 5s failure per
+    /// input. A regressed build leaks the spinning threads for the rest of the
+    /// process, which is the acceptable half of the trade.
+    ///
+    /// The `A` operator is reachable through many one-character prefixes, so
+    /// the sample covers several rather than the single input first reported.
+    @Test func multiSubstitutionRejectsNonNumericRepeatCount() throws {
+        final class DemangleOutcome: @unchecked Sendable {
+            var thrownError: (any Error)?
+            var acceptedInput = false
+        }
+
+        for mangled in ["$sA$", "$sA!", "$sA\"", "$sKA$", "$s_A$", "$sdA$", "$slA$", "$ssA$"] {
+            let outcome = DemangleOutcome()
+            let finished = DispatchSemaphore(value: 0)
+            let worker = Thread {
+                do {
+                    _ = try demangleAsNode(mangled)
+                    outcome.acceptedInput = true
+                } catch {
+                    outcome.thrownError = error
+                }
+                finished.signal()
+            }
+            worker.stackSize = 4 << 20
+            worker.start()
+
+            guard finished.wait(timeout: .now() + .seconds(5)) == .success else {
+                Issue.record("\(mangled) did not terminate within 5s — demangleMultiSubstitutions is spinning on a non-numeric repeat count again")
+                continue
+            }
+            // The semaphore establishes the ordering for these reads.
+            #expect(!outcome.acceptedInput, "\(mangled) is malformed and must be rejected")
+            #expect(outcome.thrownError is DemanglingError, "\(mangled) must fail with DemanglingError, got \(String(describing: outcome.thrownError))")
+        }
+    }
+
+    /// `decodePunycode`'s digit loop must reject a truncated encoded number
+    /// instead of trapping. The loop read `input[pos]` at the top of every
+    /// iteration while only the *advance* was guarded, so a digit run whose
+    /// digits all stay at or above `t` walks `pos` to `endIndex` and the next
+    /// iteration subscripts out of bounds. `decodePunycode` is reachable from
+    /// any mangled identifier, so `demangleAsNode` on an untrusted symbol
+    /// died on the trap where `try?` cannot reach.
+    ///
+    /// The trigger is pure ASCII: 'J' decodes to 35, which never satisfies
+    /// `digit < t`, so the loop never breaks and runs off the end. `main`
+    /// traps on it too — the byte-vs-scalar length change only re-partitioned
+    /// which inputs reach this loop, it did not introduce the defect.
+    @Test func truncatedPunycodeIsRejectedInsteadOfTrapping() async throws {
+        await #expect(processExitsWith: .success) {
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$s4main004JJJJyyF")
+            }
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$s004JJJJyyF")
+            }
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$s4main0010JJJJJJJJJJyyF")
+            }
+            // A valid punycode identifier still decodes unchanged.
+            let valid = try demangleAsNode("$s8mangling0022egbpdajGbuEbxfgehfvwxnyyF")
+            #expect(valid.print(using: .default) == "mangling.\u{644}\u{64A}\u{647}\u{645}\u{627}\u{628}\u{62A}\u{643}\u{644}\u{645}\u{648}\u{634}\u{639}\u{631}\u{628}\u{64A}\u{61F}() -> ()")
+        }
+    }
+
+    /// The printer's discriminator increments must not trap. `demangleIndex`
+    /// rejects `UInt64.max` and then returns `value + 1`, so it legitimately
+    /// hands back `UInt64.max` for the input one below it; six printer sites
+    /// then added 1 again on the same `UInt64`.
+    ///
+    /// Unlike the demangler members of this family, `print(using:)` is public
+    /// and **non-throwing** — there is no error channel, so the saturated case
+    /// is wrapped and logged (``DemanglingDiagnostics``) rather than rejected.
+    /// `main` traps too.
+    ///
+    /// Neither existing guard could see these: the source scan reads only
+    /// `Demangler.swift`, and the exit test above never prints.
+    ///
+    /// Asserting the exact rendering, not merely the absence of a trap: `#0`
+    /// is reachable only through the guard branch that emits the log, so the
+    /// expectations below also pin that the diagnostic path is the one taken.
+    @Test func printerDiscriminatorIncrementsDoNotTrap() async throws {
+        await #expect(processExitsWith: .success) {
+            let explicitClosure = try demangleAsNode("$s4main1fyyFyycfU18446744073709551614_")
+            #expect(explicitClosure.print(using: .default) == "closure #0 () -> () in main.f() -> ()")
+
+            let implicitClosure = try demangleAsNode("$s4main1fyyFyycfu18446744073709551614_")
+            #expect(implicitClosure.print(using: .default) == "implicit closure #0 () -> () in main.f() -> ()")
+
+            // `.localDeclName` prints its discriminator under `.default`
+            // (`displayLocalNameContexts` is in the default option set).
+            let localDeclName = try demangleAsNode("_$s9localtest5outeryyF11LocalStructL18446744073709551614_V6methodyyF")
+            #expect(localDeclName.print(using: .default) == "method() -> () in LocalStruct #0 in localtest.outer() -> ()")
+
+            // The ordinary discriminators still render as before.
+            let closure = try demangleAsNode("$s4main1fyyFyycfU_")
+            #expect(closure.print(using: .default) == "closure #1 () -> () in main.f() -> ()")
         }
     }
 }

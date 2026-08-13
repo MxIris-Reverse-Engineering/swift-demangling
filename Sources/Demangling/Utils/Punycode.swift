@@ -215,6 +215,13 @@ enum Punycode {
             let oldi = i
             var w = 1
             for k in stride(from: symbolCount, to: Int.max, by: symbolCount) {
+                // The encoded number must not outrun the input. Only the
+                // advance below was guarded, so a digit run that reaches the
+                // end kept re-reading at `endIndex` and trapped instead of
+                // rejecting the symbol.
+                guard pos != input.endIndex else {
+                    throw DemanglingError.punycodeParseError
+                }
                 // Unlike RFC3492, Swift uses letters A-J for values 26-35
                 let digit: Int
                 if input[pos] >= UnicodeScalar("a") {
@@ -225,9 +232,7 @@ enum Punycode {
                     throw DemanglingError.punycodeParseError
                 }
 
-                if pos != input.endIndex {
-                    pos = input.index(pos, offsetBy: 1)
-                }
+                pos = input.index(pos, offsetBy: 1)
 
                 i = i &+ (digit &* w)
                 let t = max(min(k - bias, alphaCount), 1)
