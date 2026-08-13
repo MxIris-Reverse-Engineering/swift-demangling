@@ -47,10 +47,19 @@ final class StoreBuffer<Element: BitwiseCopyable>: @unchecked Sendable {
 /// out-of-range index traps deterministically instead of reading foreign
 /// memory, in release too.
 ///
-/// A value type on purpose, but **never copy one**: two copies would share
-/// one `StoreBuffer` while tracking divergent counts. Its only holder is
-/// `NodeStoreBuilder`, which is `~Copyable`, so the type system already rules
-/// the aliasing copy out end to end.
+/// A value type on purpose, but **never copy one**: two copies would share one
+/// `StoreBuffer` while tracking divergent counts, and the second one to grow
+/// would free a page the first still addresses.
+///
+/// The type system does *not* rule that out, despite what this comment used to
+/// claim. `NodeStoreBuilder` being `~Copyable` prevents copying the *builder*;
+/// it says nothing about copying a buffer out of it, which any code inside
+/// this module can still write (`let snapshot = self.nodes`). What actually
+/// holds today is narrower and worth stating honestly: the only holder is
+/// `NodeStoreBuilder`, and no code in it copies one. Enforcing the invariant
+/// in the type system would mean making this `~Copyable` too — deliberately
+/// not done yet, since that change ripples through every stored property and
+/// accessor here (ReviewFindingsPR7 F15 addendum).
 @usableFromInline
 struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
     @usableFromInline
@@ -112,9 +121,20 @@ struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
         count += 1
     }
 
+    /// - Precondition: `elements` must not alias this buffer's own storage.
+    ///   `ensureCapacity` may grow, which frees the old page, so a source
+    ///   pointing into that page would dangle by the time it is read. Every
+    ///   caller today passes independent storage (a `String`'s UTF-8, a
+    ///   separate `[UInt32]`); the precondition below pins that rather than
+    ///   leaving it to be rediscovered (ReviewFindingsPR7 F15 addendum).
     @usableFromInline
     mutating func append(contentsOf elements: UnsafeBufferPointer<Element>) {
         guard let elementsBase = elements.baseAddress, !elements.isEmpty else { return }
+        let existingBase = storage.baseAddress
+        precondition(
+            elementsBase + elements.count <= existingBase || elementsBase >= existingBase + storage.capacity,
+            "append(contentsOf:) source overlaps the destination buffer; growth would free it mid-copy"
+        )
         ensureCapacity(count + elements.count)
         (storage.baseAddress + count).initialize(from: elementsBase, count: elements.count)
         count += elements.count
