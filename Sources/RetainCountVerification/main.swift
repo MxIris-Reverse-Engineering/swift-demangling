@@ -45,9 +45,26 @@ let defaultSymbols = [
     "_$s9localtest5outeryyF11LocalStructL_V6methodyyF",
 ]
 
+// A corpus file that fails to load must abort, not silently downgrade to the
+// built-in eight symbols: the harness would go on to report PASS for a corpus
+// nobody asked it to measure. This is the same swallow F4 removed from the
+// demangle loop below — it survived here, six lines above the comment that
+// explains why it is wrong (ReviewFindingsPR7 F4, second instance).
 let symbols: [String]
-if CommandLine.arguments.count > 1, let contents = try? String(contentsOfFile: CommandLine.arguments[1], encoding: .utf8) {
-    symbols = contents.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+if CommandLine.arguments.count > 1 {
+    let corpusPath = CommandLine.arguments[1]
+    do {
+        let contents = try String(contentsOfFile: corpusPath, encoding: .utf8)
+        symbols = contents.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    } catch {
+        print("[0008-retain-verification] failed to read symbol file \(corpusPath): \(error)")
+        print("[0008-retain-verification] refusing to fall back to the built-in corpus — that would report PASS for a different input than requested")
+        exit(1)
+    }
+    guard !symbols.isEmpty else {
+        print("[0008-retain-verification] symbol file \(corpusPath) contained no symbols")
+        exit(1)
+    }
 } else {
     symbols = defaultSymbols
 }

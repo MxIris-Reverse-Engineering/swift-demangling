@@ -50,10 +50,31 @@ static void demangling_counting_malloc_logger(uint32_t type, uintptr_t arg1,
 /* The hook installed before start(), restored by stop(). Without the
  * save/restore, stop() wrote 0 unconditionally and permanently disabled
  * whatever was logging before — MallocStackLogging, Instruments, `leaks` —
- * for the rest of the process (ReviewFindingsPR7 F13). */
-static malloc_logger_t *demangling_saved_malloc_logger;
+ * for the rest of the process (ReviewFindingsPR7 F13).
+ *
+ * _Atomic because the save and the restore can run on different threads: the
+ * window is serialized by ExclusiveMeasurementWindow, but that lock orders
+ * them without publishing this slot between them. */
+static _Atomic(malloc_logger_t *) demangling_saved_malloc_logger;
+
+/* Depth of nested start() calls, so only the outermost pair touches the hook.
+ *
+ * The save/restore alone is not enough: ExclusiveMeasurementWindow serializes
+ * with an NSRecursiveLock, which by design lets one thread re-enter. A nested
+ * start() would then save the *counting* hook as the thing to restore, and
+ * both stop() calls would put the counting hook back — the caller's original
+ * logger lost for the rest of the process, which is precisely the failure F13
+ * set out to fix. No current call site nests (each benchmark @Test opens one
+ * window), so this is a guard rail rather than a live bug fix; MallocCounter
+ * is public to the test-support module, so a new suite could introduce one. */
+static _Atomic(int) demangling_malloc_counter_depth;
 
 void demangling_malloc_counter_start(void) {
+    if (atomic_fetch_add_explicit(&demangling_malloc_counter_depth, 1,
+                                  memory_order_acq_rel) != 0) {
+        /* Nested: the outermost window owns the hook and the counters. */
+        return;
+    }
     atomic_store_explicit(&demangling_allocation_event_count, 0,
                           memory_order_relaxed);
     atomic_store_explicit(&demangling_large_allocation_event_count, 0,
@@ -61,12 +82,25 @@ void demangling_malloc_counter_start(void) {
     /* Atomic builtins on the plain global: other threads read malloc_logger
      * on every allocation, so a plain store is a data race (TSan-visible)
      * even when the value transition is benign. */
-    demangling_saved_malloc_logger = __atomic_load_n(&malloc_logger, __ATOMIC_ACQUIRE);
+    malloc_logger_t *previous_logger = __atomic_load_n(&malloc_logger, __ATOMIC_ACQUIRE);
+    atomic_store_explicit(&demangling_saved_malloc_logger, previous_logger,
+                          memory_order_release);
     __atomic_store_n(&malloc_logger, demangling_counting_malloc_logger, __ATOMIC_RELEASE);
 }
 
 uint64_t demangling_malloc_counter_stop(void) {
-    __atomic_store_n(&malloc_logger, demangling_saved_malloc_logger, __ATOMIC_RELEASE);
+    int previous_depth = atomic_fetch_sub_explicit(&demangling_malloc_counter_depth, 1,
+                                                   memory_order_acq_rel);
+    if (previous_depth <= 0) {
+        /* Unbalanced stop(): restore the depth and leave the hook alone rather
+         * than installing whatever the save slot happens to hold. */
+        atomic_fetch_add_explicit(&demangling_malloc_counter_depth, 1,
+                                  memory_order_acq_rel);
+    } else if (previous_depth == 1) {
+        malloc_logger_t *saved_logger =
+            atomic_load_explicit(&demangling_saved_malloc_logger, memory_order_acquire);
+        __atomic_store_n(&malloc_logger, saved_logger, __ATOMIC_RELEASE);
+    }
     return atomic_load_explicit(&demangling_allocation_event_count,
                                 memory_order_relaxed);
 }

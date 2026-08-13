@@ -338,8 +338,14 @@ final class SharedStorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendab
         // against the stdlib demangler (see StorePrintParitySweep for the
         // rationale and the classification's blind spot).
         var comparedCount = 0
-        var oneSidedFailureCount = 0
-        var oneSidedFailureSamples: [String] = []
+        // No "one-sided failure" tally here either: `SharedNodeStore.demangle`
+        // is `demangleAsNodeTransient` followed by a non-throwing `intern`, so
+        // it throws exactly when the transient entry throws and the two can
+        // never disagree about which symbols demangle. The counter that used
+        // to live here was pinned at zero by construction, and the assertion
+        // on it could never fail (ReviewFindingsPR7 F4, second instance). The
+        // impossible case is recorded as an issue below instead, so a future
+        // divergence fails loudly rather than silently passing.
         var consistentlyRejectedCount = 0
         var regressedSymbolCount = 0
         var regressedSymbolSamples: [String] = []
@@ -369,24 +375,18 @@ final class SharedStorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendab
                     }
                 }
             default:
-                oneSidedFailureCount += 1
-                if oneSidedFailureSamples.count < 10 {
-                    let failedSide = reference == nil ? "shared store failed, transient succeeded" : "shared store succeeded, transient failed"
-                    oneSidedFailureSamples.append("\(mangled) [\(failedSide)]")
-                }
+                // Unreachable while both entries share one implementation.
+                let failedSide = reference == nil ? "shared store failed, transient succeeded" : "shared store succeeded, transient failed"
+                Issue.record("\(mangled): \(failedSide) — the two entries are supposed to accept exactly the same symbols")
             }
         }
-        print("[0010-shared-print-parity] symbols=\(comparedCount) optionSets=\(Self.optionSets.count) mismatches=\(mismatchCount) oneSidedFailures=\(oneSidedFailureCount) consistentlyRejected=\(consistentlyRejectedCount) regressed=\(regressedSymbolCount) retiredBuffers=\(sharedStore.retiredBufferCountForTesting)")
+        print("[0010-shared-print-parity] symbols=\(comparedCount) optionSets=\(Self.optionSets.count) mismatches=\(mismatchCount) consistentlyRejected=\(consistentlyRejectedCount) regressed=\(regressedSymbolCount) retiredBuffers=\(sharedStore.retiredBufferCountForTesting)")
         if !mismatchSamples.isEmpty {
             print("[0010-shared-print-parity] samples: \(mismatchSamples.joined(separator: ", "))")
-        }
-        if !oneSidedFailureSamples.isEmpty {
-            print("[0010-shared-print-parity] one-sided failures: \(oneSidedFailureSamples.joined(separator: ", "))")
         }
         if !regressedSymbolSamples.isEmpty {
             print("[0010-shared-print-parity] regressed (stdlib demangles these, this library does not): \(regressedSymbolSamples.joined(separator: ", "))")
         }
-        #expect(oneSidedFailureCount == 0, "both paths must agree on which symbols demangle")
         #expect(regressedSymbolCount == 0, "symbols the stdlib demangler handles must not fail here")
         #expect(mismatchCount == 0, "shared-store printing must be byte-identical to the Node path")
     }
