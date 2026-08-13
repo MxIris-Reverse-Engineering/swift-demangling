@@ -37,6 +37,32 @@ public protocol DemanglingNode: Sendable {
     ///   declaration as many.
     var materializedNode: Node { get }
 
+    /// Runs a print walk over this subtree and returns the rendered text.
+    ///
+    /// A **requirement**, not an extension member, and that distinction is the
+    /// whole point. `print(using:)` below is the API callers use; it forwards
+    /// here, so the call lands in the witness table and every conformer's own
+    /// walk is selected — including from generic and existential contexts.
+    ///
+    /// `NodeReference` overrides this to walk the arena on unretained handles
+    /// (zero store retain/release per visited child). That override used to be
+    /// written directly on `print(using:)`, which is an extension member: a
+    /// concrete `NodeReference` picked up the fast walk, while
+    /// `some DemanglingNode` / `any DemanglingNode` silently kept the generic
+    /// one. Output was identical either way, so no comparison test could see
+    /// it — the same near-miss shape `NodePrinterTarget` documents for its own
+    /// hooks (ReviewFindingsPR7 F14 addendum).
+    ///
+    /// Note the split: the requirement takes no default argument (Swift does
+    /// not allow them on requirements), so the defaulted spelling lives on
+    /// `print(using:)` alone. Putting a default here and overriding *that* is
+    /// exactly how the dispatch hole reopens.
+    func runPrintWalk(using options: DemangleOptions) -> String
+
+    /// Asynchronous counterpart of ``runPrintWalk(using:)``; see its note on
+    /// why this is a requirement.
+    func runPrintWalk(using options: DemangleOptions) async -> String
+
     /// Requirements (with derived defaults) so representations can provide
     /// allocation-free fast paths — `NodeReference` witnesses these with
     /// byte comparisons against the store's string table instead of
@@ -58,8 +84,11 @@ extension DemanglingNode {
     /// The single implementation for every representation: `Node` prints the
     /// class tree, `NodeReference` prints straight from the store without
     /// materializing a `Node` tree.
+    /// Forwards through the ``runPrintWalk(using:)`` requirement so the
+    /// conformer's own walk is selected even from a generic or existential
+    /// context — see that requirement for why the override cannot live here.
     public func print(using options: DemangleOptions = .default) -> String {
-        DemanglingPrinter<String, Self>.print(self, options: options)
+        runPrintWalk(using: options)
     }
 
     /// Asynchronous variant of ``print(using:)``.
@@ -67,6 +96,16 @@ extension DemanglingNode {
     /// Suspends the calling task instead of blocking a cooperative worker when
     /// the walk has to move to a large-stack thread.
     public func print(using options: DemangleOptions = .default) async -> String {
+        await runPrintWalk(using: options)
+    }
+
+    /// Default walk: the generic engine specialized on this representation.
+    /// `Node` uses it as-is; `NodeReference` overrides it.
+    public func runPrintWalk(using options: DemangleOptions) -> String {
+        DemanglingPrinter<String, Self>.print(self, options: options)
+    }
+
+    public func runPrintWalk(using options: DemangleOptions) async -> String {
         await StackSafeExecutor.executeAsync {
             var printer = DemanglingPrinter<String, Self>(options: options)
             return printer.printRoot(self)
@@ -299,7 +338,7 @@ extension NodeReference {
     /// The pinned view stays valid across the `StackSafeExecutor` hop inside
     /// the printer: the submitting frame blocks on the hop, so the
     /// `withUnsafePointer` scope outlives the whole walk.
-    public func print(using options: DemangleOptions = .default) -> String {
+    public func runPrintWalk(using options: DemangleOptions) -> String {
         withExtendedLifetime(store) {
             store.withView { pinnedView in
                 withUnsafePointer(to: pinnedView) { viewPointer in
@@ -323,7 +362,7 @@ extension NodeReference {
     /// walk, and that responsibility should not rest on the optimizer
     /// choosing to keep the closure's implicit `self` capture live to the
     /// end (ReviewFindingsPR7 F15).
-    public func print(using options: DemangleOptions = .default) async -> String {
+    public func runPrintWalk(using options: DemangleOptions) async -> String {
         await StackSafeExecutor.executeAsync {
             withExtendedLifetime(store) {
                 var printer = DemanglingPrinter<String, UnretainedNodeReference>(options: options)
