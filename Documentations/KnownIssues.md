@@ -432,3 +432,49 @@ review 的关切（「检查面变宽」）已由该注释 + `SharedNodeStoreTes
 知情决策：数组版与 span 版无法共享实现）；语料配方与 benchmark 脚手架属清理项而非
 缺陷，不随 review 修复批次动——单独的清理不带行为验证反而引入回归面。留待下次真正
 触碰这些文件的批次顺手收敛。
+
+**重新裁决：理由部分失效，降为「限期收敛」，2026-08-13。**
+上面「互指注释要求 lockstep」这个理由，前提是两份 switch **确实保持了** lockstep。
+第五轮 review 复核时发现它们的边界检查已经跑偏——注释要求同步，实际没同步。按本文件
+头部自己的契约（「若新证据推翻了当初的理由，则更新本文件并重新裁决」），这一条不能再
+以原理由继续挂着。
+
+拆开看：
+- **两份 switch**：理由失效。lockstep 靠注释维持而没有机制保证，已经漂了一次，还会
+  再漂。**下次触碰 `NodeStore` 的批次必须收敛**，收敛方式要么是共享实现，要么是加一条
+  对照两份边界检查的测试——注释不算机制。
+- **语料配方与 benchmark 脚手架**：理由仍成立，维持不修。这两处没有「两份必须一致」的
+  契约，漂了也不产生正确性后果。
+
+## N14. `stripManglePrefix` 把字节域长度喂给字素域 `dropFirst`（PR #7 第五轮 review）
+
+**发现**：`Extensions.swift` 的 `stripManglePrefix` 用 `getManglingPrefixLength`（F9 后
+改为按字节匹配）的返回值调用 `String.dropFirst`，而后者按**字素簇**前进。据此推断
+`"$s\u{0301}4main4testyyF"` 会少砍 2 字节。
+
+**裁决：误报，2026-08-13。**
+实测 head 与 main 对该触发串及另外三组输入的输出**逐字节相同**，都是 `4main4testyyF`。
+
+推断错在前提：`getManglingPrefixLength` 返回的是**字面常量** 3 / 2 / 14，不是算出来的
+长度。F9（`ef9c1f4`）改的是**匹配方式**（`hasPrefix` → `utf8.starts(with:)`），不是
+**计数方式**。所有被识别的前缀都是纯 ASCII，字节数恒等于字素数，喂给 `dropFirst` 的值
+两版一致，不存在域错配。
+
+附带确认一个两版都有的行为：组合音标会连同 `s` 一起被 `dropFirst` 吃掉（`$` + `ś` 算两个
+字素簇）。这不是 PR 引入的，且这种输入本就不是合法 Swift 符号，不单独处理。
+
+## N15. `GrowableStoreBuffer` 的别名危险（PR #7 第五轮 review）
+
+**发现**：`GrowableStoreBuffer` 是可复制 `struct`，文档却称「类型系统已排除别名的复制」；
+且 `append(contentsOf:)` 先取 `baseAddress` 再 `ensureCapacity()`，若源指向自身存储，
+增长释放旧页后会从悬垂指针拷贝。
+
+**裁决：文档失实已修，别名路径当前不可达，`~Copyable` 暂缓，2026-08-13。**
+- 「类型系统已排除」确实说过头了：`~Copyable` 的是 `NodeStoreBuilder`（防止复制 builder），
+  管不住模块内 `let snapshot = self.nodes` 复制出一个 buffer。文档已改为如实陈述。
+- 别名的 use-after-free **当前不可达**：三个 `append(contentsOf:)` 调用点传的都是与目标
+  无关的存储（`String` 的 UTF-8、独立的 `[UInt32]`、数组重载转发）；唯一取 `edges` 视图
+  的地方（`NodeStoreBuilder.resizeManyChildrenSlots`）只读哈希，不追加。已加 `precondition`
+  把这个前提钉住。
+- 改 `~Copyable` 暂缓：它只解决第一半（复制），对 `baseAddress` 悬垂毫无作用，且会波及
+  这里每一个存储属性与访问器。两个问题要分开处理，不要用一个 `~Copyable` 假装都修了。

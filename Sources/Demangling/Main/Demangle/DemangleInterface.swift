@@ -14,6 +14,22 @@
 /// valid input these equal the scalar counts reported before; they can differ only
 /// for invalid inputs containing non-ASCII bytes.
 ///
+/// The byte move changed more than error positions: identifier **length
+/// prefixes** now count bytes rather than Unicode scalars, so on an input whose
+/// identifier contains non-ASCII bytes the demangler slices a different span and
+/// can reach a different parse outcome — not merely a different error offset.
+/// Valid Swift symbols are unaffected (they are ASCII, and non-ASCII identifiers
+/// arrive punycode-encoded, which is also ASCII); this is only observable on
+/// malformed input.
+///
+/// Measured against `swift-demangle` as referee on 1068 non-ASCII inputs built to
+/// stress that boundary: the byte reading is right 194 times and the scalar
+/// reading 41, the rest agreeing. The 41 are one shape — this entry *accepting* a
+/// punycode-marked identifier the Swift toolchain rejects — so the byte reading is
+/// the better default, not a strictly better one. Recorded rather than papered
+/// over, because "we match upstream here" would be the wrong thing to believe
+/// while debugging one of those 41 (ReviewFindingsPR7, second round).
+///
 /// - Parameters:
 ///   - mangled: the string to be parsed ("isType` is false, the string should start with a Swift Symbol prefix, _T, _$S or $S).
 ///   - isType: if true, no prefix is parsed and, on completion, the first item on the parse stack is returned.
