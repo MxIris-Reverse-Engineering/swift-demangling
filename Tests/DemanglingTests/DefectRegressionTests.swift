@@ -1161,4 +1161,43 @@ struct DefectRegressionTests {
             }
         }
     }
+
+    /// `NodeStore.NodeIndex` folded a debug-only issuance tag into its
+    /// synthesized `Hashable`, so a `Set` of indices from two stores had two
+    /// members in Debug and one in Release. Identity must not depend on the
+    /// build configuration; cross-store misuse is diagnosed by the explicit
+    /// tag checks in `reference(at:)` and `intern`, not by `==`.
+    ///
+    /// This assertion fails in Debug before the fix and passes in Release,
+    /// which is exactly the inconsistency being pinned.
+    @Test func nodeIndexIdentityDoesNotDependOnBuildConfiguration() throws {
+        var firstBuilder = NodeStoreBuilder()
+        let firstIndex = try firstBuilder.demangle("$s4main1fyyF")
+        let firstStore = firstBuilder.freeze()
+
+        var secondBuilder = NodeStoreBuilder()
+        let secondIndex = try secondBuilder.demangle("$s4main1gyyF")
+        let secondStore = secondBuilder.freeze()
+
+        withExtendedLifetime((firstStore, secondStore)) {
+            if firstIndex.rawValue == secondIndex.rawValue {
+                #expect(firstIndex == secondIndex)
+                var indices: Set<NodeStore.NodeIndex> = []
+                indices.insert(firstIndex)
+                indices.insert(secondIndex)
+                #expect(indices.count == 1)
+            }
+        }
+    }
+
+    /// The Swift 3 dependent-member-type branch tested
+    /// `c < "0" && c > "9"` — a contradiction no scalar satisfies — so every
+    /// `q`-prefixed type fell through to the generic-parameter-index parser
+    /// and a legal Swift 3 mangling was rejected.
+    ///
+    /// `xcrun swift-demangle` accepts this symbol; `main` rejects it.
+    @Test func swift3DependentMemberTypeBranchIsReachable() throws {
+        let demangled = try demangleAsNode("_TtqCSo8NSObject5Assoc")
+        #expect(demangled.print(using: .default) == "__C.NSObject.Assoc")
+    }
 }

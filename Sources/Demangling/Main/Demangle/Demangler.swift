@@ -2945,8 +2945,12 @@ private struct ScalarScanner: ~Escapable {
     /// If the position plus `skipCount` is within bounds, return the scalar at
     /// that location, otherwise nil. The position never changes.
     func peek(skipCount: Int = 0) -> UnicodeScalar? {
-        let peekOffset = offset + skipCount
-        guard peekOffset < bytes.count else { return nil }
+        // Both ends are the caller's to get wrong, and `skip(count:)` and
+        // `backtrack(count:)` in this same scanner already guard theirs: a
+        // negative skip would subscript the span at a negative offset, and a
+        // large one would overflow the addition before any bound is checked.
+        let (peekOffset, offsetOverflowed) = offset.addingReportingOverflow(skipCount)
+        guard !offsetOverflowed, peekOffset >= 0, peekOffset < bytes.count else { return nil }
         return UnicodeScalar(bytes[peekOffset])
     }
 
@@ -3953,7 +3957,11 @@ extension Demangler {
             }
         case "q":
             let c = try scanner.requirePeek()
-            if c != "d" && c != "_" && c < "0" && c > "9" {
+            // Upstream's test is `c != 'd' && c != '_' && !isdigit(c)`. The
+            // digit half was transcribed as a conjunction, which no scalar can
+            // satisfy — the branch was unreachable and every `q`-prefixed type
+            // fell through to the generic-parameter-index parser.
+            if c != "d" && c != "_" && !("0" ... "9").contains(c) {
                 type = try demangleSwift3DependentMemberTypeName(base: demangleSwift3Type())
             } else {
                 type = try demangleSwift3GenericParamIndex()

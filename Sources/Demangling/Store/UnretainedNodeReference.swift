@@ -64,6 +64,25 @@ struct UnretainedNodeReference: Hashable {
 extension UnretainedNodeReference: @unchecked Sendable {}
 
 extension UnretainedNodeReference: DemanglingNode {
+    /// Overrides the protocol's asynchronous default, which suspends on a
+    /// continuation instead of blocking.
+    ///
+    /// The handle's safety contract requires the `withUnsafePointer(to:)`
+    /// scope that minted it to outlive the walk. That holds across the
+    /// synchronous executor hop because the submitting call blocks on it; it
+    /// does not hold across a suspension, where the submitting frame — and
+    /// with it the anchoring scope — can unwind while the closure is still
+    /// pending, leaving the walk to dereference a dead stack slot. There is
+    /// no legal way to await one of these handles, so run the same blocking
+    /// walk rather than leaving an inherited spelling that compiles.
+    ///
+    /// Spelled as the engine call rather than as `runPrintWalk(using:)`,
+    /// which would resolve to this asynchronous overload and recurse.
+    @usableFromInline
+    func runPrintWalk(using options: DemangleOptions) async -> String {
+        DemanglingPrinter<String, UnretainedNodeReference>.print(self, options: options)
+    }
+
     @usableFromInline
     var kind: Node.Kind {
         compactNode.kind

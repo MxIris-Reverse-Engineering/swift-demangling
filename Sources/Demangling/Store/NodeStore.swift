@@ -57,6 +57,25 @@ public final class NodeStore: @unchecked Sendable {
             self.rawValue = rawValue
         }
         #endif
+
+        /// Written out rather than synthesized so identity does not depend on
+        /// the build configuration. With the debug-only `storeTag` folded in,
+        /// a synthesized conformance made same-`rawValue` indices from two
+        /// stores distinct in Debug and equal in Release — a `Set` of root
+        /// indices had two members in one configuration and one in the other,
+        /// so a consumer that tests in Debug and ships in Release would get
+        /// different deduplication. Cross-store misuse is caught by the
+        /// explicit tag checks in ``NodeStore/reference(at:)`` and
+        /// `NodeStoreBuilder.intern`, which is where that diagnostic belongs.
+        @inlinable
+        public static func == (left: NodeIndex, right: NodeIndex) -> Bool {
+            left.rawValue == right.rawValue
+        }
+
+        @inlinable
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(rawValue)
+        }
     }
 
     // Storage handed over from the builder at freeze (proposal 0010, step 1):
@@ -292,7 +311,9 @@ public final class NodeStore: @unchecked Sendable {
             }
         case .manyChildren:
             precondition(position >= 0 && position < Int(compact.payloadWord1), "Child index out of range")
-            return edgeSpan[Int(compact.payloadWord0) + position]
+            let edgeIndex = Int(compact.payloadWord0) + position
+            precondition(edgeIndex < edgeSpan.count, "Edge index out of range for this store")
+            return edgeSpan[edgeIndex]
         case .none, .index, .text:
             preconditionFailure("Child index out of range for a node without children")
         }

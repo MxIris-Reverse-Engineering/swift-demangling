@@ -25,6 +25,17 @@ final class StoreBuffer<Element: BitwiseCopyable>: @unchecked Sendable {
     @usableFromInline
     let capacity: Int
 
+    /// Elements actually allocated, which is `max(capacity, 1)`: an empty
+    /// buffer still owns one element's page so `baseAddress` stays valid.
+    ///
+    /// Bounds checks that reason about the *allocation* must use this rather
+    /// than `capacity`, which reports 0 for the initial generation and would
+    /// make an overlap check against `baseAddress ..< baseAddress + capacity`
+    /// an empty range — vacuously satisfied by every pointer, including one
+    /// aliasing the live slot.
+    @usableFromInline
+    var allocatedCapacity: Int { Swift.max(capacity, 1) }
+
     @usableFromInline
     init(capacity: Int) {
         self.capacity = capacity
@@ -48,8 +59,12 @@ final class StoreBuffer<Element: BitwiseCopyable>: @unchecked Sendable {
 /// memory, in release too.
 ///
 /// A value type on purpose, but **never copy one**: two copies would share one
-/// `StoreBuffer` while tracking divergent counts, and the second one to grow
-/// would free a page the first still addresses.
+/// `StoreBuffer` while tracking divergent counts, so each would append over
+/// the other's elements — including elements already published to readers.
+/// The hazard is silent data corruption, not a dangling pointer: `storage` is
+/// a strong reference held by every copy, so a copy that can still write is
+/// one that kept the page alive (this comment used to say the second copy to
+/// grow would free a page the first still addresses; it cannot).
 ///
 /// The type system does *not* rule that out, despite what this comment used to
 /// claim. `NodeStoreBuilder` being `~Copyable` prevents copying the *builder*;
@@ -132,7 +147,7 @@ struct GrowableStoreBuffer<Element: BitwiseCopyable>: Sendable {
         guard let elementsBase = elements.baseAddress, !elements.isEmpty else { return }
         let existingBase = storage.baseAddress
         precondition(
-            elementsBase + elements.count <= existingBase || elementsBase >= existingBase + storage.capacity,
+            elementsBase + elements.count <= existingBase || elementsBase >= existingBase + storage.allocatedCapacity,
             "append(contentsOf:) source overlaps the destination buffer; growth would free it mid-copy"
         )
         ensureCapacity(count + elements.count)

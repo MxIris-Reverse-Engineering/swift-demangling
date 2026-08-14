@@ -161,11 +161,17 @@ public struct NodeReference: Sendable {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *)
     @_lifetime(borrow self)
     public borrowing func textUTF8Span() -> Span<UInt8>? {
-        let compact = compactNode
+        // One resolution serves both the descriptor and the bytes. Two
+        // round-trips would take the shared store's lock twice and mix a
+        // `compactNode` read from one view with the bounds and base address
+        // of another. (Both views report the same bytes — the text table is
+        // append-only and every new generation copies the old prefix — so
+        // this is hygiene, not a correctness fix.)
+        let resolvedView = store.currentView
+        let compact = resolvedView.compactNode(at: nodeIndex.rawValue)
         guard case .text = compact.payloadKind else { return nil }
         let start = Int(compact.payloadWord0)
         let length = Int(compact.payloadWord1)
-        let resolvedView = store.currentView
         precondition(start + length <= resolvedView.textBytes.count, "Text range out of range for this store")
         // The span is formed over the raw storage; the override rebinds its
         // dependence to `self`, which keeps the store — and with it the

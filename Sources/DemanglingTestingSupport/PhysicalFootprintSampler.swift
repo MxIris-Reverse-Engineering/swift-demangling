@@ -19,9 +19,15 @@ public final class PhysicalFootprintSampler: @unchecked Sendable {
     public init() {}
 
     /// Records the baseline footprint and starts the sampling thread.
+    /// - Precondition: no window is currently open. A second `start()` would
+    ///   leave two sampling threads polling; the single `stop()` that follows
+    ///   signals the semaphore twice but waits once, so the *next* window's
+    ///   `stop()` returns before its own sampler has exited and silently
+    ///   reports a peak belonging to another window.
     public func start() {
         let currentFootprint = Self.currentFootprint()
         lock.lock()
+        precondition(!keepsSampling, "PhysicalFootprintSampler.start() called while a measurement window is already open")
         baselineFootprint = currentFootprint
         peakFootprint = currentFootprint
         keepsSampling = true
