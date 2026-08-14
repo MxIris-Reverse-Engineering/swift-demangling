@@ -765,10 +765,21 @@ struct DefectRegressionTests {
     /// and the scan read only `Demangler.swift`. A fifth round found a
     /// subtraction family (`demangleIndex() - 1`, `index - 2`,
     /// `readScalar().value - '0'`) and an overflow in `NodePrinter.swift` that
-    /// neither restriction could ever have surfaced. Both restrictions are
-    /// lifted below — keep it that way, and note the scan still cannot see an
-    /// operand laundered through a variable or a `$0` closure, which is what
-    /// the behavioral exit tests are for.
+    /// neither restriction could ever have surfaced.
+    ///
+    /// A sixth round removed the third restriction: the scan carried a
+    /// hand-maintained `scannedFileNames` set, and its only self-check fired
+    /// when a *listed* file was renamed — never when a file that should have
+    /// been listed was not, so `TypeDecoder.swift` and `Extensions.swift` were
+    /// permanently invisible to it. It now walks every source file, like its
+    /// word-size sibling above always did.
+    ///
+    /// What it still cannot see is an operand laundered through a variable or
+    /// a `$0` closure — which was every one of the four traps that round
+    /// fixed, all in files this scan already covered. Treat this as a pin for
+    /// spellings already known to have trapped, not as the defense: that is
+    /// `everyKindSurvivesBoundaryIndicesThroughEveryConsumer` and
+    /// `boundaryNumbersInMangledShapesNeverTrap`, which exercise behavior.
     @Test func librarySourceAvoidsUncheckedArithmeticOnParsedNumbers() throws {
         let sourcesDirectory = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -791,20 +802,11 @@ struct DefectRegressionTests {
             "readScalar().value - ",
             "readInt()) - 1",
         ]
-        // Scanned beyond the demangler: the printer consumes the same parsed
-        // numbers one layer later, and `print(using:)` is non-throwing, so an
-        // overflow there has no error channel at all.
-        let scannedFileNames: Set<String> = [
-            "Demangler.swift",
-            "NodePrinter.swift",
-            "Remangler.swift",
-            "Punycode.swift",
-        ]
         let fileEnumerator = try #require(FileManager.default.enumerator(at: sourcesDirectory, includingPropertiesForKeys: nil))
 
         var violations: [String] = []
         var scannedCount = 0
-        for case let fileLocation as URL in fileEnumerator where scannedFileNames.contains(fileLocation.lastPathComponent) {
+        for case let fileLocation as URL in fileEnumerator where fileLocation.pathExtension == "swift" {
             scannedCount += 1
             let fileContents = try String(contentsOf: fileLocation, encoding: .utf8)
             for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
@@ -817,8 +819,10 @@ struct DefectRegressionTests {
         }
 
         // A scan that silently stops finding its own inputs reports "clean"
-        // forever; pin the file count so a rename fails loudly instead.
-        #expect(scannedCount == scannedFileNames.count, "expected to scan \(scannedFileNames.count) files, scanned \(scannedCount) — did one get renamed or moved?")
+        // forever. With the whole tree walked there is no list to fall out of
+        // date, so the floor is simply "did we read a plausible number of
+        // files at all" — a moved directory or a broken enumerator fails loudly.
+        #expect(scannedCount > 30, "expected to scan the whole library, scanned only \(scannedCount) files — did Sources move?")
         #expect(violations.isEmpty, "unchecked arithmetic on a parsed number — bound it in the unsigned domain (require) before the arithmetic, not after:\n\(violations.sorted().joined(separator: "\n"))")
     }
 
@@ -1199,5 +1203,151 @@ struct DefectRegressionTests {
     @Test func swift3DependentMemberTypeBranchIsReachable() throws {
         let demangled = try demangleAsNode("_TtqCSo8NSObject5Assoc")
         #expect(demangled.print(using: .default) == "__C.NSObject.Assoc")
+    }
+
+    // MARK: - Boundary-value matrices
+
+    /// Every index-carrying node kind, at every integer boundary, through
+    /// every public consumer of an index.
+    ///
+    /// This is the guard the spelling scans could not be: the four traps this
+    /// round fixed were all "a parsed or constructed number meets a narrowing
+    /// conversion", and a blacklist of source spellings sees none of them once
+    /// the operand travels through a variable. Enumerating `Node.Kind.allCases`
+    /// means a kind added later is covered the day it is added, with nothing to
+    /// register by hand — the failure mode that let `TypeDecoder.swift` and
+    /// `Extensions.swift` stay permanently invisible to the file-list scan.
+    ///
+    /// Each node is exercised bare *and* wrapped, because several index reads
+    /// only happen when a parent walks its children: the second
+    /// differentiability trap fixed this round was reachable only through
+    /// `.functionType`, never by printing the node on its own.
+    @Test func everyKindSurvivesBoundaryIndicesThroughEveryConsumer() async throws {
+        await #expect(processExitsWith: .success) {
+            let boundaryIndices: [UInt64] = [
+                0, 1,
+                255, 256,                              // UInt8 narrowing
+                UInt64(UInt32.max), UInt64(UInt32.max) + 1, // UInt32 narrowing
+                UInt64(Int32.max) + 1,                 // 32-bit Int narrowing
+                UInt64(Int.max), UInt64(Int.max) + 1,  // Int narrowing
+                UInt64.max - 1, UInt64.max,            // increment saturation
+            ]
+            for kind in Node.Kind.allCases {
+                for index in boundaryIndices {
+                    let node = Node.create(kind: kind, index: index)
+                    _ = node.print(using: .default)
+                    _ = node.print(using: .simplified)
+                    _ = try? mangleAsString(node)
+                    _ = canMangle(node)
+
+                    // Contexts whose printers read a child's index.
+                    for containerKind in [Node.Kind.type, .functionType, .tuple] {
+                        let container = Node.create(kind: containerKind, children: [node])
+                        _ = container.print(using: .default)
+                        _ = try? mangleAsString(container)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The demangler half of the same matrix: boundary numbers substituted
+    /// into real mangled shapes, and — this is the part that matters —
+    /// anything that demangles successfully is then **printed and remangled**.
+    ///
+    /// Two of this round's four traps lived downstream of a successful
+    /// `demangleAsNode`, so a matrix that stopped at "does it demangle without
+    /// trapping" would have reported clean on both.
+    @Test func boundaryNumbersInMangledShapesNeverTrap() async throws {
+        await #expect(processExitsWith: .success) {
+            let boundaryNumbers = [
+                "0", "1", "26", "27", "255", "256",
+                "4294967295", "4294967296",
+                "2147483648",
+                "9223372036854775780", "9223372036854775781", "9223372036854775807",
+                "18446744073709551614", "18446744073709551615",
+            ]
+            // `#` marks where the number goes. Shapes chosen to reach the
+            // index parsers that feed different consumers: substitutions,
+            // discriminators, generic parameters, builtin sizes, tuple
+            // element counts, and the Swift 3 grammar's own index reader.
+            let shapes = [
+                "$sA#_",
+                "$sBi#_",
+                "$sBv#_",
+                "$sHA#_",
+                "$s4main1fyyFyycfU#_",
+                "$s4main1fyyFyycfu#_",
+                "_$s9localtest5outeryyF11LocalStructL#_V6methodyyF",
+                "$s#xxxxx",
+                "$s4mainAAC#_",
+                "_TtQ##_",
+            ]
+            for shape in shapes {
+                for number in boundaryNumbers {
+                    let mangled = shape.replacingOccurrences(of: "#", with: number)
+                    guard let node = try? demangleAsNode(mangled) else { continue }
+                    // Downstream of a successful demangle — where two of this
+                    // round's traps actually lived.
+                    _ = node.print(using: .default)
+                    _ = node.print(using: .simplified)
+                    _ = node.print(using: .interface)
+                    _ = try? mangleAsString(node)
+                    _ = canMangle(node)
+                }
+            }
+        }
+    }
+
+    /// Wrapping arithmetic must say why it is safe.
+    ///
+    /// The punycode decoder accumulated with `&+`/`&*` and wrapped past Int64
+    /// on an uppercase digit run, landing a negative index in
+    /// `Array.insert(_:at:)`. Nothing distinguished that use from the dozen
+    /// legitimate ones in this library (hash mixing, a tag increment, capacity
+    /// checks) — all of them just looked like someone had silenced a trap.
+    ///
+    /// So the rule is not "no wrapping operators", which would be wrong: it is
+    /// that each one states its reason on the line above, and a reviewer reads
+    /// twelve one-line claims instead of re-deriving twelve proofs. A new one
+    /// fails this test until its author writes down why wrapping is correct
+    /// there. Cheap to satisfy, and it puts the burden on the writer rather
+    /// than on whoever finds the crash.
+    ///
+    /// Deliberately *not* extended to narrowing conversions: there are 136 of
+    /// them, nearly all safe and uninteresting (`Int(someCount)`), so requiring
+    /// a note on each would produce noise that gets rubber-stamped. The
+    /// narrowing family is covered behaviorally by the boundary matrices above.
+    @Test func wrappingArithmeticCarriesAnAuditNote() throws {
+        let sourcesDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources")
+        // Assembled at runtime so this file cannot match its own prose.
+        let auditMarker = "wrapping" + "-audited:"
+        let wrappingOperators = ["&+", "&-", "&*", "&+=", "&-=", "&*="]
+        let fileEnumerator = try #require(FileManager.default.enumerator(at: sourcesDirectory, includingPropertiesForKeys: nil))
+
+        var unaudited: [String] = []
+        for case let fileLocation as URL in fileEnumerator where fileLocation.pathExtension == "swift" {
+            let fileContents = try String(contentsOf: fileLocation, encoding: .utf8)
+            let lines = fileContents.split(separator: "\n", omittingEmptySubsequences: false)
+            for (lineOffset, line) in lines.enumerated() {
+                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmedLine.hasPrefix("//") else { continue }
+                guard wrappingOperators.contains(where: { trimmedLine.contains($0) }) else { continue }
+                // The note may sit on the line itself or on the line above.
+                let precedingLine = lineOffset > 0 ? lines[lineOffset - 1].trimmingCharacters(in: .whitespaces) : ""
+                guard !trimmedLine.contains(auditMarker), !precedingLine.contains(auditMarker) else { continue }
+                unaudited.append("\(fileLocation.lastPathComponent):\(lineOffset + 1): \(trimmedLine)")
+            }
+        }
+
+        #expect(unaudited.isEmpty, """
+            wrapping arithmetic without an audit note — add `// \(auditMarker) <why wrapping is correct here>` \
+            on the line above, or use the reporting-overflow form if it is not:
+            \(unaudited.sorted().joined(separator: "\n"))
+            """)
     }
 }

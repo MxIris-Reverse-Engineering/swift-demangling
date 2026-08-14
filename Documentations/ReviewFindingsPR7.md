@@ -174,3 +174,90 @@ lldb 确认崩在打印阶段而非解析阶段（`arithmetic overflow` at `Node
 
 **归属**：本轮全部缺陷在 `main` 上同样存在，无一由本 PR 引入。711 条问题输入在 `main`
 上复跑，无一幸免。
+
+---
+
+# 第三轮：交叉复核与防线重构（2026-08-14）
+
+第二轮的 15 条发现被交给另一个会话独立复核（它自建 PR head / main 两份 worktree，用
+消费者包逐 case 实测退出码）。那一轮的**四处崩溃全部被独立证实**，同时**推翻了本方的
+五条判断**。随后按复核结论落地修复，并重建了防线——重建当天就找出两处前六轮全漏的崩溃。
+
+## 落地的修复
+
+**A 组（`ffd6f87`）：四处从公开 API 可达的进程崩溃 + 一次横向排查**
+
+| 位置 | 缺陷 | 触发 |
+|---|---|---|
+| `Demangler.swift:315` | `repeatCount + 27` 溢出（上一轮只挡住了窄化，没挡加法） | `$sA9223372036854775807_` |
+| `Punycode.swift` 四处 | `&+`/`&*` 回绕致负数组下标 | `$s0022ab_bbZZZZZZZZZZZZZZZZa` |
+| `NodePrinter.swift:1514/2188` | `UInt8(index)` 窄化，而 `print(using:)` 不可抛错 | `Node.create(kind: .differentiableFunctionType, index: 300)` |
+| `Remangler.swift` 四处 | `UInt32(index)` 窄化，而 `mangleAsString` 是 typed-throws | index > UInt32.max |
+| `TypeDecoder.swift` 七处 | 同族窄化（横向排查，review 未点名） | — |
+
+修 punycode 的累加同时消掉了 `delta == -38` 的除零路径：`i` 从此单调不减，`delta` 不再为负。
+
+**B 组（`6b19334`）：九项顺手修**
+
+capacity-0 代的恒真 precondition、`NodeIndex` 依赖构建配置的 `Hashable`、静态
+`rawChildIndex` 的边界检查（收敛 N13）、`UnretainedNodeReference` 继承的挂起式
+`runPrintWalk`、Swift 3 恒假分支、`peek` 的下界守卫、采样器的重叠窗口、
+`textUTF8Span` 的双次 view 解析、以及一条描述错误机制的注释。
+
+## 防线重构：从「枚举坏拼写」换成「枚举输入空间」
+
+第二轮留下一个尖锐事实：新加的禁用写法扫描**对当轮修的四处崩溃一处都看不见**，而那四个
+文件里有四个全在它的 `scannedFileNames` 清单里，扫描照样全绿。原因是黑名单只能匹配字面
+子串，看不见经变量中转的操作数——而四处缺陷全是这种。
+
+三项改造：
+
+1. **扫描域改为遍历整个 `Sources`。** 原先的手工文件清单，其自检只在**已登记**文件被
+   改名时报警，永远发现不了「本该登记却没登记」——`TypeDecoder.swift` 和
+   `Extensions.swift` 因此永久不可见。
+2. **新增 wrapping 运算符审计扫描。** 全库 12 处 `&+`/`&-`/`&*` 全部合法（hash 混合、
+   开放寻址探测、负载因子、刻意与上游对齐的解析回绕），但它们和 punycode 那处出事的写法
+   **长得一模一样**。现在每处必须在相邻行写明为什么回绕是正确的，新增的一处不写就红。
+   *刻意没有*扩展到窄化转换：全库 136 处，绝大多数安全且乏味，逐个要求注释只会产生被
+   橡皮图章盖过去的噪声。
+3. **新增两个边界值矩阵**（真正的防线）：
+   - `everyKindSurvivesBoundaryIndicesThroughEveryConsumer`：枚举
+     `Node.Kind.allCases` × 11 个整数边界 × {`print` ×2 档、`mangleAsString`、
+     `canMangle`}，每个节点还额外裸测与包进 `.type`/`.functionType`/`.tuple` 各测一遍
+     （第二处可微分性 trap 只在 `.functionType` 里才可达）。**靠 `allCases` 自动枚举，
+     以后新增的 kind 当天就被覆盖，没有需要手工登记的清单。**
+   - `boundaryNumbersInMangledShapesNeverTrap`：把边界数字代进 10 种真实符号形状，
+     **demangle 成功后继续 print + remangle**——本轮四处缺陷有两处就在成功 demangle 的
+     下游，止步于「能不能 demangle」的矩阵会对它们报绿。
+
+## 矩阵当场找到的两处新缺陷（前六轮全漏）
+
+**其一：`printAutoDiffSubsetParametersThunk` 的负长度 `prefix`。**
+`lastIndex = children.count - 1`，节点无子节点时为 -1，`currentIndex = lastIndex - 4`
+即 -5，`children.prefix(-5)` 直接 trap
+（`Fatal error: Can't take a prefix of negative length`）。上游只从 demangler 构造的树
+进入这个打印器，那种树必然带齐四个尾部子节点；公开构造面没有这个保证。已改为
+`currentIndex > 0` 才走 prefix 分支。
+
+**其二：`Remangler` 用 `assert` 校验输入树形状。**
+`mangleDependentGenericParamValueMarker` 的三条 `assert` 在 Debug 下 trap、Release 下
+消失——而它们消失之后，下面的 `node[_child: 1]` 会越界读。`mangleAsString` 是公开
+typed-throws API，契约是把畸形树变成 `ManglingError`，`assert` 是错误的工具。已改为
+`guard` + `throw`。
+
+同族横向排查后区分两类：**校验输入树形状**的 assert（`assert(node.text != nil)` 三处、
+`assert(enumNode.kind == .enum)` 一处）全部移除——它们下方本来就有完整的 throw 路径或
+条件分支，assert 只是额外加了一个 Debug 期的 trap；**校验 remangler 自身内部不变量**的
+assert（substitution 合并的 buffer 状态等 11 处）保留不动，那是 assert 的正确用途。
+
+## 元教训：换工具类别，而不是把同一个工具做得更细
+
+前五轮每一次都在同一个工具上加东西——往黑名单加拼写、往文件清单加文件。第二轮的复核
+一针见血：这条防线**结构上**看不见「操作数经变量中转」这一整类，加多少条目都不改变这一点。
+
+这一轮换了类别：黑名单枚举的是**已知的坏写法**，只能钉住见过的；矩阵枚举的是**输入空间**，
+能找出没见过的。区别当场兑现——矩阵上线第一次运行就抓出两处崩溃，其中一处的机制
+（负长度 `prefix`）和前五轮追的整数窄化家族根本不是一回事，任何形式的拼写黑名单都不可能
+看见它。
+
+黑名单降级为「已修拼写的回归钉」保留，这是它唯一称职的角色。

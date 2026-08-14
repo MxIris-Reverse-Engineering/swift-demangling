@@ -35,6 +35,16 @@
   第 3 条引用的 `maxPrintDepth = 512`（同上，现为 768）。第二部分 N3 的残留待办
   （`DemanglingPrinter.init(options:)` 降为 internal）经查证已在 `5cc30c9` 完成。
   **裁决结论本身没有变化**，只是把过期的数字对上。
+- **2026-08-14 更新（PR #7 第三轮：交叉复核 + 防线重构）**：本轮把第二轮的 15 条发现
+  交给另一个会话独立复核，对方推翻了其中 5 条判断（详见
+  [ReviewFindingsPR7.md 第三轮](ReviewFindingsPR7.md)）。本文件的变动：
+  - N13 **已收敛**（静态 `rawChildIndex` 补回边界检查），并澄清「限期收敛」的时序。
+  - N15 的 `precondition` 被发现在 capacity-0 的初始代上恒真，已修；同时订正该条目
+    引用的 use-after-free 机制描述（ARC 上不成立）。
+  - N5 重申一次，理由不变。
+  - 新增 N16、N17 两条误报裁决。
+  另外，本轮新加的边界值矩阵测试当场找出**两处前六轮全部漏掉的崩溃**，均已修复，
+  记录在 ReviewFindingsPR7.md，不进本文件。
 - **2026-08-09 注记（PR #7 review）**：本轮 15 条发现的完整记录与四问答案在
   [ReviewFindingsPR7.md](ReviewFindingsPR7.md)——裁决为「不修 / 误报」的条目才迁进
   本文件，已修复的条目从那里移除。
@@ -324,6 +334,12 @@ builder 插入即 hash-consing，**同一 arena 内「索引相同」就是「�
 值超范围才 trap。因此 `DefectRegressionTests.librarySourceAvoidsWordSizeDependentIntegerConversions`
 只扫三个字面量，与其目的是匹配的，并非「守卫太窄」。
 
+**重申：维持不改，2026-08-14。** PR #7 第三轮 review 又一次提出同一条（这次连同
+`BufferView.text(offset:length:)`、`withTextUTF8`、`reference(at:)`、
+`NodeStoreBuilder.intern` 一起点名）。上面的理由逐条复核后仍然成立：这些位置的
+`rawIndex` 全部来自 store 自身的缓冲区遍历，非 public 的初始化器挡住了伪造，两种结局
+都是确定性 trap、只差诊断文案。**下次再有人提这条，先读这里。**
+
 ## N6. 遍历原语按路径计价（枚举类）
 
 **发现**：`preorder()` / `inorder()` / `postorder()` / `levelorder()` / `all(of:)`
@@ -446,6 +462,15 @@ review 的关切（「检查面变宽」）已由该注释 + `SharedNodeStoreTes
 - **语料配方与 benchmark 脚手架**：理由仍成立，维持不修。这两处没有「两份必须一致」的
   契约，漂了也不产生正确性后果。
 
+**已收敛，2026-08-14。** 静态（`Span` 版）`rawChildIndex` 补回了实例版一直带着的
+`edgeIndex < edges.count` 检查，两份 switch 的边界检查重新一致。
+
+顺带澄清一处时序争议：第三轮 review 曾主张「PR #7 本身就是那个必须收敛的下一批」。
+按 git 时间线不成立——本 PR 对 `NodeStore*` 的全部触碰都在 08-09 之前，而上面这条
+「下次触碰必须收敛」写在 PR 的最后一个 commit（`5d2b476`）里，是在完全知晓本 PR 改过
+`NodeStore` 的前提下写的，显式指向下一批。收敛发生在本轮，是因为本轮为修 N16 相邻的
+`NodeIndex` 问题**又一次触碰了这个文件**，义务这才生效。
+
 ## N14. `stripManglePrefix` 把字节域长度喂给字素域 `dropFirst`（PR #7 第五轮 review）
 
 **发现**：`Extensions.swift` 的 `stripManglePrefix` 用 `getManglingPrefixLength`（F9 后
@@ -478,3 +503,49 @@ review 的关切（「检查面变宽」）已由该注释 + `SharedNodeStoreTes
   把这个前提钉住。
 - 改 `~Copyable` 暂缓：它只解决第一半（复制），对 `baseAddress` 悬垂毫无作用，且会波及
   这里每一个存储属性与访问器。两个问题要分开处理，不要用一个 `~Copyable` 假装都修了。
+
+**两处订正，2026-08-14。**
+
+**其一：那条 `precondition` 曾经等于没钉。** 它的排除区上界写作
+`existingBase + storage.capacity`，而 `StoreBuffer.init` 实际按 `max(capacity, 1)`
+分配。初始代的 `capacity` 是 0，排除区宽度为 0，任何指针都能通过检查——恰恰在最需要
+它的那一代。已新增 `allocatedCapacity` 并改用它做界。也就是说，上面「已加 `precondition`
+把这个前提钉住」这句话，在写下时对第一代是不成立的。
+
+**其二：use-after-free 这个机制本身在 ARC 上不成立。** 原描述说「第二个扩容的副本会
+释放第一个仍在寻址的页面」——做不到：`storage` 是每个副本各自持有的**强引用**，还能写
+的副本就是让页面活着的副本，两件事互斥。复制的真实后果是两份 `count` 分叉，各自
+append 覆盖对方的元素（包括已发布给读者的元素）——**静默数据损坏，不是悬垂指针**。
+类型文档里那句同样失实的注释已一并改写。
+
+这两点都不改变结论：复制危险仍然存在，`~Copyable` 仍然暂缓。变的是「它到底会怎么坏」，
+以及「原先以为钉住了的那一半其实没钉」。
+
+## N16. `Remangler` 两处 `UInt8(index)` 被指为窄化陷阱同族（PR #7 第三轮 review）
+
+**发现**：`Remangler.swift` 的 `trySubstitution` 有两处
+`Character(UnicodeScalar(UInt8(ascii: "A") + UInt8(index)))`，被列为与
+`UnicodeScalar(UInt32(index))` 同族的窄化 trap。
+
+**裁决：误报，2026-08-14。**
+`findSubstitution` 返回 `UInt64?`，而这两处都在 `if index >= 26 { … } else { … }` 的
+**else 分支**里——`index < 26` 已由条件本身保证，`UInt8(index)` 不可能失败，
+`65 + index < 91` 也不可能溢出。
+
+值得记一笔的是这条误报的来源：它是在「同族横向排查」时按**拼写**（`UInt8(` 后跟变量）
+匹配出来的，没有读周围的控制流。横向排查按模式找候选是对的，但每个候选仍要单独确认
+可达性——否则「修的是这一类」会变成「改的是长得像的那一堆」。
+
+## N17. `textUTF8Span()` 混用两个 view 被指为正确性缺陷（PR #7 第三轮 review）
+
+**发现**：`textUTF8Span()` 先经 `compactNode` 解析一次 view 拿描述符，再经
+`store.currentView` 解析第二次拿边界与基址，被指为「一个 view 的描述符配另一个 view 的
+基址」的正确性缺陷。
+
+**裁决：正确性指控不成立，卫生问题已顺手修，2026-08-14。**
+两次解析之间 view 只可能**前进**，而文本表是 append-only、每一代新缓冲区整段拷贝旧前缀，
+且退休代由保活链持有——用旧 offset 到新 view 里读，逐字节相同，`precondition` 也恒过。
+所以不存在读错数据的路径。
+
+真实存在的是两件小事，已一并处理：多付一次共享 store 的锁，以及「同一个逻辑读跨两个
+快照」这个坏味道。现在改为一次解析同时供给描述符和字节。

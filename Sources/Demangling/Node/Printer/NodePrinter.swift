@@ -1810,9 +1810,16 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         let kind = name.children.at(lastIndex - 3)
         let currentIndex = lastIndex - 4
         _ = printOptional(kind, suffix: " from ")
+        // Upstream only ever reaches this printer from a demangler-built tree,
+        // which always carries the four trailing children read above, so
+        // `lastIndex - 4` is never negative there. Public node construction
+        // has no such guarantee: a node with fewer children sends a negative
+        // length into `prefix(_:)`, which traps — and `print(using:)` is
+        // non-throwing, so there is no channel to reject it. Print what the
+        // node does carry instead.
         if currentIndex == 0 {
             printFirstChild(name)
-        } else {
+        } else if currentIndex > 0 {
             printSequence(name.children.prefix(currentIndex))
         }
         if options.contains(.shortenThunk) {

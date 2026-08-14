@@ -226,6 +226,7 @@ struct Remangler {
 
     /// Combine two hash values
     private func combineHash(_ currentHash: Int, _ newValue: Int) -> Int {
+        // wrapping-audited: hash mixing — wrap-around is the point, and the result only ever feeds a masked table index.
         return 33 &* currentHash &+ newValue
     }
 
@@ -262,10 +263,12 @@ struct Remangler {
     /// which case the hash is computed without being cached.
     private func cacheSlot(for node: Node, treatAsIdentifier: Bool) -> (cachedEntry: SubstitutionEntry?, freeSlotIndex: Int?) {
         let ident = treatAsIdentifier ? 4 : 0
+        // wrapping-audited: hash mixing; the sum is masked into a slot below, so a wrap is a different slot, never a bad one.
         let nodeHash = nodePointerHash(node) &+ ident
 
         // Linear probing with limited attempts
         for probe in 0 ..< Self.hashHashMaxProbes {
+            // wrapping-audited: open-addressing probe — the mask below makes any wrap land in range.
             let index = (nodeHash &+ probe) & (Self.hashHashCapacity - 1)
 
             if let cachedEntry = hashHash[index] {
@@ -297,6 +300,7 @@ struct Remangler {
     private func nodePointerHash(_ node: Node) -> Int {
         // Use ObjectIdentifier for pointer-like hashing
         let objectId = ObjectIdentifier(node)
+        // wrapping-audited: hash mixing over a full-width value; every bit pattern is an acceptable output.
         let prime = objectId.hashValue &* 2043
 
         // Rotate for better distribution (simulate pointer alignment patterns)
@@ -383,6 +387,7 @@ struct Remangler {
         if value == 0 {
             append("_")
         } else {
+            // wrapping-audited: unreachable at 0 — the `value == 0` arm above returns, so this branch has `value >= 1`.
             append(value &- 1)
             append("_")
         }
@@ -1696,7 +1701,9 @@ extension Remangler {
 
     private mutating func mangleBoundGenericEnum(_ node: Node, depth: Int) throws(ManglingError) {
         let enumNode = try node[_child: 0][_child: 0]
-        assert(enumNode.kind == .enum)
+        // Not asserted: the `Swift.Optional` test below already falls through
+        // to the non-sugar path for any other shape, so a debug-only trap here
+        // rejected trees the release path mangles fine.
         let moduleNode = try enumNode[_child: 0]
         let identNode = try enumNode[_child: 1]
         if moduleNode.kind == .module, moduleNode.text == "Swift",
@@ -3094,9 +3101,19 @@ extension Remangler {
     }
 
     private mutating func mangleDependentGenericParamValueMarker(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.numberOfChildren == 2)
-        assert(node.children[0].children[0].kind == .dependentGenericParamType)
-        assert(node.children[1].kind == .type)
+        // These were `assert`s, which is the wrong instrument for validating
+        // an *input* tree: they trap in debug and vanish in release, where
+        // the subscripts below then read out of bounds. `mangleAsString` is
+        // public and its contract is to reject a malformed tree through
+        // `ManglingError`, and public node construction can hand it either
+        // shape. Internal invariants of the remangler's own buffer state
+        // keep their asserts — this one describes the caller's data.
+        guard node.numberOfChildren == 2,
+              let firstChild = node.children.first,
+              firstChild.children.first?.kind == .dependentGenericParamType,
+              node.children.at(1)?.kind == .type else {
+            throw .invalidNodeStructure(node, message: "DependentGenericParamValueMarker needs a generic param type and a type")
+        }
         try mangleType(node[_child: 1], depth: depth + 1)
         append("RV")
         try mangleDependentGenericParamIndex(node[_child: 0][_child: 0])
@@ -3394,7 +3411,10 @@ extension Remangler {
     }
 
     private mutating func mangleImplParameterIsolated(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.text != nil)
+        // No `assert(node.text != nil)`: the switch below already routes a
+        // missing or unrecognized text through `invalidImplParameterAttr`,
+        // which is the channel `mangleAsString` promises. The assert only
+        // added a debug-build trap on a tree public API can construct.
         let diffChar: String? = switch node.text {
         case "isolated": "I"
         default: nil
@@ -3407,7 +3427,10 @@ extension Remangler {
     }
 
     private mutating func mangleImplParameterSending(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.text != nil)
+        // No `assert(node.text != nil)`: the switch below already routes a
+        // missing or unrecognized text through `invalidImplParameterAttr`,
+        // which is the channel `mangleAsString` promises. The assert only
+        // added a debug-build trap on a tree public API can construct.
         let diffChar: String? = switch node.text {
         case "sending": "T"
         default: nil
@@ -3420,7 +3443,10 @@ extension Remangler {
     }
 
     private mutating func mangleImplParameterImplicitLeading(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.text != nil)
+        // No `assert(node.text != nil)`: the switch below already routes a
+        // missing or unrecognized text through `invalidImplParameterAttr`,
+        // which is the channel `mangleAsString` promises. The assert only
+        // added a debug-build trap on a tree public API can construct.
         let diffChar: String? = switch node.text {
         case "sil_implicit_leading_param": "L"
         default: nil

@@ -3153,6 +3153,7 @@ private struct ScalarScanner: ~Escapable {
         var scanOffset = offset
         while scanOffset < bytes.count, UnicodeScalar(bytes[scanOffset]).isDigit {
             // The Swift compiler allows overflow here for malformed inputs, so we're obliged to do the same
+            // wrapping-audited: deliberate parity with upstream, which also lets a malformed digit run wrap; every consumer bounds the result before use.
             result = result &* 10 &+ UInt64(bytes[scanOffset] - UInt8(ascii: "0"))
             scanOffset += 1
         }

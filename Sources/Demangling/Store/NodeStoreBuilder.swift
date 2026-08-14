@@ -86,6 +86,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     private static func mintStoreTag() -> UInt16 {
         #if DEBUG
         return nextStoreTag.withLockUnchecked { storedTagValue in
+            // wrapping-audited: debug-only issuance counter — after 65_536 builders the tags repeat, which weakens the diagnostic but stays correct.
             storedTagValue &+= 1
             return storedTagValue
         }
@@ -548,6 +549,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     /// negative values it can produce — is harmless, and slot distribution is
     /// identical on both word sizes.
     private static func mix(_ currentHash: UInt64, _ value: UInt64) -> UInt64 {
+        // wrapping-audited: hash mixing — see the doc above; consumers mask, so wrapped and truncated values are both fine.
         (currentHash &* 0x9E3779B1) &+ value
     }
 
@@ -559,6 +561,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func internCanonicalCompact(_ compact: CompactNode) -> UInt32 {
+        // wrapping-audited: load-factor test; both operands are bounded by allocated slots, which cannot approach Int.max / 4.
         if (compactCount &+ 1) &* 4 >= compactSlots.count &* 3 {
             growCompactSlots()
         }
@@ -620,6 +623,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func internManyChildren(kind: Node.Kind, childIndices: [UInt32]) -> UInt32 {
+        // wrapping-audited: load-factor test; both operands are bounded by allocated slots, which cannot approach Int.max / 4.
         if (manyChildrenCount &+ 1) &* 4 >= manyChildrenSlots.count &* 3 {
             growManyChildrenSlots()
         }
@@ -683,6 +687,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         // pinned rather than left as `Int`.
         var combined: UInt64 = 0xCBF2_9CE4_8422_2325
         for byte in bytes {
+            // wrapping-audited: FNV-1a, whose definition is arithmetic modulo 2^64.
             combined = (combined ^ UInt64(byte)) &* 0x100_0000_01B3
         }
         return Int(truncatingIfNeeded: combined)
@@ -718,6 +723,7 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
     }
 
     private mutating func internText(_ textValue: String) -> TextLocation {
+        // wrapping-audited: load-factor test; both operands are bounded by allocated slots, which cannot approach Int.max / 4.
         if (uniqueTexts.count &+ 1) &* 4 >= textSlots.count &* 3 {
             growTextSlots()
         }
