@@ -3381,7 +3381,10 @@ extension Remangler {
     }
 
     private mutating func mangleImplDifferentiabilityKind(_ node: Node, depth: Int) throws(ManglingError) {
-        if let index = node.index, let scalar = UnicodeScalar(UInt32(index)) {
+        // `UInt32(index)` trapped for an index above UInt32.max. Mangling is
+        // a typed-throws API whose contract is to reject malformed trees, so
+        // an out-of-range index has to reach that channel, not abort.
+        if let index = node.index, let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) {
             append(Character(scalar))
         }
     }
@@ -4087,7 +4090,7 @@ extension Remangler {
     // MARK: - Node Index Methods (8 methods)
 
     private mutating func mangleAutoDiffFunctionKind(_ node: Node, depth: Int) throws(ManglingError) {
-        guard let index = node.index, let scalar = UnicodeScalar(UInt32(index)) else {
+        guard let index = node.index, let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) else {
             throw .invalidNodeStructure(node, message: "AutoDiffFunctionKind has no index")
         }
         append(Character(scalar))
@@ -4103,7 +4106,7 @@ extension Remangler {
             throw .invalidNodeStructure(node, message: "DifferentiableFunctionType has no index")
         }
         append("Yj")
-        if let scalar = UnicodeScalar(UInt32(index)) {
+        if let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) {
             append(Character(scalar))
         }
     }
@@ -6052,7 +6055,7 @@ extension Node {
 
     fileprivate var character: Character {
         get throws(ManglingError) {
-            if let index, let scalar = UnicodeScalar(UInt32(index)) {
+            if let index, let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) {
                 return Character(scalar)
             } else {
                 throw .genericError("")

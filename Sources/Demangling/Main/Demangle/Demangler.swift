@@ -312,8 +312,16 @@ extension Demangler {
             } else if c.isUpper {
                 return try pushMultiSubstitutions(repeatCount: repeatCount, index: Int(c.value - UnicodeScalar("A").value))
             } else if c == "_" {
-                let idx = repeatCount + 27
-                return try require(substitutions.at(idx))
+                // `repeatCount` still carries whatever `demangleNatural`
+                // parsed, all the way to `Int.max` — the bound below only
+                // covers the narrowing. Upstream reads that same number as an
+                // index into the substitution table, so this addition is the
+                // last place the parsed value is unbounded, and a trapping `+`
+                // here kills the host process: `demangleAsNode` is public API
+                // fed untrusted strings and `try?` cannot catch a trap.
+                let (substitutionIndex, additionOverflowed) = repeatCount.addingReportingOverflow(27)
+                try require(!additionOverflowed)
+                return try require(substitutions.at(substitutionIndex))
             } else {
                 try scanner.backtrack()
                 // Upstream bails here (`RepeatCount = demangleNatural(); if

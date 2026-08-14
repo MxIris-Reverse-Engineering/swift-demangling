@@ -1511,10 +1511,14 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 
     private mutating func printDifferentiableFunctionType(_ name: SomeNode) {
         target.write("@differentiable")
-        switch UnicodeScalar(UInt8(name.index ?? 0)) {
-        case "f": target.write("(_forward)")
-        case "r": target.write("(reverse)")
-        case "l": target.write("(_linear)")
+        // `UInt8(name.index ?? 0)` trapped for any index above 255, inside a
+        // public non-throwing API with no error channel to reject it. The
+        // failable `Differentiability` initializer is the spelling
+        // `printDifferentiabilityWitness` ten lines below already uses.
+        switch Differentiability(name.index ?? 0) {
+        case .forward: target.write("(_forward)")
+        case .reverse: target.write("(reverse)")
+        case .linear: target.write("(_linear)")
         default: break
         }
     }
@@ -2185,7 +2189,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             startIndex += 1
         }
         if name.children.at(startIndex)?.kind == .differentiableFunctionType {
-            diffKind = UnicodeScalar(UInt8(name.children.at(startIndex)?.index ?? 0))
+            // Same narrowing trap as `printDifferentiableFunctionType`; an
+            // index that names no differentiability leaves `diffKind` at its
+            // initial scalar, which the switch below already ignores.
+            diffKind = Differentiability(name.children.at(startIndex)?.index ?? 0)?.rawValue ?? UnicodeScalar(0)
             startIndex += 1
         }
         var thrownErrorNode: SomeNode?

@@ -1068,4 +1068,97 @@ struct DefectRegressionTests {
             #expect(closure.print(using: .default) == "closure #1 () -> () in main.f() -> ()")
         }
     }
+
+    /// The substitution-index addition in `demangleMultiSubstitutions`, which
+    /// the previous round's bound did not cover: it constrained only the
+    /// narrowing of the parsed number, leaving `repeatCount + 27` twenty lines
+    /// below to overflow on the top 27 values of `Int`.
+    ///
+    /// `main` traps on the same inputs. The behavioral guard has to be here
+    /// because the source scan cannot see an operand that reached the addition
+    /// through a variable.
+    @Test func multiSubstitutionIndexAdditionDoesNotTrap() async throws {
+        await #expect(processExitsWith: .success) {
+            // Int.max, and the first value whose `+ 27` leaves the range.
+            for mangled in ["$sA9223372036854775807_", "$sA9223372036854775781_"] {
+                #expect(throws: DemanglingError.self) {
+                    _ = try demangleAsNode(mangled)
+                }
+            }
+            // One below the boundary still rejects through the ordinary
+            // substitution lookup, so the fix did not move the accepted range.
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$sA9223372036854775780_")
+            }
+        }
+    }
+
+    /// Punycode decoding accumulated the encoded number with wrapping
+    /// arithmetic, so an uppercase digit run (values 26-51 never satisfy
+    /// `digit < t`) drove the weight past Int64 and left the insertion point
+    /// negative — `Array.insert(_:at:)` then trapped on a negative index.
+    ///
+    /// `main` traps on all three. The symbols are ordinary identifier
+    /// manglings, so they arrive through plain `demangleAsNode`. Each runs in
+    /// its own child process so a regression names the input that brought the
+    /// trap back. That well-formed punycode still decodes is the corpus
+    /// suite's job — it carries the real identifiers.
+    @Test func punycodeAccumulationOverflowIsRejected() async throws {
+        await #expect(processExitsWith: .success) {
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$s0022ab_bbZZZZZZZZZZZZZZZZa")
+            }
+        }
+        await #expect(processExitsWith: .success) {
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$s0044ZZZZZZZZZZZZZZZZZZZZZaZZZZZZZZZZZZZZZZZZZZZa")
+            }
+        }
+        await #expect(processExitsWith: .success) {
+            #expect(throws: DemanglingError.self) {
+                _ = try demangleAsNode("$s4main0021aJJJJJJJJJJJJJJJJJJJbyyF")
+            }
+        }
+    }
+
+    /// Differentiability payloads are narrowed to a single byte on the way to
+    /// a `UnicodeScalar`. `print(using:)` is public and non-throwing, so an
+    /// index above 255 has to fall back to printing nothing rather than
+    /// aborting the process.
+    ///
+    /// Both indices come from public node construction, and `main` traps on
+    /// both. The witness printer next to these sites already used the
+    /// failable initializer; these two spellings did not.
+    @Test func differentiabilityPayloadPrintingDoesNotTrap() async throws {
+        await #expect(processExitsWith: .success) {
+            let outOfRange = Node.create(kind: .differentiableFunctionType, index: 300)
+            #expect(outOfRange.print(using: .default) == "@differentiable")
+
+            let wrapped = Node.create(kind: .functionType, children: [outOfRange])
+            _ = wrapped.print(using: .default)
+
+            // An in-range payload still renders its annotation.
+            let reverse = Node.create(kind: .differentiableFunctionType, index: UInt64(UnicodeScalar("r").value))
+            #expect(reverse.print(using: .default) == "@differentiable(reverse)")
+        }
+    }
+
+    /// The remangler's counterpart: `mangleAsString` is a typed-throws API
+    /// whose contract is to reject malformed trees, so an index that does not
+    /// fit a `UnicodeScalar` must reach that channel instead of trapping.
+    ///
+    /// `main` traps on both kinds.
+    @Test func differentiabilityPayloadManglingDoesNotTrap() async throws {
+        await #expect(processExitsWith: .success) {
+            let outOfRangeIndex = UInt64(UInt32.max) + 5
+            for kind in [Node.Kind.differentiableFunctionType, .autoDiffFunctionKind] {
+                let node = Node.create(kind: kind, index: outOfRangeIndex)
+                // Either outcome is acceptable — a `ManglingError` or a
+                // mangling that simply omits the unrepresentable payload.
+                // What must not happen is a trap.
+                _ = try? mangleAsString(node)
+                _ = canMangle(node)
+            }
+        }
+    }
 }

@@ -332,7 +332,10 @@ extension TypeDecoderEngine {
                   let indexValue = node.children[1].index else {
                 throw TypeLookupError(node: node, message: "invalid generic param type")
             }
-            return builder.createGenericTypeParameterType(depth: Int(depthValue), index: Int(indexValue))
+            guard let parameterDepth = Int(exactly: depthValue), let parameterIndex = Int(exactly: indexValue) else {
+                throw TypeLookupError(node: node, message: "generic param depth/index out of range")
+            }
+            return builder.createGenericTypeParameterType(depth: parameterDepth, index: parameterIndex)
 
         case .escapingObjCBlock,
              .objCBlock,
@@ -395,7 +398,10 @@ extension TypeDecoderEngine {
                     throw TypeLookupError(node: node.children[firstChildIndex], message: "missing differentiability index")
                 }
 
-                diffKind = FunctionMetadataDifferentiabilityKind(from: UInt8(rawValue))
+                guard let narrowedRawValue = UInt8(exactly: rawValue) else {
+                    throw TypeLookupError(node: node.children[firstChildIndex], message: "differentiability index out of range")
+                }
+                diffKind = FunctionMetadataDifferentiabilityKind(from: narrowedRawValue)
                 firstChildIndex += 1
             }
 
@@ -563,7 +569,10 @@ extension TypeDecoderEngine {
                         throw TypeLookupError(node: node, message: "missing differentiability index")
                     }
 
-                    let diffKind = ImplFunctionDifferentiabilityKind(from: UInt8(index))
+                    guard let narrowedIndex = UInt8(exactly: index) else {
+                        throw TypeLookupError(node: node, message: "differentiability index out of range")
+                    }
+                    let diffKind = ImplFunctionDifferentiabilityKind(from: narrowedIndex)
                     flags = flags.withDifferentiabilityKind(diffKind)
 
                 case .implEscaping:
@@ -804,7 +813,10 @@ extension TypeDecoderEngine {
                 for reqNode in dependentGenericSignatureNode.children {
                     if reqNode.kind == .dependentGenericParamCount,
                        let index = reqNode.index {
-                        genericParamsAtDepth.append(Int(index))
+                        guard let parameterCount = Int(exactly: index) else {
+                            throw TypeLookupError(node: reqNode, message: "generic param count out of range")
+                        }
+                        genericParamsAtDepth.append(parameterCount)
                     }
                 }
 
@@ -972,13 +984,19 @@ extension TypeDecoderEngine {
             guard let index = node.index else {
                 throw TypeLookupError(node: node, message: "missing index")
             }
-            return builder.createIntegerType(value: Int(index))
+            guard let integerValue = Int(exactly: index) else {
+                throw TypeLookupError(node: node, message: "integer literal out of range")
+            }
+            return builder.createIntegerType(value: integerValue)
 
         case .negativeInteger:
             guard let index = node.index else {
                 throw TypeLookupError(node: node, message: "missing index")
             }
-            return builder.createNegativeIntegerType(value: Int(index))
+            guard let integerValue = Int(exactly: index) else {
+                throw TypeLookupError(node: node, message: "integer literal out of range")
+            }
+            return builder.createNegativeIntegerType(value: integerValue)
 
         case .builtinFixedArray:
             guard node.children.count >= 2 else {
@@ -1446,7 +1464,7 @@ private func decodeRequirements<BuilderType: TypeBuilder, SomeNode: DemanglingNo
                 return
             }
 
-            let protocolKind = InvertibleProtocolKind(rawValue: UInt32(index)) ?? .copyable
+            let protocolKind = UInt32(exactly: index).flatMap { InvertibleProtocolKind(rawValue: $0) } ?? .copyable
             let inverseReq = builder.createInverseRequirement(subjectType: subjectType, kind: protocolKind)
             inverseRequirements.append(inverseReq)
 

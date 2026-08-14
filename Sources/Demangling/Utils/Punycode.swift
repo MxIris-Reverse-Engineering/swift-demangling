@@ -234,12 +234,31 @@ enum Punycode {
 
                 pos = input.index(pos, offsetBy: 1)
 
-                i = i &+ (digit &* w)
+                // Wrapping arithmetic let this accumulator go negative:
+                // uppercase digits (values 26-51) never satisfy `digit < t`,
+                // so `w` kept growing until it wrapped past Int64, and a
+                // negative `i` survives the `% (output.count + 1)` below to
+                // reach `output.insert(_:at:)` as a negative array index.
+                // Upstream rejects the symbol when the accumulation
+                // overflows; do that instead of wrapping.
+                let (scaledDigit, digitScalingOverflowed) = digit.multipliedReportingOverflow(by: w)
+                guard !digitScalingOverflowed else {
+                    throw DemanglingError.punycodeParseError
+                }
+                let (accumulatedValue, accumulationOverflowed) = i.addingReportingOverflow(scaledDigit)
+                guard !accumulationOverflowed else {
+                    throw DemanglingError.punycodeParseError
+                }
+                i = accumulatedValue
                 let t = max(min(k - bias, alphaCount), 1)
                 if digit < t {
                     break
                 }
-                w = w &* (symbolCount - t)
+                let (scaledWeight, weightScalingOverflowed) = w.multipliedReportingOverflow(by: symbolCount - t)
+                guard !weightScalingOverflowed else {
+                    throw DemanglingError.punycodeParseError
+                }
+                w = scaledWeight
             }
 
             // Bias adaptation function
@@ -253,7 +272,14 @@ enum Punycode {
             k += (symbolCount * delta) / (delta + symbolCount + 2)
 
             bias = k
-            n = n + i / (output.count + 1)
+            // `i` is bounded now but can still sit near `Int.max`, and `n`
+            // only ever grows, so the last unguarded addition in this loop
+            // gets the same treatment.
+            let (advancedCodePoint, advanceOverflowed) = n.addingReportingOverflow(i / (output.count + 1))
+            guard !advanceOverflowed else {
+                throw DemanglingError.punycodeParseError
+            }
+            n = advancedCodePoint
             i = i % (output.count + 1)
             var scalarValue = n
             if scalarValue >= 0xD800, scalarValue < 0xD880 {
