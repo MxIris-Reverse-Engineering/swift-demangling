@@ -70,3 +70,10 @@
 | **`<<too complex>>`** | 打印时触到深度上限的标记，表示这里主动放弃了，不是输出错误。 |
 | **视图钉扎（view pinning）** | 0010 的读取纪律：walk 入口把 store 当前的缓冲描述符（`BufferView`，三组基址+长度）解析一次、`withUnsafePointer` 钉住整个 walk。冻结 store 的描述符恒定，钉扎等于免费；共享 store 的描述符会随增长更新，钉扎保证一个 walk 全程读同一份一致视图。 |
 | **退休缓冲（retired buffer）** | `SharedNodeStore` 增长时被换下的旧缓冲代。不释放而是挂进保活链——已被钉住的旧视图可能还在读它。倍增策略下退休总量 < 当前缓冲一倍；预留到位时增长不发生、退休链恒空。整链随 store 一起释放。 |
+
+## Swift 语言层面的坑（踩过才知道的）
+
+| 说法 | 意思 |
+|---|---|
+| **raw-value enum 的 `Hashable` 见证（witness）** | `enum Kind: String` 这类**带 raw value** 的枚举，`Hashable` 的见证来自标准库的 `RawRepresentable where RawValue: Hashable` 扩展，而不是编译器为枚举合成的那份——所以哈希的是**用例名字符串**，不是用例序号。实测 `hasher.combine(RawKind.beta)` 与 `hasher.combine("beta")` 摘要相同，而无 raw value 的枚举匹配 `hasher.combine(1)`。后果：把这种枚举当字典键放进热路径，每次查找都在做 SipHash 字符串哈希。本库的 `Node.Kind` 正是 `String` raw-value 枚举，`CompactNode` 的 kind→序号查表因此比 `switch` 慢约 60 倍（per-op；对账到 23.4 万符号的构建总量约占 0.6–1%，所以是清理项不是热点）。**新增以 raw-value 枚举为键的字典前先量一下。** |
+| **`assert` 与「校验调用方数据」** | `assert` 在 release 构建里整个消失，所以**只能**用来校验自身的内部不变量，绝不能用来校验调用方传进来的数据——后者在 release 下等于没有检查，紧跟其后的不安全操作（数组下标、强制解包）会直接 trap，而 trap 是 `try?` 接不住的进程终止。公共 API 的正确工具是 `guard` + `throw`。本库为此栽过两次（PR #7 第一轮 `mangleDependentGenericParamValueMarker`、第三轮 `getChildOfType`）。 |

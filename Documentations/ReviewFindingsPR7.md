@@ -261,3 +261,83 @@ assert（substitution 合并的 buffer 状态等 11 处）保留不动，那是 
 看见它。
 
 黑名单降级为「已修拼写的回归钉」保留，这是它唯一称职的角色。
+
+---
+
+# 第三轮（`max` 档全量复审，2026-08-16）
+
+## 元信息
+
+| 项 | 值 |
+|---|---|
+| 审查目标 | PR #7 `feature/node-store` @ `2624d14` |
+| 对比基线 | `next` @ `04c959b` |
+| 审查日期 | 2026-08-15 |
+| 复审 | 同仓库第二个 agent 会话独立复核（自建 head/base 只读 worktree、无执行证据条目自建 release 探针、上游 `swift-demangle` 对拍、git 考古） |
+| 结论 | 15 条主发现**无一误报**；复审推翻本轮 1 条重提、订正 2 条新旧定性、加强 1 条 |
+
+## 复审订正的三处（记录以免再犯）
+
+1. **两条的新旧定性反了**：`PhysicalFootprintSampler.swift` 与 `CMallocCounter.c`
+   在 `next` 上**不存在**（`git ls-tree` 为空），是 PR 新引入，初审记成了旧账。
+2. **`stripManglePrefix` 重提不成立**：见 [KnownIssues N14](KnownIssues.md) 的
+   2026-08-16 段。初审只读了 N14 第一段，漏了第二段已对该行为本身做过知情 won't-fix。
+3. **一处连带影响点名错**：`NodeStoreTests.storeBackedPrintingDoesNotPopulateTheGlobalCache`
+   自带防碰撞设计（唯一模块名探针、不断言 cache count），不受全局缓存被撑大的影响；
+   泛化结论仍成立但受害者不是它。量级也偏高：进缓存的只有叶子，实测唯一节点平铺
+   8.75 MB，对象化后是几十 MB 而非「几百 MB」。
+
+## 处置索引
+
+**已修（本批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| 1 | `Remangler.getChildOfType` 用 `assert` 校验输入树后无条件读 `children[0]`；release 下 assert 消失、下标 trap，从公共 `canMangle` 杀掉进程（exit 133） | `DefectRegressionTests.remanglingAChildlessTypeWrapperFailsInsteadOfTrapping` |
+| 2 | `printSpecializationPrefix` 的访问计数在 `if` 之外自增，而读 latch 的只有 `if` 内分支；`.default` 下计数照动，`printName` 的缓存写入守卫对该节点及全部祖先失败 | `DefectRegressionTests.aSpecializationNodeDoesNotDisableTheFragmentCache` |
+| 3 | 打印深度守卫 `>` 改写成 `<` 少一层（769 而非 770 帧截断），与上游及基线不一致 | `DefectRegressionTests.theDeepestFullyPrintedChainMatchesTheDocumentedBudget`（release-only，见 #4） |
+| 4 | `conditionalInt` 环绕累加把溢出数字串当合法值接受；上游对拍证伪「与上游对齐」的辩护 | `DefectRegressionTests.anOverflowingDigitRunIsRejectedRatherThanWrapped`；[KnownIssues #1](KnownIssues.md) 已更新 |
+| 5（一半） | `" in "` / `" of "` 分隔词继承外层 nominal 的 scope（归属颠倒） | `NodePrinterScopeTests.contextSeparatorsCarryNoTypeReferenceScope` |
+| 6 | `.otherNominalType` 走相同 `printEntity` 调用却不 push scope | `NodePrinterScopeTests.otherNominalTypeGetsTheSameScopeAsOtherNominals` |
+| 7 | 验收测试基线用 `internsSubtrees: false` 却仍把全语料叶子钉进 `NodeCache.shared`；改用 `demangleAsNodeTransient`（附带：该套件耗时 471s → 308s） | 无（行为修正，由既有套件覆盖） |
+| 8 | `Node.create` / `NodeCache.intern` 的 `text`+`children` 组合静默丢弃 contents，且 intern 键把不同 text 的请求合并成同一实例 | 编译期——不可能的重载已删除，非法组合无法拼写 |
+| 9 | 提案总验收里构造上恒真的断言（同族此前已删过两次，独漏这处）；改为 `Issue.record` | 无（断言本身即产物） |
+| 10 | 三处文档声称「公共 API 零破坏」，与三处刻意破坏矛盾 | 无（文档）；见 [NodeStoreArena.md](NodeStoreArena.md) 源码兼容性一节 |
+| 11 | `PhysicalFootprintSampler` 用 `Thread.start()`（失败静默）+ `stop()` 无限等信号量；四个调用点无 `defer` 配对 | 改用带检查的 `pthread_create`；调用点加 `defer` |
+| 12 | `CMallocCounter` 不平衡 `stop()` 的回滚使深度瞬时为负，并发 `start()` 误判嵌套 | `MallocCounterConcurrencyTests`（env-gated）；见下「无法测试的部分」 |
+| 13 | `reserveCapacity` 的 2^30 钳制注释不实（trap 只是换了地方） | 无（注释如实化）；真修法进 0012 |
+| 小 | 验收测试的墙钟比值断言放在非 `.serialized` 常开套件 | 改为打印提示 |
+| 小 | `internTree` 的 per-walk memo 漏了叶子分支 | 无（有界代价，一行） |
+| 小 | `hasChildren` 在 `Node` 上走 `!children.isEmpty`，每次调用重建 `Children` 并 retain | `DefectRegressionTests.hasChildrenAgreesWithTheChildCount` |
+
+**转入提案**：条目 5 的另一半（scope 与 printCache 不组合）、通用遍历 API 的视图钉扎、
+scope hook 从 kind 清单改为挂机制、`reserveCapacity` 按字节预算封顶、重复代码收敛
+（含 N13 的合格关闭）——全部进
+[`Evolutions/0012`](../Evolutions/0012-review-round-three-structural-followups.md)。
+
+**转入 KnownIssues**：N14 维持原判并补记（重提不成立）；N13 重开为「限期收敛」（上次
+关闭方式不满足其自订标准）；#1 的字符串级可达链已切断，条目降级不关闭。
+
+## 本轮的两个方法论产物
+
+**其一：把修复逐条回退，确认测试真的会红。** 四条修复回退后，四个新测试全部按预测
+失败，且失败值与预测一致（缓存那条：131072 次写 = 2^16 × 2，正是按路径计价的数）。
+写了测试不等于测住了——只有见过它红，才知道它盯的是什么。`getChildOfType` 那条是反
+例：回退后的行为是**进程 trap**，会杀掉测试进程而不是报失败，这恰恰是它必须改成
+throw 的理由。
+
+**其二：写测试的过程本身找出了一条新缺陷。** 为 `CMallocCounter` 写并发测试时，测试
+在**修复到位的情况下仍然失败**——查明原因不是修复没生效，而是深度计数器有一个更大的
+设计缺口：一个多余的 `stop()` 撞上别人正开着的窗口时（depth == 1），会走
+`previous_depth == 1` 分支**把别人的 hook 摘掉**，修复前后行为完全相同，因为深度计数
+器区分不了「谁的 stop」。关闭它需要窗口所有权（`start()` 发 token、`stop()` 出示），
+不是更好的计数器。当前 `ExclusiveMeasurementWindow` 用一把锁串行化所有窗口使其不可
+达，属对未来调用方的潜在风险，已记在 `MallocCounterConcurrencyTests` 的文件注释里。
+
+## 无法测试的部分（如实登记）
+
+- **finding 12 的竞态本身**：需要让 `start()` 停在不平衡 `stop()` 的两条指令之间，没有
+  这个 seam；采样深度也看不见这么窄的窗口。修复站在构造上（只减正值的 CAS 永不为负），
+  不站在复现上。
+- **finding 3 的深度边界**：debug 构建约 745 帧就爆栈（KnownIssues #4），768 的边界只能
+  在 release 测试构建里跑。测试用 `#if DEBUG` 跳过，`swift test -c release` 时生效。
