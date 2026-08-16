@@ -1513,4 +1513,49 @@ struct DefectRegressionTests {
     // asserted on the printed text rather than on rendering work: on the
     // latch-consulting branch only the first visit writes anything, so a write
     // count says nothing about how many times the walk got there.
+
+    // MARK: - PR #7 review, finding 3: the print depth budget lost a level
+
+    /// A chain of `depth` nested `.type` wrappers over one leaf.
+    private static func nestedTypeChain(depth: Int) -> Node {
+        var currentNode = Node.createTransient(kind: .identifier, text: "Leaf")
+        for _ in 0 ..< depth {
+            currentNode = Node.createTransient(kind: .type, children: [currentNode])
+        }
+        return currentNode
+    }
+
+    /// The guard was rewritten from `if printDepth > maxPrintDepth` to
+    /// `guard printDepth < maxPrintDepth`. `printDepth` is still the enclosing
+    /// frame count at that point (the increment is below it), so upstream's
+    /// `if (depth > MaxDepth)` over a depth-0 root truncates on the 770th
+    /// frame while `<` truncated on the 769th — one level off a budget that was
+    /// deliberately restored from 512 to 768 because real symbols were being
+    /// truncated.
+    ///
+    /// Release-only by necessity: an unoptimized build overflows an 8MB stack
+    /// somewhere around 745 `printName` frames, so exercising a 768-frame
+    /// boundary in a debug test crashes the process instead of failing it
+    /// (`Documentations/KnownIssues.md` #4). Run with `swift test -c release`.
+    @Test func theDeepestFullyPrintedChainMatchesTheDocumentedBudget() throws {
+        #if DEBUG
+        // Intentionally not exercised: see the note above. Kept as a live test
+        // rather than a comment so `swift test -c release` picks it up.
+        #else
+        let budget = DemanglingPrinter<String, Node>.maxPrintDepth
+        let truncationMarker = "<<too complex>>"
+
+        let deepestAccepted = Self.nestedTypeChain(depth: budget)
+        #expect(
+            !deepestAccepted.print(using: .default).contains(truncationMarker),
+            "a \(budget)-link chain is inside the documented budget and must print in full"
+        )
+
+        let firstRejected = Self.nestedTypeChain(depth: budget + 1)
+        #expect(
+            firstRejected.print(using: .default).contains(truncationMarker),
+            "a \(budget + 1)-link chain is past the budget and must truncate"
+        )
+        #endif
+    }
 }

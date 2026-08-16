@@ -139,7 +139,14 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printName(_ name: SomeNode, asPrefixContext: Bool = false) -> SomeNode? {
-        guard printDepth < Self.maxPrintDepth else {
+        // `<=`, not `<`: `printDepth` is still the *enclosing* frame count here
+        // (the increment is below), so upstream's `if (depth > MaxDepth)` with a
+        // depth-0 root truncates on the 770th frame. Spelling this `<` shaved a
+        // level off the budget — the direction the comment on `maxPrintDepth`
+        // argues against at length, since the limit was restored from 512 to 768
+        // precisely because real symbols were being truncated
+        // (PR #7 review, finding 3).
+        guard printDepth <= Self.maxPrintDepth else {
             // Matches the C++ printer's behaviour when it hits `MaxDepth`: emit
             // the marker in place and unwind this path only, so siblings of the
             // too-deep path still print.
