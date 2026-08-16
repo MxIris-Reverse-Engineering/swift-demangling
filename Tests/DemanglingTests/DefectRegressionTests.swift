@@ -1412,4 +1412,105 @@ struct DefectRegressionTests {
             try demangleAsNode("$sBi4096_")
         }
     }
+
+    // MARK: - PR #7 review, finding 2: the fragment cache disabled by a counter
+
+    /// Counts real rendering work. `write` is recorded in walk-global state
+    /// rather than in the target, because targets are value types that the
+    /// printer swaps and splices: counting inside `append` would re-count a
+    /// replayed cache fragment and hide exactly the effect under test.
+    private final class PrintWorkCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recordedWrites = 0
+
+        func recordWrite() {
+            lock.lock()
+            recordedWrites += 1
+            lock.unlock()
+        }
+
+        func reset() {
+            lock.lock()
+            recordedWrites = 0
+            lock.unlock()
+        }
+
+        var writeCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return recordedWrites
+        }
+    }
+
+    private static let printWorkCounter = PrintWorkCounter()
+
+    /// Mirrors `String`'s writing behaviour but keeps only the character count,
+    /// so a deliberately path-exponential tree cannot blow the test's memory
+    /// while the pre-fix walk is running.
+    private struct WriteCountingTarget: NodePrinterTarget {
+        var count: Int = 0
+
+        init() {}
+
+        mutating func write(_ content: String) {
+            count += content.count
+            DefectRegressionTests.printWorkCounter.recordWrite()
+        }
+
+        mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
+            write(content)
+        }
+
+        mutating func append(_ other: WriteCountingTarget) {
+            count += other.count
+        }
+
+        mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
+    }
+
+    /// `levels` nested two-element `.typeList`s over one shared instance:
+    /// 2^levels paths, `levels + 1` unique nodes. A childless
+    /// `.genericSpecialization` sits at the bottom, so every ancestor's
+    /// rendering routes through `printSpecializationPrefix`.
+    private static func doublingListOverASpecializationNode(levels: Int) -> Node {
+        var currentNode = Node.createTransient(kind: .genericSpecialization)
+        for _ in 0 ..< levels {
+            currentNode = Node.createTransient(kind: .typeList, children: [currentNode, currentNode])
+        }
+        return currentNode
+    }
+
+    /// `printSpecializationPrefix` bumped its visit counter on entry, but the
+    /// counter exists to mark fragments whose rendering *consulted the one-shot
+    /// latch* — and the latch is only read on the branch taken when the options
+    /// omit `.displayGenericSpecializations`. `.default` contains that option,
+    /// so under it the counter moved on a path that never touches the latch,
+    /// and `printName`'s cache-write guard (which compares the walk-global
+    /// counter before and after) then refused to memoize the specialization
+    /// node *and every ancestor up to the root*.
+    ///
+    /// With the cache intact the walk renders `levels + 1` unique nodes; with it
+    /// defeated it renders one node per path. Asserted as rendering work rather
+    /// than wall-clock so the test is deterministic.
+    @Test func aSpecializationNodeDoesNotDisableTheFragmentCache() throws {
+        let levels = 16
+        let root = Self.doublingListOverASpecializationNode(levels: levels)
+
+        Self.printWorkCounter.reset()
+        _ = NodePrinter<WriteCountingTarget>.print(root, using: .default)
+        let writesWithCacheIntact = Self.printWorkCounter.writeCount
+
+        #expect(writesWithCacheIntact < 1000, """
+            the print walk did \(writesWithCacheIntact) writes over \(levels + 1) unique nodes \
+            (2^\(levels) paths) — the fragment cache is not memoizing the specialization node's ancestors
+            """)
+    }
+
+    // The correctness half of the same counter — that a fragment which *did*
+    // consult the latch stays out of the cache, so the one-shot "specialized "
+    // prefix is not replayed at a position that must not have it — is pinned by
+    // `sharedSpecializationSubtreePrintsThePrefixOnce` above. It has to be
+    // asserted on the printed text rather than on rendering work: on the
+    // latch-consulting branch only the first visit writes anything, so a write
+    // count says nothing about how many times the walk got there.
 }

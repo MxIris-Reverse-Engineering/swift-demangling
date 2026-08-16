@@ -2054,8 +2054,16 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printSpecializationPrefix(_ name: SomeNode, description: String, paramPrefix: String = "") {
-        specializationPrefixVisitCount += 1
         if !options.contains(.displayGenericSpecializations) {
+            // Counted here, not on entry: the counter exists to mark fragments
+            // whose rendering *consulted the latch* (its own doc comment says
+            // so), and the latch is read nowhere else. `.default` contains
+            // `.displayGenericSpecializations`, so bumping it on entry moved the
+            // counter on a path that never touches the latch, and `printName`'s
+            // cache-write guard then failed for this node and every ancestor up
+            // to the root. `truncationCount`, the sibling counter, already sits
+            // inside its branch (PR #7 review, finding 2).
+            specializationPrefixVisitCount += 1
             if !specializationPrefixPrinted {
                 if name.children.first?.kind == .representationChanged {
                     target.write("representation changed of ")
