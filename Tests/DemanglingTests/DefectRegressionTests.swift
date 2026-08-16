@@ -1350,4 +1350,34 @@ struct DefectRegressionTests {
             \(unaudited.sorted().joined(separator: "\n"))
             """)
     }
+
+    // MARK: - PR #7 review, finding 1: remangler traps on a caller-supplied tree
+
+    /// `getChildOfType` asserted the shape and then read `children[0]`
+    /// unconditionally. Asserts vanish in release, so a childless `.type`
+    /// reached the subscript and trapped: `Index 0 out of range for empty
+    /// Node.Children`, an unrecoverable process abort (exit 133 on an optimized
+    /// build) raised from `canMangle`, whose entire contract is to answer this
+    /// question without failing. `try?` cannot catch a trap, so no caller could
+    /// defend against it.
+    ///
+    /// Both shapes below are buildable from public API and reach the helper
+    /// through different callers — `.protocolConformance` via
+    /// `mangleProtocolConformance`, `.dependentMemberType` via
+    /// `mangleConstrainedType`.
+    @Test func remanglingAChildlessTypeWrapperFailsInsteadOfTrapping() throws {
+        let childlessType = Node.createTransient(kind: .type)
+
+        let conformance = Node.createTransient(kind: .protocolConformance, children: [childlessType])
+        #expect(!canMangle(conformance))
+        #expect(throws: ManglingError.self) { try mangleAsString(conformance) }
+
+        let dependentMember = Node.createTransient(kind: .type, children: [
+            Node.createTransient(kind: .dependentMemberType, children: [
+                childlessType,
+                Node.createTransient(kind: .identifier, text: "Element"),
+            ]),
+        ])
+        #expect(!canMangle(dependentMember))
+    }
 }

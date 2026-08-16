@@ -2709,10 +2709,18 @@ extension Remangler {
         try mangleChildNodes(proto, depth: depth + 1)
     }
 
-    private func getChildOfType(_ node: Node) -> Node {
-        assert(node.kind == .type)
-        assert(node.children.count == 1)
-        return node.children[0]
+    /// The child of a `.type` wrapper.
+    ///
+    /// The shape used to be asserted and then read unconditionally. Asserts are
+    /// compiled out of release builds, so a caller-supplied childless `.type`
+    /// took the `children[0]` subscript instead and trapped — an unrecoverable
+    /// process abort reached from the public `mangleAsString` and, worse, from
+    /// `canMangle`, whose whole contract is to answer that question without
+    /// failing. `try?` cannot catch a trap in either configuration. The
+    /// throwing subscript is this file's standard shape for reading a
+    /// caller-supplied tree (PR #7 review, finding 1).
+    private func getChildOfType(_ node: Node) throws(ManglingError) -> Node {
+        try node[_child: 0]
     }
 
     // MARK: - Metadata Descriptors
@@ -5216,7 +5224,7 @@ extension Remangler {
         var node = node
         var resultNode: Node? = node
         if node.kind == .type {
-            node = getChildOfType(node)
+            node = try getChildOfType(node)
             resultNode = node
         }
 
