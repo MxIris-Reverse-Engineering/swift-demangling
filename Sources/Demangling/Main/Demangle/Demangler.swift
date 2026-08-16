@@ -3148,13 +3148,32 @@ private struct ScalarScanner: ~Escapable {
 
     /// Consumes digits until a non-digit is encountered, returning the base-10
     /// value, or nil without moving when the current byte is not a digit.
+    ///
+    /// A digit run that does not fit `UInt64` is rejected, not wrapped. The
+    /// wrapping accumulator this replaces made a malformed symbol parse as a
+    /// legal small one — `$sBi18446744073709551617_` printed `Builtin.Int1`,
+    /// byte-identical to `$sBi1_`, with nothing downstream able to tell them
+    /// apart. It was kept on the grounds of parity with upstream, but upstream
+    /// does not wrap: `demangleNatural` detects the overflow (`if (newNum <
+    /// num) return -1000`) and every caller fails on the sentinel, and
+    /// `swift-demangle` refuses the input above. Rejecting at the single
+    /// accumulation point is also what lets the ~40 consumer-side bounds
+    /// checks — whose limits disagree with each other — go away
+    /// (PR #7 review, finding 4).
+    ///
+    /// Overflow throws rather than returning nil: nil means "no digits here,
+    /// offset unmoved", which would leave the digit run in the stream for a
+    /// later production to mis-parse instead of rejecting the symbol.
     mutating func conditionalInt() throws(DemanglingError) -> UInt64? {
         var result: UInt64 = 0
         var scanOffset = offset
         while scanOffset < bytes.count, UnicodeScalar(bytes[scanOffset]).isDigit {
-            // The Swift compiler allows overflow here for malformed inputs, so we're obliged to do the same
-            // wrapping-audited: deliberate parity with upstream, which also lets a malformed digit run wrap; every consumer bounds the result before use.
-            result = result &* 10 &+ UInt64(bytes[scanOffset] - UInt8(ascii: "0"))
+            let digit = UInt64(bytes[scanOffset] - UInt8(ascii: "0"))
+            let (scaledResult, scalingOverflowed) = result.multipliedReportingOverflow(by: 10)
+            guard !scalingOverflowed else { throw DemanglingError.integerOverflow(at: scanOffset) }
+            let (accumulatedResult, accumulationOverflowed) = scaledResult.addingReportingOverflow(digit)
+            guard !accumulationOverflowed else { throw DemanglingError.integerOverflow(at: scanOffset) }
+            result = accumulatedResult
             scanOffset += 1
         }
         if scanOffset == offset {

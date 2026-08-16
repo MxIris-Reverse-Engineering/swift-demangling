@@ -1380,4 +1380,36 @@ struct DefectRegressionTests {
         ])
         #expect(!canMangle(dependentMember))
     }
+
+    // MARK: - PR #7 review, finding 4: an overflowing digit run parsed as legal
+
+    /// The digit accumulator used `&*`/`&+`, so a run that overflows `UInt64`
+    /// was silently accepted as its value modulo 2^64. `2^64 + 1` wrapped to 1
+    /// and the malformed symbol below produced output byte-identical to the
+    /// legitimate `$sBi1_` — nothing downstream could tell them apart.
+    ///
+    /// Upstream does not wrap: `demangleNatural` detects the overflow
+    /// (`if (newNum < num) return -1000`) and every caller fails on the
+    /// sentinel; `swift-demangle` refuses this input.
+    @Test func anOverflowingDigitRunIsRejectedRatherThanWrapped() throws {
+        // 2^64 + 1, one past what `UInt64` holds.
+        #expect(throws: DemanglingError.self) {
+            try demangleAsNode("$sBi18446744073709551617_")
+        }
+        // 2^64 exactly, which wrapped to 0.
+        #expect(throws: DemanglingError.self) {
+            try demangleAsNode("$sBi18446744073709551616_")
+        }
+        // The value the first input used to impersonate still demangles. That
+        // impersonation is the whole mechanism: `demangleBuiltinTypeSize`
+        // already bounds the size at 4096, and wrapping is what carried an
+        // out-of-range run back down into the legal range.
+        let legitimate = try demangleAsNode("$sBi1_")
+        #expect(legitimate.print(using: .default).contains("Builtin.Int1"))
+        // Large-but-representable runs must stay accepted — the rejection is of
+        // runs that do not fit `UInt64`, not of large values.
+        #expect(throws: Never.self) {
+            try demangleAsNode("$sBi4096_")
+        }
+    }
 }

@@ -126,6 +126,25 @@ inverse requirement 的 index 走 `Ri<十进制>_` 语法同理可达；`.depend
 **修法方向**：8 处全部改用 `Int(exactly:)` / `UInt32(exactly:)`，超范围抛
 `TypeLookupError`。
 
+> **2026-08-16 更新：字符串级可达链已切断，本条降级但不关闭（第三轮 review finding 4）。**
+>
+> 上面「从 mangled 字符串可达」整段的前提是 `conditionalInt` 的环绕累加。该累加已改为
+> 溢出即抛 `DemanglingError.integerOverflow`，因此**上表全部 8 处的字符串级触发器全部
+> 失效**——超过 `UInt64` 的数字串在 demangle 阶段就被拒，进不了节点树。上面记录的触发器
+> `$s$9223372036854775807_D` 仍然有效（2^63 在 `UInt64` 内，不触发溢出检测），所以本条
+> **不能关闭**：只是把「任意 `UInt64` 都能从字符串进树」收窄为「任意 `UInt64` 值仍可从
+> 字符串进树，但不能再由更大的数字串绕回构造」，以及手搭树依旧全部可达。8 处
+> `Int(exactly:)` 的修法仍然要做。
+>
+> 附带：`conditionalInt` 那两行注释（「Swift 编译器对畸形输入允许溢出，所以我们有义务
+> 照做」）**前提不成立**，据此把该处列为「刻意与上游对齐」的第三轮 wrapping 审计裁决
+> 一并推翻。上游 `demangleNatural` 有显式溢出检测（`if (newNum < num) return -1000`，
+> 每个调用方都在哨兵值上失败），`demangleBuiltinType` 另有 `size > 4096` 上限，
+> `xcrun swift-demangle`（LLVM 21）实测**拒绝** `$sBi18446744073709551617_`；本库此前
+> 接受它并打印 `Builtin.Int1`，与合法的 `$sBi1_` 逐字节相同。与 N8 同构：前提被证伪，
+> 按本文件契约重新裁决为「修」。回归测试
+> `DefectRegressionTests.anOverflowingDigitRunIsRejectedRatherThanWrapped`。
+
 ## 2. TypeDecoder 公开入口不经 `StackSafeExecutor`，小栈线程上深度守卫失效
 
 `TypeDecoder.decodeMangledType(node:)`（含 `NodeReference` 重载）在调用线程原地执行——
