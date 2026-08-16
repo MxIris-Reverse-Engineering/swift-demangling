@@ -1573,4 +1573,99 @@ struct DefectRegressionTests {
         #expect(Node.createTransient(kind: .typeList, children: [leaf, leaf]).hasChildren)
         #expect(Node.createTransient(kind: .typeList, children: [leaf, leaf, leaf]).hasChildren)
     }
+
+    // MARK: - PR #7 review, fourth round
+
+    /// `mangleDependentGenericInverseConformanceRequirement` read child 1's
+    /// index with `!`. The two-child guard above it does not imply that child
+    /// carries an index, so a caller-assembled tree reached the force-unwrap
+    /// and aborted the process — through `canMangle`, whose entire contract is
+    /// to answer *without* failing, and which `try?` cannot defend because a
+    /// trap is not an error.
+    ///
+    /// Same shape as `remanglingAChildlessTypeWrapperFailsInsteadOfTrapping`;
+    /// that fix swept for `assert`-then-read and missed the `!` spelling.
+    @Test func inverseConformanceWithoutAnIndexThrowsInsteadOfTrapping() async throws {
+        await #expect(processExitsWith: .success) {
+            let node = Node.createTransient(kind: .dependentGenericInverseConformanceRequirement, children: [
+                Node.create(kind: .module, text: "Mod"),
+                Node.create(kind: .identifier, text: "Foo"),
+            ])
+            #expect(canMangle(node) == false)
+            #expect(throws: ManglingError.self) { try mangleAsString(node) }
+        }
+    }
+
+    /// Upstream's `case -1` ends with `return ... // substitution`; this port
+    /// dropped the `return`, so the substitution branch fell through to the
+    /// shared `mangleIndex` below the switch and emitted child 1's index
+    /// twice. Pre-fix these mangle to `3ModRI__` and `3ModRI2_2_`.
+    @Test func inverseConformanceSubstitutionBranchEmitsItsIndexOnce() throws {
+        let zero = Node.createTransient(kind: .dependentGenericInverseConformanceRequirement, children: [
+            Node.create(kind: .module, text: "Mod"),
+            Node.create(kind: .index, index: 0),
+        ])
+        #expect(try mangleAsString(zero) == "3ModRI_")
+
+        let three = Node.createTransient(kind: .dependentGenericInverseConformanceRequirement, children: [
+            Node.create(kind: .module, text: "Mod"),
+            Node.create(kind: .index, index: 3),
+        ])
+        #expect(try mangleAsString(three) == "3ModRI2_")
+
+        // The non-substitution branches keep emitting the index exactly once.
+        let paramType = Node.create(kind: .type, child: Node.create(kind: .dependentGenericParamType, children: [
+            Node.create(kind: .index, index: 0),
+            Node.create(kind: .index, index: 0),
+        ]))
+        let nonNegative = Node.createTransient(kind: .dependentGenericInverseConformanceRequirement, children: [
+            paramType,
+            Node.create(kind: .index, index: 3),
+        ])
+        #expect(try mangleAsString(nonNegative) == "Ri2_z")
+    }
+
+    /// `mangleDependentConformanceIndex` computed `node.index! + 2` on a
+    /// payload that is caller-reachable up to `UInt64.max`, so a near-max
+    /// index aborted the process from both `mangleAsString` and `canMangle`.
+    ///
+    /// The boundary-value matrices cannot see this: they drive each kind bare
+    /// or wrapped in `.type`/`.functionType`/`.tuple`, and this kind is only
+    /// ever reached as a child of `.dependentProtocolConformanceRoot`.
+    @Test func conformanceIndexNearUInt64MaxThrowsInsteadOfTrapping() async throws {
+        await #expect(processExitsWith: .success) {
+            for boundaryIndex in [UInt64.max, UInt64.max - 1, UInt64.max - 2] {
+                let root = Node.createTransient(kind: .dependentProtocolConformanceRoot, children: [
+                    Node.create(kind: .type, child: Node.create(kind: .tuple)),
+                    Node.create(kind: .protocol, children: [
+                        Node.create(kind: .module, text: "M"),
+                        Node.create(kind: .identifier, text: "P"),
+                    ]),
+                    Node.create(kind: .index, index: boundaryIndex),
+                ])
+                _ = try? mangleAsString(root)
+                _ = canMangle(root)
+            }
+        }
+    }
+
+    /// `indexAsCharacter` narrowed a `UInt64` payload with a trapping
+    /// `UInt32(_:)` on a public, non-throwing accessor. `demangleIndex`
+    /// returns values up to `UInt64.max`, so a mangled string reaches it.
+    ///
+    /// `ffd6f87` fixed this exact expression in four other files and missed
+    /// this one; it is also not one of the four consumers the boundary
+    /// matrices drive.
+    @Test func indexAsCharacterAboveUInt32MaxIsNilInsteadOfTrapping() async throws {
+        await #expect(processExitsWith: .success) {
+            #expect(Node.create(kind: .index, index: UInt64(UInt32.max) + 1).indexAsCharacter == nil)
+            #expect(Node.create(kind: .index, index: .max).indexAsCharacter == nil)
+            // Surrogates and out-of-plane values are not scalars either.
+            #expect(Node.create(kind: .index, index: 0xD800).indexAsCharacter == nil)
+            #expect(Node.create(kind: .index, index: 0x11_0000).indexAsCharacter == nil)
+            // A representable payload still round-trips.
+            #expect(Node.create(kind: .index, index: UInt64(UnicodeScalar("r").value)).indexAsCharacter == "r")
+        }
+    }
+
 }

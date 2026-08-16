@@ -4131,7 +4131,20 @@ extension Remangler {
     }
 
     private mutating func mangleDependentConformanceIndex(_ node: Node, depth: Int) throws(ManglingError) {
-        let indexValue = node.index != nil ? node.index! + 2 : 1
+        // Upstream's `+ 2` is unguarded because its index came from the
+        // demangler; here the payload is caller-reachable up to `UInt64.max`,
+        // and an overflow trap is not catchable by `try?` — so it has to reach
+        // the typed-throws channel like every other malformed shape.
+        let indexValue: UInt64
+        if let index = node.index {
+            let (shifted, overflowed) = index.addingReportingOverflow(2)
+            guard !overflowed else {
+                throw .invalidNodeStructure(node, message: "DependentConformanceIndex is out of range")
+            }
+            indexValue = shifted
+        } else {
+            indexValue = 1
+        }
         mangleIndex(indexValue)
     }
 
@@ -4344,11 +4357,24 @@ extension Remangler {
             throw .invalidNodeStructure(node, message: "DependentGenericInverseConformanceRequirement needs 2 children")
         }
 
+        // Upstream reads `getChild(1)->getIndex()` on every path, so a child 1
+        // without an index is a malformed tree. The two-child guard above does
+        // not imply an index payload, and `!` here aborted the process through
+        // `canMangle` — whose contract is to answer *without* failing, and
+        // which `try?` cannot defend because a trap is not an error.
+        guard let requirementIndex = try node[_child: 1].index else {
+            throw .invalidNodeStructure(node, message: "DependentGenericInverseConformanceRequirement child 1 has no index")
+        }
+
         let mangling = try mangleConstrainedType(node[_child: 0], depth: depth + 1)
         switch mangling.numMembers {
         case -1:
             append("RI")
-            try mangleIndex(node[_child: 1].index!)
+            mangleIndex(requirementIndex)
+            // Upstream ends the substitution branch here (`return ...;
+            // // substitution`). Falling through emitted the index a second
+            // time below, mangling `3ModRI2_` as `3ModRI2_2_`.
+            return
         case 0:
             append("Ri")
         case 1:
@@ -4356,9 +4382,7 @@ extension Remangler {
         default:
             append("RJ")
         }
-        if let index = try node[_child: 1].index {
-            mangleIndex(index)
-        }
+        mangleIndex(requirementIndex)
         if let paramIdx = mangling.paramIdx {
             try mangleDependentGenericParamIndex(paramIdx)
         }

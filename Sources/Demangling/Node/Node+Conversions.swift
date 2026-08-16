@@ -31,12 +31,19 @@ extension Node {
         }
     }
 
+    /// The index payload rendered as a `Character`, or `nil` when it does not
+    /// name a Unicode scalar.
+    ///
+    /// `UInt32(index)` trapped for any payload above `UInt32.max`, on a public
+    /// **non-throwing** accessor — so no caller could defend against it, and
+    /// `demangleIndex` returns values up to `UInt64.max`, which makes a
+    /// mangled string enough to reach it. Same expression `ffd6f87` fixed in
+    /// the remangler, printer, type decoder and punycode; this file was missed
+    /// (PR #7 review, fourth round).
     public var indexAsCharacter: Character? {
-        if let index, let scalar = UnicodeScalar(UInt32(index)) {
-            return Character(scalar)
-        } else {
-            return nil
-        }
+        guard let index, let narrowedIndex = UInt32(exactly: index),
+              let scalar = UnicodeScalar(narrowedIndex) else { return nil }
+        return Character(scalar)
     }
 
     @inlinable
