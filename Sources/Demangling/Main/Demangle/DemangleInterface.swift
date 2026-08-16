@@ -6,8 +6,19 @@
 /// through a bottom-up subtree interning (hash-consing) pass, so structurally equal
 /// subtrees across all demangled symbols share a single `Node` instance. This
 /// reduces memory by roughly 4x when demangling a whole binary. Interned nodes are
-/// retained by `NodeCache.shared` until `NodeCache.shared.clear()` is called; pass
-/// `internsSubtrees: false` for one-off demangling that should not grow the cache.
+/// retained by `NodeCache.shared` until `NodeCache.shared.clear()` is called.
+///
+/// - Important: `internsSubtrees: false` is **not** a way to keep the cache from
+///   growing, and this comment used to say it was. It only skips the whole-tree
+///   hash-consing pass; leaf interning happens during the parse under a separate
+///   switch this entry point does not expose, so every unique identifier, module
+///   and index still gets pinned in the never-evicting `NodeCache.shared` for the
+///   process lifetime — and *more* of them, because without the subtree pass the
+///   tree above those leaves is not shared either. For demangling that must leave
+///   no trace in global state, use ``demangleAsNodeTransient(_:isType:symbolicReferenceResolver:)``.
+///   Turn `internsSubtrees` off only when you specifically do not want canonical
+///   (`===`-comparable) subtrees, e.g. when the result is about to be mutated
+///   through a `NodeBuilder` or handed to a `NodeStoreBuilder` that interns again.
 ///
 /// Error positions carried by thrown ``DemanglingError`` values are byte offsets
 /// into the mangled input (proposal 0008). Mangled symbols are ASCII, so for any
@@ -33,7 +44,7 @@
 /// - Parameters:
 ///   - mangled: the string to be parsed ("isType` is false, the string should start with a Swift Symbol prefix, _T, _$S or $S).
 ///   - isType: if true, no prefix is parsed and, on completion, the first item on the parse stack is returned.
-///   - internsSubtrees: if true, the resulting tree is canonicalized through `NodeCache.shared` so equal subtrees are shared.
+///   - internsSubtrees: if true, the resulting tree is canonicalized through `NodeCache.shared` so equal subtrees are shared. Turning it off does **not** reduce what the cache retains — see the note above.
 /// - Returns: the successfully parsed result
 /// - Throws: a SwiftSymbolParseError error that contains parse position when the error occurred.
 public func demangleAsNode(_ mangled: String, isType: Bool = false, symbolicReferenceResolver: DemangleSymbolicReferenceResolver? = nil, internsSubtrees: Bool = true) throws(DemanglingError) -> Node {

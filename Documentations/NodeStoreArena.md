@@ -56,7 +56,7 @@ struct 的价值在于**精确布局 + 可平铺进连续缓冲**，所以正确
 ## 源码兼容性
 
 `NodeBuilder`、`demangleAsNode`、`TypeDecoder<Builder>`、`TypeBuilder` 的签名与行为保持。
-**有六处刻意的源码破坏**，影响自己实现 `NodePrinterTarget`、直接构造 printer、或手工组装
+**有七处刻意的源码破坏**，影响自己实现 `NodePrinterTarget`、直接构造 printer、或手工组装
 `Node` 树的下游（已知的只有 MachOSwiftSection）：
 
 | 破坏 | 变更 | 为什么 |
@@ -66,6 +66,7 @@ struct 的价值在于**精确布局 + 可平铺进连续缓冲**，所以正确
 | `Node: Codable` | 已移除 | 见 `06a423c`。 |
 | `NodePrinterTarget.write(_:context:)` | `NodePrintContext?` → `@autoclosure () -> NodePrintContext?`，且**删除了协议扩展里的默认实现** | 默认实现在的时候，一个按旧签名写的实现不构成 witness，默认实现会静默顶替它：打印文本一字不差，所有上下文标注全部消失，且 Swift 对「存在默认实现时的 near-miss witness」没有任何警告。删掉默认实现后，同样的写法变成定义处的编译错误。代价是每个 target 都得写出这个方法（包括纯文本的），这是有意的取舍。 |
 | `NodePrinterTarget.pushTypeReferenceScope(_:)` | `Node?` → `@autoclosure () -> Node?`，同样删除默认实现 | 同上。原来的 no-op 默认实现会吸收掉按 `Node?` 写的实现，scope 事件随之消失而文本不变——文本比对的快照测试同样看不见。 |
+| `NodePrinterTarget.popTypeReferenceScope()` | 删除默认实现 | 与 push 的理由**不同**。它不带参数，确实没有 near-miss witness 可被吸收（上一轮据此保留了默认实现，那个论证本身没错），但它漏掉了**配对要求**这一面：实现了 push 却忘记 pop 的 target 会静默继承 no-op，scope 栈只增不减，第一个 nominal 之后的所有写入——含其同级与符号其余部分——全被归到那个 nominal 名下，而文本逐字节相同。改成要求后，库内**当场暴露出两个**只写了 push 的测试 target。 |
 | `NodePrinter<Target>` | `public struct` → `public enum`（只剩静态成员），失去公共 `init`/`printRoot` | 打印逻辑移进泛型引擎 `DemanglingPrinter<Target, SomeNode>`，`NodePrinter` 退化为入口。迁移路径见 `Documentations/StackSafety.md`。 |
 
 此外 `NodeReference.textUTF8` 更名为 `textUTF8Bytes`（F10 维护者裁决），因此提案 0010
@@ -106,6 +107,13 @@ extension SemanticString: @retroactive NodePrinterTarget {
     ...
 }
 ```
+
+**3. `popTypeReferenceScope()` 失去默认实现 —— `SemanticString` 不受影响**
+
+它已经实现了 `popTypeReferenceScope()`（转发到 `popIdentifierScope()`），所以无需改动。
+列在这里是因为对**其它**自定义 target 是破坏性的。顺带一提：`SemanticString.popIdentifierScope`
+对不平衡的 pop 是「忽略」而非崩溃，所以即便漏掉，症状也只是 scope 卡住而不是崩溃 —— 这恰恰
+是这类缺陷难以被发现的原因。
 
 `SemanticString` 原先靠自身的 `count`（`_storage.atoms.count`）满足旧要求，语义恰好正确 ——
 它是**每次写入 append 一个 atom**，而不是对拼好的文本计数，所以非空写入必然改变它。改名后

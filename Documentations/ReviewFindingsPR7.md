@@ -415,8 +415,19 @@ probe package 实跑取证。结论未变，但**复用上一轮的 worktree 跑
 | F8 | `NodePrinterTarget.count` 无契约，`String` 违反增量探针语义，组合符起首的 identifier 吞掉限定名分隔点 | `DefectRegressionTests.combiningMarkIdentifiersKeepTheirQualifiedNameSeparator` + `targetsWithDifferentUnitCountsPrintIdenticalText` |
 | F11 | async `runPrintWalk` 的 printer 声明在 `withUnsafePointer` 之外，`printCache` 的 key 指向已退出的栈槽 | 无（见「无法测试的部分」） |
 
-**待排期**：F7（泛型签名 marker 扫描窗口）、F13（`popTypeReferenceScope` 默认实现）、
-F14（`demangleAsNode` 文档给出反向建议）。
+**已修（第三批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| F7 | `printGenericSignature` 的 marker 扫描窗口写成 `[n, n + firstRequirement)`，而 `firstRequirement` 是绝对索引，上游窗口是 `[numGenericParams, firstRequirement)`；requirement 之间的 marker 因此泄漏进参数列表 | `DefectRegressionTests.genericSignatureMarkerScanStopsAtTheFirstRequirement` + `…ValueMarkerScanStops…` |
+| F13 | `popTypeReferenceScope()` 保留 no-op 默认实现，实现了 push 却忘记 pop 的 target 静默继承它 | 无回归测试（编译期保证）；改成要求后库内当场暴露两个只写了 push 的测试 target |
+| F14 | `demangleAsNode` 的文档仍建议用 `internsSubtrees: false` 来「避免撑大缓存」，而该开关只跳过整树 hash-consing，叶子 interning 走另一个入口不暴露的开关 | 无（纯文档） |
+
+**F7 的窗口分析**（写下来是因为构造复现用例时不直观）：过宽的窗口多出的部分是
+`[firstRequirement, numGenericParams + firstRequirement)`。而 `children[firstRequirement]`
+按定义**不是** marker（正是它终止了前导扫描），所以**只有一个泛型参数深度时永远不会泄漏** ——
+复现用例必须有至少两个 `dependentGenericParamCount`。第一版 value-marker 用例就是因为只用了
+一个深度而红错了原因，改成两个深度后才真正打出泄漏的 `let B: Swift.Int`。
 
 **不作为缺陷修**：F9 → [KnownIssues #1](KnownIssues.md)；**F12 → [KnownIssues N18](KnownIssues.md)**。
 
@@ -503,6 +514,12 @@ F5 一处（`Punycode.swift:30/87` 有 `if value < 0x80` 前置守卫；`TypeDec
   栈的场景需要让 printer 在 `withUnsafePointer` 返回后再被使用，而修复恰恰是让它不可能被这样
   使用。修复站在**构造**上（与同步版对齐、生命周期由词法作用域保证），不站在复现上 —— 与
   第三轮 finding 12 的处理相同。
+- **F13（`popTypeReferenceScope` 失去默认实现）**：同样是编译期保证，没有运行时回归测试。
+  值得记的是它**当场就抓到了东西** —— 库内两个测试 target（`ContextRecordingTarget`、
+  `WriteCountingTarget`）都实现了 `push` 而没有 `pop`，一直静默继承 no-op。它们不记录
+  scope 所以无害，但正说明这个遗漏有多容易发生：上一轮保留默认实现的论证（「不带参数，
+  没有 near-miss witness 可吸收」）本身没错，只是没覆盖「配对要求」这一面。
+- **F14**：纯文档改动，无测试。
 - **F6 的编译期性质**：「无效组合无法拼写」是编译期保证，运行时测不到。守卫是源码扫描
   （`nodeFactoriesCannotSpellContentsWithChildren`），且已实测：临时把 `contents:` 加回主力
   重载后该测试退出码为 1 并点名违规行。扫描对「经中间层洗过的调用」失明，但这一类的入口
