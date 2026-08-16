@@ -1668,4 +1668,38 @@ struct DefectRegressionTests {
         }
     }
 
+    /// The remangler wrote identifier length prefixes as grapheme-cluster
+    /// counts while proposal 0008 moved the demangler's reader to bytes, so
+    /// `mangleAsString(_:usePunycode: false)` emitted a string this library
+    /// could no longer demangle.
+    ///
+    /// Both normalization forms are pinned: NFC regressed in this branch, NFD
+    /// was already broken on `next` (grapheme count vs the pre-0008 scalar
+    /// reader), and byte counting is what closes both.
+    @Test func nonPunycodeManglingRoundTripsForNonASCIIIdentifiers() throws {
+        func functionTree(named name: String) -> Node {
+            Node.create(kind: .global, child: Node.create(kind: .function, children: [
+                Node.create(kind: .module, text: "main"),
+                Node.create(kind: .identifier, text: name),
+                Node.create(kind: .type, child: Node.create(kind: .functionType, children: [
+                    Node.create(kind: .argumentTuple, child: Node.create(kind: .type, child: Node.create(kind: .tuple))),
+                    Node.create(kind: .returnType, child: Node.create(kind: .type, child: Node.create(kind: .tuple))),
+                ])),
+            ]))
+        }
+
+        // "café" precomposed (NFC) and decomposed (NFD), plus a multi-byte
+        // identifier with no ASCII at all.
+        for identifier in ["caf\u{e9}", "cafe\u{301}", "\u{4e2d}\u{6587}"] {
+            let tree = functionTree(named: identifier)
+            for usePunycode in [true, false] {
+                let mangled = try mangleAsString(tree, usePunycode: usePunycode)
+                let restored = try demangleAsNode(mangled)
+                #expect(
+                    restored.print(using: .default) == tree.print(using: .default),
+                    "round trip broke for \(identifier.debugDescription) usePunycode=\(usePunycode): \(mangled.debugDescription)"
+                )
+            }
+        }
+    }
 }

@@ -48,8 +48,18 @@ struct Remangler {
     /// List of word replacements in the current identifier
     private var substWordsInIdent: [WordReplacement] = []
 
-    /// Output buffer for mangled string
-    private var buffer: String = ""
+    /// Output buffer for the mangled string, as UTF-8 **bytes**.
+    ///
+    /// Upstream's `Buffer` is a byte stream (`SmallString`), and every position
+    /// this file records into it — `words[].start`, `SubstitutionMerging`'s
+    /// `lastSubstPosition`/`lastSubstSize`, `bufferPosition` — is a byte
+    /// offset there. Holding it as a `String` made all of those
+    /// grapheme-cluster offsets instead, which agrees with bytes only while
+    /// the content is ASCII. Identifier length prefixes are the visible
+    /// consequence: proposal 0008 moved the *demangler* to counting bytes,
+    /// so a grapheme-counted prefix produced manglings this library could no
+    /// longer read back (PR #7 review, fourth round).
+    private var buffer: [UInt8] = []
 
     /// Hash table for caching node hashes (avoids expensive recursive computation)
     private var hashHash: [SubstitutionEntry?] = Array(repeating: nil, count: hashHashCapacity)
@@ -72,38 +82,42 @@ struct Remangler {
 
     /// Append a string to the output buffer
     private mutating func append(_ string: String) {
-        buffer.append(string)
+        buffer.append(contentsOf: string.utf8)
     }
 
     /// Append a character to the output buffer
     private mutating func append(_ char: Character) {
-        buffer.append(char)
+        for scalar in String(char).unicodeScalars {
+            UTF8.encode(scalar) { buffer.append($0) }
+        }
     }
 
     /// Append an integer to the output buffer
     private mutating func append(_ value: UInt64) {
-        buffer.append(String(value))
+        buffer.append(contentsOf: String(value).utf8)
     }
 
-    /// Reset the buffer to a previous position (index-based)
-    private mutating func resetBuffer(to position: String.Index) {
-        buffer = String(buffer[..<position])
-    }
-
-    /// Reset the buffer to a previous position (count-based)
+    /// Reset the buffer to a previous **byte** position
     private mutating func resetBuffer(to position: Int) {
-        let idx = buffer.index(buffer.startIndex, offsetBy: position)
-        buffer = String(buffer[..<idx])
+        buffer.removeLast(buffer.count - position)
     }
 
-    /// Get current buffer position
-    private var bufferPosition: String.Index {
-        return buffer.endIndex
+    /// Current buffer position, in bytes
+    private var bufferPosition: Int {
+        return buffer.count
     }
 
     /// Clear the buffer
     private mutating func clearBuffer() {
-        buffer = ""
+        buffer.removeAll(keepingCapacity: true)
+    }
+
+    /// The buffer decoded as text. UTF-8 validity is structural here: every
+    /// byte was appended from a `String`/`Character`/`UnicodeScalar`, and the
+    /// only positional edits (`resetBuffer`, the substitution merge) cut on
+    /// boundaries this file recorded from `buffer.count` after a whole append.
+    private var bufferText: String {
+        String(decoding: buffer, as: UTF8.self)
     }
 
     // MARK: - Hash Computation
@@ -459,7 +473,7 @@ struct Remangler {
         overflowSubstitutions.removeAll(keepingCapacity: true)
         substMerging = .init()
         try mangle(node, depth: 0)
-        return buffer
+        return bufferText
     }
 
     // MARK: - Core Mangling
@@ -5417,6 +5431,43 @@ extension Remangler {
         return false
     }
 
+    // MARK: - Byte-level word predicates
+
+    // Upstream runs the word-substitution scan over `char`, so a multi-byte
+    // scalar is several separate characters to it and none of them is a digit,
+    // `_`, NUL or an upper letter. These reproduce that on `UInt8`: a byte
+    // >= 0x80 fails every range test here exactly as a negative `char` does
+    // upstream. `mangleIdentifier` must use these rather than the `Character`
+    // forms above, because its positions index the UTF-8 buffer.
+
+    @inline(__always)
+    private static func isDigit(_ byte: UInt8) -> Bool {
+        return byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9")
+    }
+
+    @inline(__always)
+    private static func isUpperLetter(_ byte: UInt8) -> Bool {
+        return byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z")
+    }
+
+    @inline(__always)
+    private static func isWordStart(_ byte: UInt8) -> Bool {
+        return !isDigit(byte) && byte != UInt8(ascii: "_") && byte != 0
+    }
+
+    @inline(__always)
+    private static func isWordEnd(_ byte: UInt8, _ previousByte: UInt8) -> Bool {
+        if byte == UInt8(ascii: "_") || byte == 0 {
+            return true
+        }
+
+        if !isUpperLetter(previousByte) && isUpperLetter(byte) {
+            return true
+        }
+
+        return false
+    }
+
     /// Returns true if the character is a valid character which may appear at the start of a symbol mangling
     @inline(__always)
     private static func isValidSymbolStart(_ ch: Character) -> Bool {
@@ -5497,12 +5548,18 @@ extension Remangler {
 
     // MARK: - Word Substitution
 
-    /// Describes a word in a mangled identifier
+    /// Describes a word in a mangled identifier.
+    ///
+    /// Both fields are **UTF-8 byte** quantities, and `start` is an offset into
+    /// whichever byte sequence the word currently lives in: the identifier
+    /// being scanned, then `buffer` once the word has been emitted (see the
+    /// `word.start = buffer.count` handoff in ``mangleIdentifier(_:)``). They
+    /// must stay in the same unit as `buffer`, which is why that is `[UInt8]`.
     private struct SubstitutionWord {
-        /// The position of the first word character in the mangled string
+        /// Byte offset of the first character of the word
         var start: Int
 
-        /// The length of the word
+        /// The length of the word, in bytes
         var length: Int
 
         init(start: Int, length: Int) {
@@ -5513,7 +5570,7 @@ extension Remangler {
 
     /// Helper struct which represents a word replacement
     private struct WordReplacement {
-        /// The position in the identifier where the word is substituted
+        /// The **byte** position in the identifier where the word is substituted
         var stringPos: Int
 
         /// The index into the mangler's Words array (-1 if invalid)
@@ -5664,15 +5721,16 @@ extension Remangler {
         /// substitution separately in the form 'S<Subst>' or 'A<Subst>'.
         ///
         /// - Parameters:
-        ///   - buffer: Current buffer content
+        ///   - buffer: Current buffer content, as UTF-8 bytes. Every position
+        ///     this type records (`lastSubstPosition`, `lastSubstSize`) is a
+        ///     byte offset, matching upstream's `SmallString` buffer.
+        ///     Substitutions are themselves ASCII, so slicing on these offsets
+        ///     always lands on a scalar boundary.
         ///   - subst: The substitution to merge
         ///   - isStandardSubst: True if this is an 'S' substitution, false for 'A'
-        ///   - resetBuffer: Callback to reset buffer to a position
-        ///   - appendToBuffer: Callback to append string to buffer
-        ///   - getBuffer: Callback to get current buffer content
         /// - Returns: True if merge was successful
         mutating func tryMergeSubst(
-            buffer: inout String,
+            buffer: inout [UInt8],
             subst: String,
             isStandardSubst: Bool
         ) -> Bool {
@@ -5687,13 +5745,14 @@ extension Remangler {
                 assert(lastSubstPosition > 0 && lastSubstPosition < bufferCount)
                 assert(lastSubstSize > 0)
 
-                let lastSubstStart = buffer.index(buffer.endIndex, offsetBy: -lastSubstSize)
-                var lastSubst = String(buffer[lastSubstStart...])
+                var lastSubstBytes = ArraySlice(buffer.suffix(lastSubstSize))
 
                 // Drop leading digits
-                while let first = lastSubst.first, Remangler.isDigit(first) {
-                    lastSubst = String(lastSubst.dropFirst())
+                while let first = lastSubstBytes.first,
+                      first >= UInt8(ascii: "0"), first <= UInt8(ascii: "9") {
+                    lastSubstBytes = lastSubstBytes.dropFirst()
                 }
+                let lastSubst = String(decoding: lastSubstBytes, as: UTF8.self)
 
                 assert(Remangler.isUpperLetter(lastSubst.last!) || (isStandardSubst && Remangler.isLowerLetter(lastSubst.last!)))
 
@@ -5702,14 +5761,13 @@ extension Remangler {
                     // e.g. 'AB' -> 'AbC'
                     lastSubstPosition = bufferCount
                     lastNumSubsts = 1
-                    let resetPos = bufferCount - 1
-                    let resetIndex = buffer.index(buffer.startIndex, offsetBy: resetPos)
-                    buffer = String(buffer[..<resetIndex])
+                    buffer.removeLast(1)
                     assert(Remangler.isUpperLetter(lastSubst.last!))
 
                     let lastChar = lastSubst.last!
-                    let lowercaseChar = Character(UnicodeScalar(lastChar.asciiValue! - Character("A").asciiValue! + Character("a").asciiValue!))
-                    buffer.append(String(lowercaseChar) + subst)
+                    let lowercaseByte = lastChar.asciiValue! - UInt8(ascii: "A") + UInt8(ascii: "a")
+                    buffer.append(lowercaseByte)
+                    buffer.append(contentsOf: subst.utf8)
                     lastSubstSize = 1
                     return true
                 }
@@ -5718,9 +5776,8 @@ extension Remangler {
                     // We can merge with the same 'A' or 'S' substitution
                     // e.g. 'AB' -> 'A2B', or 'S3i' -> 'S4i'
                     lastNumSubsts += 1
-                    let resetIndex = buffer.index(buffer.startIndex, offsetBy: lastSubstPosition)
-                    buffer = String(buffer[..<resetIndex])
-                    buffer.append("\(lastNumSubsts)\(subst)")
+                    buffer.removeLast(bufferCount - lastSubstPosition)
+                    buffer.append(contentsOf: "\(lastNumSubsts)\(subst)".utf8)
 
                     // Get updated buffer to calculate the new size
                     lastSubstSize = buffer.count - lastSubstPosition
@@ -5731,7 +5788,7 @@ extension Remangler {
             // We can't merge with the previous substitution, but let's remember this
             // substitution which will be mangled by the caller
             lastSubstPosition = bufferCount + 1
-            lastSubstSize = subst.count
+            lastSubstSize = subst.utf8.count
             lastNumSubsts = 1
             lastSubstIsStandardSubst = isStandardSubst
             return false
@@ -5747,6 +5804,14 @@ extension Remangler {
     ///
     /// - Parameters:
     ///   - ident: The identifier to mangle
+    /// - Note: every position in here — `pos`, `wordStartPos`,
+    ///   `SubstitutionWord.start`/`.length`, `WordReplacement.stringPos` and
+    ///   the emitted length prefixes — is a **UTF-8 byte** offset, matching
+    ///   upstream's `StringRef` and the byte-based reader on the demangling
+    ///   side (proposal 0008). Counting grapheme clusters here made the length
+    ///   prefix disagree with the reader for any non-ASCII identifier, so
+    ///   `mangleAsString(_:usePunycode: false)` emitted manglings this library
+    ///   could not read back (PR #7 review, fourth round).
     private mutating func mangleIdentifier(_ ident: String) {
         let wordsInBuffer = words.count
         assert(substWordsInIdent.isEmpty)
@@ -5755,8 +5820,8 @@ extension Remangler {
         if usePunycode, Self.needsPunycodeEncoding(ident) {
             if let encoded = Punycode.encodePunycode(ident, mapNonSymbolChars: true) {
                 let pcIdent = encoded
-                append("00\(pcIdent.count)")
-                if let first = pcIdent.first, Self.isDigit(first) || first == "_" {
+                append("00\(pcIdent.utf8.count)")
+                if let first = pcIdent.utf8.first, Self.isDigit(first) || first == UInt8(ascii: "_") {
                     append("_")
                 }
                 append(pcIdent)
@@ -5764,29 +5829,27 @@ extension Remangler {
             }
         }
 
+        let identBytes = Array(ident.utf8)
+
         // Search for word substitutions and new words
         let notInsideWord = -1
         var wordStartPos = notInsideWord
 
-        for pos in 0 ... ident.count {
-            let ch: Character = pos < ident.count ? ident[ident.index(ident.startIndex, offsetBy: pos)] : "\0"
+        for pos in 0 ... identBytes.count {
+            let byte: UInt8 = pos < identBytes.count ? identBytes[pos] : 0
 
-            if wordStartPos != notInsideWord, Self.isWordEnd(ch, pos > 0 ? ident[ident.index(ident.startIndex, offsetBy: pos - 1)] : "\0") {
+            if wordStartPos != notInsideWord, Self.isWordEnd(byte, pos > 0 ? identBytes[pos - 1] : 0) {
                 // End of a word
                 assert(pos > wordStartPos)
                 let wordLen = pos - wordStartPos
-                let wordStart = ident.index(ident.startIndex, offsetBy: wordStartPos)
-                let wordEnd = ident.index(wordStart, offsetBy: wordLen)
-                let word = String(ident[wordStart ..< wordEnd])
+                let word = identBytes[wordStartPos ..< pos]
 
                 // Look up word in buffer and existing words
-                func lookupWord(in str: String, from: Int, to: Int) -> Int? {
+                func lookupWord(in bytes: [UInt8], from: Int, to: Int) -> Int? {
                     for idx in from ..< to {
                         let w = words[idx]
-                        let existingWordStart = str.index(str.startIndex, offsetBy: w.start)
-                        let existingWordEnd = str.index(existingWordStart, offsetBy: w.length)
-                        let existingWord = String(str[existingWordStart ..< existingWordEnd])
-                        if word == existingWord {
+                        let existingWord = bytes[w.start ..< (w.start + w.length)]
+                        if word.elementsEqual(existingWord) {
                             return idx
                         }
                     }
@@ -5798,7 +5861,7 @@ extension Remangler {
 
                 // Check if word exists in this identifier
                 if wordIdx == nil {
-                    wordIdx = lookupWord(in: ident, from: wordsInBuffer, to: words.count)
+                    wordIdx = lookupWord(in: identBytes, from: wordsInBuffer, to: words.count)
                 }
 
                 if let idx = wordIdx {
@@ -5813,7 +5876,7 @@ extension Remangler {
                 wordStartPos = notInsideWord
             }
 
-            if wordStartPos == notInsideWord, Self.isWordStart(ch) {
+            if wordStartPos == notInsideWord, Self.isWordStart(byte) {
                 // Begin of a word
                 wordStartPos = pos
             }
@@ -5828,7 +5891,7 @@ extension Remangler {
         var wordsInBufferMutable = wordsInBuffer
 
         // Add dummy word at end
-        addSubstWordInIdent(WordReplacement(stringPos: ident.count, wordIdx: -1))
+        addSubstWordInIdent(WordReplacement(stringPos: identBytes.count, wordIdx: -1))
 
         for idx in 0 ..< substWordsInIdent.count {
             let repl = substWordsInIdent[idx]
@@ -5848,13 +5911,13 @@ extension Remangler {
                         wordsInBufferMutable += 1
                     }
 
-                    let ch = ident[ident.index(ident.startIndex, offsetBy: pos)]
+                    let byte = identBytes[pos]
 
                     // Error recovery for invalid identifiers
-                    if first, Self.isDigit(ch) {
+                    if first, Self.isDigit(byte) {
                         append("X")
                     } else {
-                        append(String(ch))
+                        buffer.append(byte)
                     }
 
                     pos += 1
@@ -5869,13 +5932,11 @@ extension Remangler {
 
                 if idx < substWordsInIdent.count - 2 {
                     // Lowercase letter
-                    let ch = Character(UnicodeScalar(UInt8(ascii: "a") + UInt8(repl.wordIdx)))
-                    append(String(ch))
+                    buffer.append(UInt8(ascii: "a") + UInt8(repl.wordIdx))
                 } else {
                     // Last word substitution is uppercase
-                    let ch = Character(UnicodeScalar(UInt8(ascii: "A") + UInt8(repl.wordIdx)))
-                    append(String(ch))
-                    if pos == ident.count {
+                    buffer.append(UInt8(ascii: "A") + UInt8(repl.wordIdx))
+                    if pos == identBytes.count {
                         append("0")
                     }
                 }
