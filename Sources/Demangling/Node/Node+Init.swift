@@ -3,32 +3,50 @@ import SwiftStdlibToolbox
 // MARK: - Factory Methods (with automatic leaf interning)
 
 extension Node {
-    /// Creates a node. Leaf nodes (no children) are automatically interned via `NodeCache.shared`.
+    /// Creates a node with children. Childless nodes are automatically interned
+    /// via `NodeCache.shared`.
+    ///
+    /// There is deliberately no `contents` parameter here, and no `children`
+    /// parameter on ``create(kind:contents:)`` — see ``create(kind:text:)``.
     @inlinable
-    public static func create(kind: Kind, contents: Contents = .none, children: [Node] = []) -> Node {
-        NodeCache.shared.createInterned(kind: kind, contents: contents, children: children)
+    public static func create(kind: Kind, children: [Node] = []) -> Node {
+        NodeCache.shared.createInterned(kind: kind, children: children)
     }
 
-    /// Creates a node from inline children. Leaf nodes are automatically interned.
+    /// Creates an interned leaf carrying `contents`.
     @inlinable
-    public static func create(kind: Kind, contents: Contents = .none, inlineChildren: Children) -> Node {
-        NodeCache.shared.createInterned(kind: kind, contents: contents, inlineChildren: inlineChildren)
+    public static func create(kind: Kind, contents: Contents) -> Node {
+        NodeCache.shared.createInterned(kind: kind, contents: contents)
+    }
+
+    /// Creates a node from inline children. Childless nodes are automatically interned.
+    @inlinable
+    public static func create(kind: Kind, inlineChildren: Children) -> Node {
+        NodeCache.shared.createInterned(kind: kind, inlineChildren: inlineChildren)
     }
 
     @inlinable
     public static func create(kind: Kind, child: Node) -> Node {
-        create(kind: kind, contents: .none, children: [child])
+        create(kind: kind, children: [child])
     }
 
     /// Creates an interned leaf carrying `text`.
     ///
     /// There is deliberately no `children` parameter: contents and children are
-    /// mutually exclusive in `Payload`, so `mergedPayload` dropped `text` on the
-    /// floor whenever children were present — silently, and through the subtree
-    /// intern key, collapsing two differently-texted requests onto one shared
-    /// instance. The overloads that accepted both are gone rather than
+    /// mutually exclusive in `Payload` (as they are in upstream's `Node`, whose
+    /// payload is a union of `Text`/`Index`/`OneChild`/`TwoChildren`/
+    /// `ManyChildren`), so `mergedPayload` dropped `text` on the floor whenever
+    /// children were present — silently, and through the subtree intern key,
+    /// collapsing two differently-texted requests onto one shared instance.
+    /// Every factory that accepted both is gone rather than
     /// precondition-guarded, so the invalid combination cannot be spelled
     /// (PR #7 review, finding 8).
+    ///
+    /// The first pass at this deleted only the `text:`/`index:` spellings and
+    /// left the primary `contents:` + `children:` overload in place — while
+    /// this very comment claimed the combination was unspellable. The rule is
+    /// enforced by `DefectRegressionTests.nodeFactoriesCannotSpellContentsWithChildren`
+    /// now, so the claim and the code cannot drift apart again.
     @inlinable
     public static func create(kind: Kind, text: String) -> Node {
         create(kind: kind, contents: .text(text))
@@ -79,12 +97,18 @@ extension Node {
 /// instances, so `===`-based sharing assumptions do not apply.
 @_spi(Internals)
 extension Node {
-    public static func createTransient(kind: Kind, contents: Contents = .none, children: [Node] = []) -> Node {
-        Node(kind: kind, contents: contents, children: children)
+    /// See ``create(kind:children:)`` for why contents and children cannot be
+    /// passed together.
+    public static func createTransient(kind: Kind, children: [Node] = []) -> Node {
+        Node(kind: kind, contents: .none, children: children)
     }
 
-    public static func createTransient(kind: Kind, contents: Contents = .none, inlineChildren: Children) -> Node {
-        Node(kind: kind, contents: contents, inlineChildren: inlineChildren)
+    public static func createTransient(kind: Kind, contents: Contents) -> Node {
+        Node(kind: kind, contents: contents, children: [])
+    }
+
+    public static func createTransient(kind: Kind, inlineChildren: Children) -> Node {
+        Node(kind: kind, contents: .none, inlineChildren: inlineChildren)
     }
 
     public static func createTransient(kind: Kind, child: Node) -> Node {
@@ -103,11 +127,11 @@ extension Node {
 }
 
 extension Node {
-    // A `text:`/`index:` counterpart of this builder would always discard its
-    // contents — the builder exists to produce children, and children win in
-    // `mergedPayload`. See ``create(kind:text:)``.
+    // No `contents:` parameter, for the same reason as everywhere else: this
+    // builder exists to produce children, and children win in `mergedPayload`.
+    // See ``create(kind:text:)``.
     @inlinable
-    public static func create(kind: Kind, contents: Contents = .none, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) -> Node {
-        create(kind: kind, contents: contents, children: childrenBuilder())
+    public static func create(kind: Kind, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) -> Node {
+        create(kind: kind, children: childrenBuilder())
     }
 }

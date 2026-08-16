@@ -1871,6 +1871,53 @@ struct DefectRegressionTests {
         mutating func popTypeReferenceScope() {}
     }
 
+    /// No node factory may accept contents and children together.
+    ///
+    /// `Payload` merges the two into one discriminated union — as upstream's
+    /// `Node` does — and `mergedPayload` resolves the conflict by giving
+    /// children priority, silently. A factory taking both therefore drops its
+    /// `text`/`index` on the floor whenever children are present, and through
+    /// the subtree intern key it collapses two differently-texted requests
+    /// onto a single shared instance.
+    ///
+    /// `eff0716` deleted the `text:`/`index:` spellings by hand and left the
+    /// primary `contents:` + `children:` overload — plus `inlineChildren:`,
+    /// `childrenBuilder:` and both SPI `createTransient` forms — in place,
+    /// while its own doc comment stated the combination could not be spelled.
+    /// Hence a scan rather than another hand sweep.
+    ///
+    /// `Node.init` is exempt: it is the internal entry point that
+    /// `mergedPayload` exists for, and it is not public API.
+    @Test func nodeFactoriesCannotSpellContentsWithChildren() throws {
+        let librarySourcesDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources")
+        let fileEnumerator = try #require(FileManager.default.enumerator(at: librarySourcesDirectory, includingPropertiesForKeys: nil))
+        let childParameterLabels = ["children:", "inlineChildren:", "childrenBuilder:"]
+
+        var violations: [String] = []
+        for case let fileLocation as URL in fileEnumerator where fileLocation.pathExtension == "swift" {
+            let fileContents = try String(contentsOf: fileLocation, encoding: .utf8)
+            for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmedLine.hasPrefix("//"), !trimmedLine.hasPrefix("///") else { continue }
+                // Declarations of node factories only — `Node.init` is exempt.
+                guard trimmedLine.contains("func create"), trimmedLine.contains("contents:") else { continue }
+                for childLabel in childParameterLabels where trimmedLine.contains(childLabel) {
+                    violations.append("\(fileLocation.lastPathComponent):\(lineOffset + 1): \(trimmedLine)")
+                }
+            }
+        }
+
+        #expect(violations.isEmpty, """
+        node factories accepting contents together with children found — split them into a \
+        contents-only and a children-only overload so the invalid combination cannot be spelled:
+        \(violations.sorted().joined(separator: "\n"))
+        """)
+    }
+
     @Test func targetsWithDifferentUnitCountsPrintIdenticalText() throws {
         let symbols = [
             "$s4main1fyyF",

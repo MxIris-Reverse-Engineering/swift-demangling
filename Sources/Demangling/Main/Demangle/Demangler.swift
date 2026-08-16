@@ -2055,7 +2055,7 @@ extension Demangler {
 
         // RepresentationChanged specialization has no params
         if specBase.children.first?.kind == .representationChanged {
-            return createNode(kind: .functionSignatureSpecialization, contents: specBase.contents, children: specChildren)
+            return createNode(kind: .functionSignatureSpecialization, children: specChildren)
         }
 
         while !scanner.conditional(scalar: "_") {
@@ -2098,7 +2098,7 @@ extension Demangler {
             param = param.reversingChildren(from: fixedChildrenCount)
             specChildren[paramIndex] = param
         }
-        return createNode(kind: .functionSignatureSpecialization, contents: specBase.contents, children: specChildren)
+        return createNode(kind: .functionSignatureSpecialization, children: specChildren)
     }
 
     private mutating func demangleFuncSpecParam(kind: Node.Kind) throws(DemanglingError) -> Node {
@@ -2229,7 +2229,25 @@ extension Demangler {
         let asyncRemoved = scanner.conditional(scalar: "a")
         let representationChanged = scanner.conditional(scalar: "r")
         let passId = try demangleDecimalDigitValue()
-        let contents = try demangleUniqueId ? (demangleNatural().map { Node.Contents.index($0) } ?? Node.Contents.none) : Node.Contents.none
+        if demangleUniqueId {
+            // Parsed and discarded, deliberately. The value never survived:
+            // `.specializationPassID` is appended unconditionally below, so
+            // the node always has children, and contents and children are
+            // mutually exclusive in `Payload` — the index was dropped by
+            // `mergedPayload` before anyone could read it. Upstream reached
+            // the same end state from the other direction and simply removed
+            // the parse (`demangleSpecAttributes(Node::Kind)` takes no
+            // `demangleUniqueID` flag any more, and `UniqueID` appears nowhere
+            // in Demangler.cpp); its Remangler still has the matching
+            // re-emit branch, equally dead for the same union reason.
+            //
+            // The scan is kept rather than deleted because deleting it would
+            // change how much input is consumed, and this library and
+            // `swift-demangle` currently agree on every `Tf` symbol tried —
+            // including ones where the pass ID is followed by digits, which
+            // both reject (PR #7 review, fourth round).
+            _ = try demangleNatural()
+        }
         var children: [Node] = []
         if isSerialized {
             children.append(NodeFactory.isSerialized)
@@ -2241,7 +2259,7 @@ extension Demangler {
             children.append(createNode(kind: .representationChanged))
         }
         children.append(createNode(kind: .specializationPassID, contents: .index(UInt64(passId))))
-        return createNode(kind: kind, contents: contents, children: children)
+        return createNode(kind: kind, children: children)
     }
 
     private mutating func demangleWitness() throws(DemanglingError) -> Node {

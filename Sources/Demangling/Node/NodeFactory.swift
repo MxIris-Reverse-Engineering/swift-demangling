@@ -129,24 +129,34 @@ public final class NodeCache: Sendable {
 
     // MARK: - Inline Interning (used by Node.create)
 
+    // Contents and children are never accepted together here either, so the
+    // invalid combination has no internal back door — see
+    // `Node.create(kind:text:)`. An empty `children` still interns as a leaf.
+
     /// Creates or retrieves an interned node.
     /// Called by `Node.create()`. Only leaf nodes (no children) are cached.
     @usableFromInline
-    func createInterned(kind: Node.Kind, contents: Node.Contents, children: [Node]) -> Node {
+    func createInterned(kind: Node.Kind, children: [Node]) -> Node {
         if children.isEmpty {
-            return storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: contents, in: &$0) }
+            return storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: .none, in: &$0) }
         }
-        return Node(kind: kind, contents: contents, children: children)
+        return Node(kind: kind, contents: .none, children: children)
+    }
+
+    /// Creates or retrieves an interned leaf carrying `contents`.
+    @usableFromInline
+    func createInterned(kind: Node.Kind, contents: Node.Contents) -> Node {
+        storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: contents, in: &$0) }
     }
 
     /// Creates or retrieves an interned node from inline children.
     /// Called by `Node.create()`. Only leaf nodes (no children) are cached.
     @usableFromInline
-    func createInterned(kind: Node.Kind, contents: Node.Contents, inlineChildren: Node.Children) -> Node {
+    func createInterned(kind: Node.Kind, inlineChildren: Node.Children) -> Node {
         if inlineChildren.isEmpty {
-            return storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: contents, in: &$0) }
+            return storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: .none, in: &$0) }
         }
-        return Node(kind: kind, contents: contents, inlineChildren: inlineChildren)
+        return Node(kind: kind, contents: .none, inlineChildren: inlineChildren)
     }
 
     // MARK: - Leaf Node Interning (No Children)

@@ -7,23 +7,32 @@
 /// traffic and nothing retained once the transient tree is dropped, which is
 /// what the `NodeStore` bridge wants.
 extension Demangler {
+    // Contents and children are never passed together, matching the public
+    // factories — see `Node.create(kind:text:)`.
     @inline(__always)
-    func createNode(kind: Node.Kind, contents: Node.Contents = .none, children: [Node] = []) -> Node {
+    func createNode(kind: Node.Kind, children: [Node] = []) -> Node {
         internsLeaves
-            ? Node.create(kind: kind, contents: contents, children: children)
-            : Node(kind: kind, contents: contents, children: children)
+            ? Node.create(kind: kind, children: children)
+            : Node(kind: kind, contents: .none, children: children)
     }
 
     @inline(__always)
-    func createNode(kind: Node.Kind, contents: Node.Contents = .none, inlineChildren: Node.Children) -> Node {
+    func createNode(kind: Node.Kind, contents: Node.Contents) -> Node {
         internsLeaves
-            ? Node.create(kind: kind, contents: contents, inlineChildren: inlineChildren)
-            : Node(kind: kind, contents: contents, inlineChildren: inlineChildren)
+            ? Node.create(kind: kind, contents: contents)
+            : Node(kind: kind, contents: contents, children: [])
+    }
+
+    @inline(__always)
+    func createNode(kind: Node.Kind, inlineChildren: Node.Children) -> Node {
+        internsLeaves
+            ? Node.create(kind: kind, inlineChildren: inlineChildren)
+            : Node(kind: kind, contents: .none, inlineChildren: inlineChildren)
     }
 
     @inline(__always)
     func createNode(kind: Node.Kind, child: Node) -> Node {
-        createNode(kind: kind, contents: .none, children: [child])
+        createNode(kind: kind, children: [child])
     }
 
     // Contents-carrying leaves only — see `Node.create(kind:text:)` for why the
