@@ -270,13 +270,15 @@ NodeCache.shared.clear()
 
 Because interned nodes are canonical, demangling the same symbol twice returns the identical (`===`) tree instance. Interning never changes structural equality (`==`), printing, or remangling results.
 
-For one-off demangling where the cache should not grow, opt out per call:
+To skip only the whole-tree hash-consing pass — keeping canonical leaves, but not paying to canonicalize the interior of a tree you will not compare by identity:
 
 ```swift
 let node = try demangleAsNode(symbol, internsSubtrees: false)
 ```
 
-For demangle-and-discard work — demangle, extract a string or a classification, drop the tree — use the fully cache-free entry instead. It touches no global state at all (`internsSubtrees: false` still interns leaf nodes), and its tree remangles byte-identically to the canonical path, so deriving lookup keys via `mangleAsString` is sound:
+Note this is **not** a way to keep the cache from growing: leaves are interned during the parse regardless, so every unique identifier, module and index in the input stays in `NodeCache.shared` for the process lifetime.
+
+For demangle-and-discard work — demangle, extract a string or a classification, drop the tree — use the fully cache-free entry instead. It is the only entry that touches no global state at all, and its tree remangles byte-identically to the canonical path, so deriving lookup keys via `mangleAsString` is sound:
 
 ```swift
 let node = try demangleAsNodeTransient(symbol)
