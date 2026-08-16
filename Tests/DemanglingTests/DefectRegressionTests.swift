@@ -504,7 +504,7 @@ struct DefectRegressionTests {
     @Test func storePathDeliversContextNodesToRichTargets() throws {
         struct ContextRecordingTarget: NodePrinterTarget {
             var text = ""
-            var count: Int { text.count }
+            var writtenUnitCount: Int { text.utf8.count }
             var moduleContextNodeTexts: [String?] = []
 
             init() {}
@@ -1157,9 +1157,11 @@ struct DefectRegressionTests {
             let outOfRangeIndex = UInt64(UInt32.max) + 5
             for kind in [Node.Kind.differentiableFunctionType, .autoDiffFunctionKind] {
                 let node = Node.create(kind: kind, index: outOfRangeIndex)
-                // Either outcome is acceptable — a `ManglingError` or a
-                // mangling that simply omits the unrepresentable payload.
-                // What must not happen is a trap.
+                // This test only pins "does not trap". Omitting the payload
+                // used to be treated as an acceptable outcome here; it is not,
+                // and `differentiabilityMarkersRejectUnrepresentableIndices`
+                // now requires the throw. Left as-is so the trap guard stays
+                // independent of the stricter contract.
                 _ = try? mangleAsString(node)
                 _ = canMangle(node)
             }
@@ -1448,12 +1450,14 @@ struct DefectRegressionTests {
     /// so a deliberately path-exponential tree cannot blow the test's memory
     /// while the pre-fix walk is running.
     private struct WriteCountingTarget: NodePrinterTarget {
-        var count: Int = 0
+        // Accumulated per write rather than measured on a joined buffer, so
+        // every non-empty write changes it — the delta-probe contract.
+        var writtenUnitCount: Int = 0
 
         init() {}
 
         mutating func write(_ content: String) {
-            count += content.count
+            writtenUnitCount += content.utf8.count
             DefectRegressionTests.printWorkCounter.recordWrite()
         }
 
@@ -1462,7 +1466,7 @@ struct DefectRegressionTests {
         }
 
         mutating func append(_ other: WriteCountingTarget) {
-            count += other.count
+            writtenUnitCount += other.writtenUnitCount
         }
 
         mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
@@ -1700,6 +1704,83 @@ struct DefectRegressionTests {
                     "round trip broke for \(identifier.debugDescription) usePunycode=\(usePunycode): \(mangled.debugDescription)"
                 )
             }
+        }
+    }
+
+    /// The printer decides whether to write a qualified-name separator by
+    /// reading the target's size before and after a nested print — a *delta*
+    /// probe, never an absolute or arithmetic use. The contract it needs is
+    /// "a non-empty write changes this value", and `String.count` breaks it:
+    /// appending a combining mark to a buffer already ending in `.` merges
+    /// into the preceding grapheme cluster and leaves the count unchanged, so
+    /// the separator is skipped.
+    ///
+    /// Note the review filed this as a downstream hazard for rich targets.
+    /// It is the reverse: `SemanticString` (atom counts) satisfies the
+    /// contract, and `String` — this library's own default target and its
+    /// reference conformance — is the one that violates it. Real Swift
+    /// symbols cannot reach it (identifiers cannot start with a combining
+    /// mark, and non-ASCII ones arrive punycoded), but hand-built trees and
+    /// malformed symbols can.
+    @Test func combiningMarkIdentifiersKeepTheirQualifiedNameSeparator() {
+        let constructor = Node.create(kind: .global, child: Node.create(kind: .constructor, children: [
+            Node.create(kind: .module, text: "Mod"),
+            Node.create(kind: .identifier, text: "\u{301}"),
+            Node.create(kind: .type, child: Node.create(kind: .functionType, children: [
+                Node.create(kind: .argumentTuple, child: Node.create(kind: .type, child: Node.create(kind: .tuple))),
+                Node.create(kind: .returnType, child: Node.create(kind: .type, child: Node.create(kind: .structure, children: [
+                    Node.create(kind: .module, text: "Swift"),
+                    Node.create(kind: .identifier, text: "Int"),
+                ]))),
+            ])),
+        ]))
+
+        #expect(constructor.print(using: .default) == "Mod.\u{301}.init() -> Swift.Int")
+    }
+
+    /// A target whose size is a token count rather than a text length — the
+    /// shape of the downstream `SemanticString` conformance. It must print
+    /// byte-identically to `String`, which is the property the delta-probe
+    /// contract exists to guarantee and which no `String`-only test can check.
+    private struct TokenCountingTarget: NodePrinterTarget {
+        var text: String = ""
+        private var tokenCount: Int = 0
+
+        init() {}
+
+        var writtenUnitCount: Int { tokenCount }
+
+        mutating func write(_ content: String) {
+            guard !content.isEmpty else { return }
+            text += content
+            tokenCount += 1
+        }
+
+        mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
+            write(content)
+        }
+
+        mutating func append(_ other: TokenCountingTarget) {
+            text += other.text
+            tokenCount += other.tokenCount
+        }
+
+        mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
+        mutating func popTypeReferenceScope() {}
+    }
+
+    @Test func targetsWithDifferentUnitCountsPrintIdenticalText() throws {
+        let symbols = [
+            "$s4main1fyyF",
+            "$s7SwiftUI4ViewPAAE4task8priority_QrScP_yyYaYbScMYccntF",
+            "$s10Foundation4DataV15withUnsafeBytesyxxSWKXEKlF",
+            "$sSaySiGSayxGSTsWl",
+        ]
+        for symbol in symbols {
+            let node = try demangleAsNode(symbol)
+            let asString = node.print(using: .default)
+            let asTokens = NodePrinter<TokenCountingTarget>.print(node, using: .default).text
+            #expect(asString == asTokens, "target-dependent divergence for \(symbol)")
         }
     }
 }

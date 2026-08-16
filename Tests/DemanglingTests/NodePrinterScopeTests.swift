@@ -29,7 +29,7 @@ struct NodePrinterScopeTests {
 
         init() {}
 
-        var count: Int { text.count }
+        var writtenUnitCount: Int { text.utf8.count }
 
         mutating func write(_ content: String) {
             text.write(content)
@@ -102,7 +102,9 @@ struct NodePrinterScopeTests {
 
         init() {}
 
-        var count: Int { runs.reduce(0) { $0 + $1.content.count } }
+        // Run count, not character count: the probe only needs a value that
+        // every non-empty write changes.
+        var writtenUnitCount: Int { runs.count }
 
         mutating func write(_ content: String) {
             runs.append(WrittenRun(content: content, scopeIdentity: scopeStack.last ?? nil))

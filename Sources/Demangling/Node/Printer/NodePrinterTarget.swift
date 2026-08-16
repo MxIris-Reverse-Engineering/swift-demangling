@@ -1,6 +1,26 @@
 public protocol NodePrinterTarget: Sendable {
     init()
-    var count: Int { get }
+    /// How much has been written so far, in whatever unit the target counts.
+    ///
+    /// The printer uses this **only as a delta probe**: it reads the value,
+    /// runs a nested print, and compares against the earlier reading to decide
+    /// whether that print emitted anything — which in turn decides whether a
+    /// qualified-name separator is written. It never does arithmetic on it,
+    /// never compares it across targets, and never treats it as a length.
+    ///
+    /// - Important: the one contract is that **a non-empty `write` must change
+    ///   this value**. Token counts, byte counts and span counts all satisfy
+    ///   it; `String.count` does not, which is why this requirement is not
+    ///   simply `count`. Appending a combining mark to a buffer ending in `.`
+    ///   merges into the preceding grapheme cluster and leaves `String.count`
+    ///   unchanged, so the separator was silently dropped — and because the
+    ///   affected target was `String` itself, no test on the default target
+    ///   could see it either (PR #7 review, fourth round).
+    ///
+    ///   This replaced a bare, undocumented `var count: Int` — the only member
+    ///   of this protocol that carried no contract, while its neighbours had
+    ///   paragraphs about near-miss witnesses.
+    var writtenUnitCount: Int { get }
     mutating func write(_ content: String)
     /// Writes `content` together with the semantic context of the node it
     /// came from, so rich targets can attach per-component annotations.
@@ -75,6 +95,11 @@ extension NodePrinterTarget {
 /// materializes no `Node`; copy this shape for any other target that does not
 /// care about semantic context.
 extension String: NodePrinterTarget {
+    /// UTF-8 bytes, **not** `count`: the delta probe needs a value that every
+    /// non-empty write changes, and appending a combining mark leaves
+    /// `String.count` untouched. See ``NodePrinterTarget/writtenUnitCount``.
+    public var writtenUnitCount: Int { utf8.count }
+
     public mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
         write(content)
     }

@@ -1958,9 +1958,9 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             if multiWordName {
                 postfixContext = context
             } else {
-                let currentPos = target.count
+                let currentPos = target.writtenUnitCount
                 postfixContext = printName(context, asPrefixContext: true)
-                if target.count != currentPos {
+                if target.writtenUnitCount != currentPos {
                     // A module→type dot stays inside the current type's scope
                     // so a fully-qualified name selects as one span; a nested
                     // type's separator dot joins two independently navigable
@@ -1987,7 +1987,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                 target.write(" of ")
                 extraNameConsumed = true
             }
-            let currentPos = target.count
+            let currentPos = target.writtenUnitCount
             if let o = overwriteName {
                 target.write(o)
             } else {
@@ -2004,7 +2004,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                     }
                 }
             }
-            if target.count != currentPos, !extraNameConsumed {
+            if target.writtenUnitCount != currentPos, !extraNameConsumed {
                 target.write(".")
             }
         }
