@@ -23,6 +23,23 @@ static _Atomic uint64_t demangling_allocation_event_count;
 static _Atomic uint64_t demangling_large_allocation_event_count;
 static _Atomic uint64_t demangling_large_allocation_threshold = UINT64_MAX;
 
+/* Counts and returns; it deliberately does NOT chain to
+ * demangling_saved_malloc_logger.
+ *
+ * The consequence is real and worth stating: for the duration of a window, any
+ * tool that was already logging (MallocStackLogging, Instruments Allocations,
+ * `leaks`) sees no allocation events but still sees the matching frees
+ * afterwards, so its live-block set under-counts by exactly the allocations the
+ * window leaves alive — hundreds of thousands of nodes for a bulk NodeStore
+ * build. F13 restored the saved *pointer* at stop(); the events lost *during*
+ * the window are this trade.
+ *
+ * Chaining was considered and rejected: the saved logger is arbitrary
+ * third-party code running inside the allocator, so calling it here reintroduces
+ * the re-entrancy the counting hook is careful to avoid and puts unbounded work
+ * inside the very window whose timing the benchmarks measure. A measurement run
+ * is not the run to profile under another allocation tool
+ * (PR #7 review, finding 12, second defect). */
 static void demangling_counting_malloc_logger(uint32_t type, uintptr_t arg1,
                                               uintptr_t arg2, uintptr_t arg3,
                                               uintptr_t result,
@@ -89,14 +106,26 @@ void demangling_malloc_counter_start(void) {
 }
 
 uint64_t demangling_malloc_counter_stop(void) {
-    int previous_depth = atomic_fetch_sub_explicit(&demangling_malloc_counter_depth, 1,
-                                                   memory_order_acq_rel);
-    if (previous_depth <= 0) {
-        /* Unbalanced stop(): restore the depth and leave the hook alone rather
-         * than installing whatever the save slot happens to hold. */
-        atomic_fetch_add_explicit(&demangling_malloc_counter_depth, 1,
-                                  memory_order_acq_rel);
-    } else if (previous_depth == 1) {
+    /* Decrement only from a positive depth, in one compare-exchange.
+     *
+     * The previous shape was fetch_sub followed by a compensating fetch_add for
+     * the unbalanced case, which left the depth transiently negative. A
+     * concurrent start() reading that negative value takes the "nested" early
+     * return: it neither zeroes the counters nor installs the hook, so its whole
+     * window measures nothing and its stop() reports a stale count from an
+     * earlier window — a benchmark silently publishing a wrong allocation
+     * figure, the failure the depth counter was added to prevent
+     * (PR #7 review, finding 12). */
+    int previous_depth = atomic_load_explicit(&demangling_malloc_counter_depth,
+                                              memory_order_acquire);
+    while (previous_depth > 0 &&
+           !atomic_compare_exchange_weak_explicit(&demangling_malloc_counter_depth,
+                                                  &previous_depth, previous_depth - 1,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+        /* previous_depth was reloaded by the failed exchange; retry. */
+    }
+    if (previous_depth == 1) {
         malloc_logger_t *saved_logger =
             atomic_load_explicit(&demangling_saved_malloc_logger, memory_order_acquire);
         __atomic_store_n(&malloc_logger, saved_logger, __ATOMIC_RELEASE);

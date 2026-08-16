@@ -72,6 +72,12 @@ struct SharedNodeStoreBenchmarks {
                 let isColdPass = passIndex == 0
                 let isFinalPass = passIndex == Self.timedPassCount
                 let footprintSampler = PhysicalFootprintSampler()
+                // The pass body can throw between start() and stop(); a sampler
+                // left running keeps a 2 kHz polling thread alive for the rest
+                // of the process and leaves `malloc_logger` on the counting
+                // hook, degrading every later measurement. A second stop() is a
+                // documented no-op returning 0 (PR #7 review, finding 11).
+                defer { _ = footprintSampler.stop() }
                 if isColdPass { footprintSampler.start() }
                 if isFinalPass { MallocCounter.start() }
 

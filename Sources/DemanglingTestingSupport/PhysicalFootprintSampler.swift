@@ -14,11 +14,32 @@ public final class PhysicalFootprintSampler: @unchecked Sendable {
     private var baselineFootprint: UInt64 = 0
     private var peakFootprint: UInt64 = 0
     private var keepsSampling = false
+    private var samplingThreadStartFailed = false
     private let samplingFinished = DispatchSemaphore(value: 0)
 
     public init() {}
 
+    /// Whether the most recent ``start()`` could not create its sampling
+    /// thread. A window that never opened reports a peak of 0; callers that
+    /// treat 0 as a measurement should check this first.
+    public var lastWindowFailedToStart: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return samplingThreadStartFailed
+    }
+
     /// Records the baseline footprint and starts the sampling thread.
+    ///
+    /// The thread is created with a checked `pthread_create` rather than
+    /// `Thread.start()`, which reports nothing when the OS refuses to make a
+    /// thread. With the unchecked spelling, `keepsSampling` was already true
+    /// when creation failed, so the matching `stop()` passed its `guard` and
+    /// parked forever on a semaphore no thread would ever signal — the whole
+    /// benchmark suite wedging with no diagnostic and no timeout, under exactly
+    /// the thread pressure those suites create. `StackSafeExecutor` documents
+    /// this same hazard twice and is where the shape below comes from
+    /// (PR #7 review, finding 11).
+    ///
     /// - Precondition: no window is currently open. A second `start()` would
     ///   leave two sampling threads polling; the single `stop()` that follows
     ///   signals the semaphore twice but waits once, so the *next* window's
@@ -31,21 +52,55 @@ public final class PhysicalFootprintSampler: @unchecked Sendable {
         baselineFootprint = currentFootprint
         peakFootprint = currentFootprint
         keepsSampling = true
+        samplingThreadStartFailed = false
         lock.unlock()
 
-        let thread = Thread { [self] in
-            while true {
-                lock.lock()
-                let continues = keepsSampling
-                lock.unlock()
-                guard continues else { break }
-                recordSample(Self.currentFootprint())
-                usleep(500)
-            }
-            samplingFinished.signal()
+        var threadAttributes = pthread_attr_t()
+        guard pthread_attr_init(&threadAttributes) == 0 else {
+            abandonUnstartedWindow()
+            return
         }
-        thread.qualityOfService = .userInitiated
-        thread.start()
+        defer { pthread_attr_destroy(&threadAttributes) }
+        guard pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0 else {
+            abandonUnstartedWindow()
+            return
+        }
+        _ = pthread_attr_set_qos_class_np(&threadAttributes, QOS_CLASS_USER_INITIATED, 0)
+
+        let samplerContext = Unmanaged.passRetained(self).toOpaque()
+        var threadHandle: pthread_t?
+        let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
+            let sampler = Unmanaged<PhysicalFootprintSampler>.fromOpaque(rawContext).takeRetainedValue()
+            pthread_setname_np("swift-demangling.footprint-sampler")
+            sampler.runSamplingLoop()
+            return nil
+        }, samplerContext)
+        guard creationResult == 0 else {
+            Unmanaged<PhysicalFootprintSampler>.fromOpaque(samplerContext).release()
+            abandonUnstartedWindow()
+            return
+        }
+    }
+
+    /// Closes a window whose sampling thread never started, so the matching
+    /// `stop()` returns 0 instead of blocking on a semaphore nobody will signal.
+    private func abandonUnstartedWindow() {
+        lock.lock()
+        keepsSampling = false
+        samplingThreadStartFailed = true
+        lock.unlock()
+    }
+
+    private func runSamplingLoop() {
+        while true {
+            lock.lock()
+            let continuesSampling = keepsSampling
+            lock.unlock()
+            guard continuesSampling else { break }
+            recordSample(Self.currentFootprint())
+            usleep(500)
+        }
+        samplingFinished.signal()
     }
 
     /// Stops sampling and returns the peak footprint growth over the
