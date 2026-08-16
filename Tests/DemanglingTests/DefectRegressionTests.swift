@@ -1777,6 +1777,38 @@ struct DefectRegressionTests {
         ])))
     }
 
+    /// `mangleDifferentiableFunctionType` and `mangleImplDifferentiabilityKind`
+    /// narrowed with `UInt32(exactly:)` but had no `else`, so an index that
+    /// does not name a Unicode scalar produced a legal-looking prefix with the
+    /// payload byte missing — `"Yj"` instead of `"Yjf"` — and `canMangle`
+    /// reported `true`. A consumer using that as a lookup key silently
+    /// collides with, or fails to match, the real symbol.
+    ///
+    /// The comment above the sibling site says an out-of-range index "has to
+    /// reach that channel, not abort"; the `if let` never had the `else` that
+    /// would make that true. `mangleAutoDiffFunctionKind`, narrowed in the
+    /// same commit, does throw.
+    ///
+    /// Note the surrogate and out-of-plane cases already went silent on
+    /// `next`: `UnicodeScalar(_: UInt32)` is failable, so `ffd6f87` widened an
+    /// existing channel rather than opening one.
+    @Test func differentiabilityMarkersRejectUnrepresentableIndices() throws {
+        let unrepresentable: [UInt64] = [0xD800, 0xDFFF, 0x11_0000, UInt64(UInt32.max) + 1, .max]
+        for kind in [Node.Kind.differentiableFunctionType, .implDifferentiabilityKind] {
+            for index in unrepresentable {
+                let node = Node.create(kind: kind, index: index)
+                #expect(throws: ManglingError.self, "\(kind) index 0x\(String(index, radix: 16)) must be rejected") {
+                    try mangleAsString(node)
+                }
+                #expect(canMangle(node) == false, "\(kind) index 0x\(String(index, radix: 16)) must not report manglable")
+            }
+        }
+
+        // A representable payload still mangles, marker byte included.
+        let reverse = Node.create(kind: .differentiableFunctionType, index: UInt64(UnicodeScalar("f").value))
+        #expect(try mangleAsString(reverse) == "Yjf")
+    }
+
     /// The printer decides whether to write a qualified-name separator by
     /// reading the target's size before and after a nested print — a *delta*
     /// probe, never an absolute or arithmetic use. The contract it needs is

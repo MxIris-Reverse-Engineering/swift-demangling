@@ -3423,9 +3423,17 @@ extension Remangler {
         // `UInt32(index)` trapped for an index above UInt32.max. Mangling is
         // a typed-throws API whose contract is to reject malformed trees, so
         // an out-of-range index has to reach that channel, not abort.
-        if let index = node.index, let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) {
-            append(Character(scalar))
+        //
+        // It also must not be dropped: without the `else` this emitted the
+        // node's other bytes and silently omitted the marker, so `canMangle`
+        // answered `true` for a mangling that is missing a payload byte.
+        // `UnicodeScalar(_: UInt32)` is failable, so surrogates and
+        // out-of-plane values take this path too — not just >UInt32.max.
+        guard let index = node.index, let narrowedIndex = UInt32(exactly: index),
+              let scalar = UnicodeScalar(narrowedIndex) else {
+            throw .invalidNodeStructure(node, message: "ImplDifferentiabilityKind index does not name a Unicode scalar")
         }
+        append(Character(scalar))
     }
 
     private mutating func mangleImplCoroutineKind(_ node: Node, depth: Int) throws(ManglingError) {
@@ -4163,13 +4171,16 @@ extension Remangler {
     }
 
     private mutating func mangleDifferentiableFunctionType(_ node: Node, depth: Int) throws(ManglingError) {
+        // See `mangleImplDifferentiabilityKind` for why the narrowing must
+        // throw rather than silently omit the marker byte.
         guard let index = node.index else {
             throw .invalidNodeStructure(node, message: "DifferentiableFunctionType has no index")
         }
-        append("Yj")
-        if let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) {
-            append(Character(scalar))
+        guard let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) else {
+            throw .invalidNodeStructure(node, message: "DifferentiableFunctionType index does not name a Unicode scalar")
         }
+        append("Yj")
+        append(Character(scalar))
     }
 
     private mutating func mangleDirectness(_ node: Node, depth: Int) throws(ManglingError) {
