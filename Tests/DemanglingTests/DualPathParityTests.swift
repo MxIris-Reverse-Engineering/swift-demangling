@@ -43,10 +43,59 @@ struct DualPathParityTests {
         }
     }
 
+    /// Whether the default entry can actually take the modern leg in this
+    /// process. Both routes that collapse it are checked: the process-wide
+    /// environment seam, and the OS version the `#available` guard tests.
+    ///
+    /// - SeeAlso: ``dualPathParityCoversTheModernLeg()``, which turns "no" into
+    ///   a visible result instead of a vacuous pass.
+    static var modernLegIsReachable: Bool {
+        if DemanglingRuntimePath.forcesLegacyPath { return false }
+        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
+            return true
+        }
+        return false
+    }
+
+    /// Guards every `assertParity` below. The comparison is only meaningful
+    /// when the default entry is on the *modern* leg; otherwise both sides run
+    /// the legacy path, every expectation is trivially equal, and the suite is
+    /// green while covering nothing.
+    ///
+    /// The suite's own doc comment anticipated the environment-variable route
+    /// and called it harmless. The OS-version route is not harmless: a
+    /// developer or CI runner on a host older than macOS 26 gets zero coverage
+    /// of the modern leg with no signal at all. This is precisely the blind
+    /// spot `BorrowedTextViewTests.lifetimesFeatureIsEnabledInTestTarget`
+    /// documents about itself — "blind to gates in *other* targets and to
+    /// `#available` runtime guards" — applied to the axis it could not see
+    /// (PR #7 review, fourth round).
+    @Test func dualPathParityCoversTheModernLeg() {
+        if DemanglingRuntimePath.forcesLegacyPath {
+            // Deliberate: the CI double-run pins the legacy leg process-wide
+            // and this pass is *expected* to compare legacy against legacy.
+            return
+        }
+        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, macCatalyst 26.0, *) {
+            // The default entry is the modern leg; the parity tests are real.
+        } else {
+            Issue.record("""
+            This host predates the modern demangling leg (macOS 26 / iOS 26 / \
+            tvOS 26 / watchOS 26 / visionOS 26 / macCatalyst 26), so \
+            `demangleAsNode` already resolves to the legacy path and every \
+            parity test in this suite compares the legacy leg against itself. \
+            The suite passes without exercising the utf8Span scanner, \
+            InlineWordRanges or prevalidated materialization at all. Run the \
+            0008 parity suite on a modern host before trusting it as evidence.
+            """)
+        }
+    }
+
     /// Under a CI double-run (`DEMANGLING_FORCE_LEGACY_PATH=1`, set at
     /// process launch) the default entry is already on the legacy leg and
     /// the comparison degrades to legacy vs legacy — trivially equal,
-    /// harmless.
+    /// harmless. The OS-version route to the same degradation is *not*
+    /// harmless and is reported by ``dualPathParityCoversTheModernLeg()``.
     private static func assertParity(_ mangled: String, isType: Bool = false, sourceLocation: SourceLocation = #_sourceLocation) {
         let defaultPathOutcome = outcome(for: mangled, isType: isType) { (mangledSymbol, isTypeSymbol) throws(DemanglingError) in
             try demangleAsNode(mangledSymbol, isType: isTypeSymbol, internsSubtrees: false)
