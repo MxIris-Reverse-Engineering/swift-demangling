@@ -71,16 +71,25 @@ public protocol NodePrinterTarget: Sendable {
     ///   diagnostic, which a text-comparison snapshot test cannot see either.
     ///   A near-miss is now a conformance error instead.
     mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?)
+    /// Ends the scope opened by the matching ``pushTypeReferenceScope(_:)``.
+    ///
+    /// - Important: like its twin, this has **no default implementation**, but
+    ///   for a different reason. The argument-less signature means there is no
+    ///   near-miss witness for a default to absorb — that hazard genuinely
+    ///   cannot arise here, and an earlier round kept the no-op default on
+    ///   exactly that reasoning. What it misses is the *paired-requirement*
+    ///   hazard: a target that witnesses `push` and forgets `pop` inherits a
+    ///   silent no-op, so its scope stack only ever grows and every write after
+    ///   the first nominal reference is attributed to that nominal — siblings
+    ///   and the rest of the symbol included. The printed text is
+    ///   byte-identical, so no snapshot test can see it, which is the same
+    ///   failure mode this protocol's other two requirements were hardened
+    ///   against. Costing each conformer one line turns the omission into a
+    ///   conformance error (PR #7 review, fourth round).
     mutating func popTypeReferenceScope()
 }
 
 extension NodePrinterTarget {
-    /// Kept as a default: it takes no argument, so there is no near-miss
-    /// signature for it to absorb — the hazard that removed the defaults for
-    /// ``write(_:context:)`` and ``pushTypeReferenceScope(_:)`` cannot arise
-    /// here.
-    public mutating func popTypeReferenceScope() {}
-
     public mutating func writeSpace(_ count: Int = 1) {
         write(" ")
     }
@@ -105,4 +114,6 @@ extension String: NodePrinterTarget {
     }
 
     public mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
+
+    public mutating func popTypeReferenceScope() {}
 }

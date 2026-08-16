@@ -525,9 +525,12 @@ struct DefectRegressionTests {
                 moduleContextNodeTexts += other.moduleContextNodeTexts
             }
 
-            // Scopes are not what this target records, but the requirement
-            // carries no default, so ignoring it has to be explicit.
+            // Scopes are not what this target records, but neither hook
+            // carries a default, so ignoring them has to be explicit — and
+            // `pop` is deliberately paired with `push` here rather than
+            // inherited, so a target that tracks scopes cannot forget it.
             mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
+            mutating func popTypeReferenceScope() {}
         }
 
         let mangled = "$sSaySiGD"
@@ -1470,6 +1473,7 @@ struct DefectRegressionTests {
         }
 
         mutating func pushTypeReferenceScope(_ node: @autoclosure () -> Node?) {}
+        mutating func popTypeReferenceScope() {}
     }
 
     /// `levels` nested two-element `.typeList`s over one shared instance:
