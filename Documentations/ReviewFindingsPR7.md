@@ -405,13 +405,48 @@ probe package 实跑取证。结论未变，但**复用上一轮的 worktree 跑
 | F5 | `Node.indexAsCharacter` 在公开**非抛出**访问器上用 trapping 的 `UInt32(_:)` 窄化 | `DefectRegressionTests.indexAsCharacterAboveUInt32MaxIsNilInsteadOfTrapping` |
 | F15 | 双路径 parity 套件无可用性守卫，在 macOS 26 以下整体退化为 legacy-vs-legacy 恒真通过，零信号 | `DualPathParityTests.dualPathParityCoversTheModernLeg` |
 
-**待修（下一批）**：F6 + F12（contents/children 同传，同根，需全库横扫）、F10（`hasChildren`
-覆写因非协议要求而从不派发）、F4、F8、F11（async walk 的 printer 生命周期越界）。
+**已修（第二批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| F6 | 五个公开工厂 + 两个 SPI + 两个内部 `createInterned` 仍能同传 contents 与 children，contents 被静默丢弃并经 intern key 合并不同请求 —— 而 `Node+Init.swift` 的注释已宣称该组合「无法拼写」 | `DefectRegressionTests.nodeFactoriesCannotSpellContentsWithChildren`（源码扫描，已验证能抓到违规） |
+| F10 | `hasChildren` 是扩展成员而非协议要求，`Node` 的 payload-tag 覆写在泛型上下文从不派发，整个优化空转 | `DefectRegressionTests.hasChildrenDispatchesThroughTheWitnessTable` |
+| F4 | 可微分标记的收窄无 `else`，产出缺载荷的合法前缀且 `canMangle` 报 `true` | `DefectRegressionTests.differentiabilityMarkersRejectUnrepresentableIndices` |
+| F8 | `NodePrinterTarget.count` 无契约，`String` 违反增量探针语义，组合符起首的 identifier 吞掉限定名分隔点 | `DefectRegressionTests.combiningMarkIdentifiersKeepTheirQualifiedNameSeparator` + `targetsWithDifferentUnitCountsPrintIdenticalText` |
+| F11 | async `runPrintWalk` 的 printer 声明在 `withUnsafePointer` 之外，`printCache` 的 key 指向已退出的栈槽 | 无（见「无法测试的部分」） |
 
 **待排期**：F7（泛型签名 marker 扫描窗口）、F13（`popTypeReferenceScope` 默认实现）、
 F14（`demangleAsNode` 文档给出反向建议）。
 
-**不作为缺陷修**：F9 → 已并入 [KnownIssues #1](KnownIssues.md)。
+**不作为缺陷修**：F9 → [KnownIssues #1](KnownIssues.md)；**F12 → [KnownIssues N18](KnownIssues.md)**。
+
+### F12 的重新裁决（原判为「F6 的同根」，不成立）
+
+F12 被归类为「contents/children 互斥问题经 demangler 到达」。查上游后两个前提都不成立：
+
+- **上游 `Demangle::Node` 的 payload 同样是互斥 union**，本库的 `Payload` 是忠实移植，
+  不是本库的发明，所以这不是「移植时引入的设计缺陷」。
+- **上游已经完全移除了 unique ID 的解析**（`demangleSpecAttributes(Node::Kind)` 没有
+  `demangleUniqueID` 参数，`Demangler.cpp` 里 `UniqueID` 零命中），而上游 Remangler 里对应的
+  重新发射分支**同样是死代码**（`addChild` 之后 `hasIndex()` 必为 false）。上游自身即不对称。
+
+删除本库的解析反而会改变消费的字节数，而实测本库与 `swift-demangle` 对 `Tf` 符号的接受/拒绝
+完全一致（含 pass ID 后跟数字的构造，两侧都拒绝）。因此只把「解析后丢弃」写成显式的
+`_ = try demangleNatural()` 并附理由，不改变行为。详见 KnownIssues N18。
+
+### F8 的修法：给探针一个有契约的成员
+
+`NodePrinterTarget.count` 换成 `writtenUnitCount`，契约写进文档：**非空 `write` 必须改变它**。
+printer 的四处探针随之改名，`String` 的 conformance 用 `utf8.count`。
+
+没有采用「printer 自维护写入计数器」那条路：它要改 334 个 `target.write` 调用点，而这条缺陷
+真实 Swift 符号触发不了（标识符不能以组合符开头，非 ASCII 走 punycode）。334 处机械替换的
+风险高于收益。换成协议成员只动了协议、`String` conformance、四处探针和四个测试 target —— 而且
+后者是编译错误暴露出来的，正是「删掉默认实现让遗漏变成编译错误」的既定取舍在起作用。
+
+新增 `targetsWithDifferentUnitCountsPrintIdenticalText`：一个 token 计数的 target（下游
+`SemanticString` 的形状）必须与 `String` 打印出逐字节相同的文本 —— 这正是契约存在的目的，
+而任何只在 `String` 上跑的测试都验证不到。
 
 ## F3 的修法：buffer 整体字节化
 
@@ -463,3 +498,13 @@ F5 一处（`Punycode.swift:30/87` 有 `if value < 0x80` 前置守卫；`TypeDec
   改用两个模拟验证：把 `#available` 的版本临时改为 99.0 → 退出码 1 并 record issue；
   设 `DEMANGLING_FORCE_LEGACY_PATH=1` → 退出码 0（该路径是有意的 CI 双跑，不应报错）。
   验证后已还原版本号。
+- **F11（async walk 的 printer 生命周期）**：当前**没有**可观测的失败。`printCache` 的 key 是
+  POD，字典析构不解引用其中的指针，所以栈槽退出后也读不到坏数据。构造一个会真正读到已释放
+  栈的场景需要让 printer 在 `withUnsafePointer` 返回后再被使用，而修复恰恰是让它不可能被这样
+  使用。修复站在**构造**上（与同步版对齐、生命周期由词法作用域保证），不站在复现上 —— 与
+  第三轮 finding 12 的处理相同。
+- **F6 的编译期性质**：「无效组合无法拼写」是编译期保证，运行时测不到。守卫是源码扫描
+  （`nodeFactoriesCannotSpellContentsWithChildren`），且已实测：临时把 `contents:` 加回主力
+  重载后该测试退出码为 1 并点名违规行。扫描对「经中间层洗过的调用」失明，但这一类的入口
+  （`Node.init`）本就是 `mergedPayload` 存在的理由，不在守卫范围内 —— 与 N1 的
+  拼写守卫/行为守卫互补关系相同。

@@ -632,3 +632,38 @@ append 覆盖对方的元素（包括已发布给读者的元素）——**静�
 
 真实存在的是两件小事，已一并处理：多付一次共享 store 的锁，以及「同一个逻辑读跨两个
 快照」这个坏味道。现在改为一次解析同时供给描述符和字节。
+
+## N18. `Tf` 的 unique ID 在往返中丢失（PR #7 第四轮 review）
+
+**发现**：`demangleSpecAttributes` 把解析出的 unique ID 作为 `contents` 与 `children` 一起传给
+`createNode`，`mergedPayload` 因两者互斥而丢弃它，所以
+`.functionSignatureSpecialization` 节点的 `index` 恒为 `nil`（实测真实符号确认）。连带
+`Remangler.swift` 里 `if child.kind == .specializationPassID, let index = node.index` 这个
+分支永不触发，带 unique ID 的 `Tf` 符号 remangle 后丢 ID。被归类为「finding 6 的同根，经
+demangler 到达」。
+
+**裁决：不作为缺陷修，与上游一致，2026-08-16。**
+
+根因不是 contents/children 互斥的移植问题 —— **上游 `Demangle::Node` 的 payload 同样是
+互斥 union**（`Text` / `Index` / `InlineChildren` / `Children` / `RemoteAddress`），本库的
+`Payload` 是忠实移植。三点证据：
+
+1. **上游已经完全移除了 unique ID 的解析。** 当前 `swiftlang/swift` main 的签名是
+   `Demangler::demangleSpecAttributes(Node::Kind SpecKind)` —— 没有 `demangleUniqueID` 参数，
+   函数体内也没有任何 `demangleNatural()`；整个 `Demangler.cpp` 里 `UniqueID` 零命中。
+   `demangleFunctionSpecialization` 直接调用它。本库的 `demangleUniqueId: Bool` 是旧版移植残留。
+2. **上游 Remangler 的对应分支同样是死代码。** `mangleFunctionSignatureSpecialization` 里
+   `if (Child->getKind() == Node::Kind::SpecializationPassID && node->hasIndex())` 仍在，
+   但 `SpecNd->addChild(...)` 之后 payload 变成 children，`hasIndex()` 必为 false。上游自己
+   也不对称：Remangler 留着旧格式的支持，Demangler 不再产生它。
+3. **删除解析反而是行为变更**：`demangleNatural()` 会**消费输入**，删掉它会改变后续解析看到
+   的字节。而实测本库与 `xcrun swift-demangle` 对 `Tf` 符号的接受/拒绝完全一致，包括 pass ID
+   后面跟数字的构造（`Tf14nc_n`、`Tf123nc_n` 两侧都拒绝），没能构造出产生偏离的输入。
+
+**已做的处理**：把「解析后丢弃」写成显式的 `_ = try demangleNatural()` 并附上以上理由，
+不再伪装成「存进 contents」。Remangler 侧的死分支与上游一致，保留不动。若要真正保留 unique
+ID，需要改 `Payload` 让 contents 与 children 共存 —— 那会偏离上游的节点模型，属架构级改动，
+应走提案，且当前没有需求驱动。
+
+与 [#1](#1-typedecoder多处会陷入trap的整数转换) 的 layout 死分支同类：**移植缺陷与上游缺陷
+要分开裁决，本库不单方面偏离上游。**

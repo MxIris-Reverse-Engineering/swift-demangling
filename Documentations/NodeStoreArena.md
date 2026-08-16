@@ -55,12 +55,15 @@ struct 的价值在于**精确布局 + 可平铺进连续缓冲**，所以正确
 
 ## 源码兼容性
 
-`Node`、`NodeBuilder`、`NodeCache`、`demangleAsNode`、`TypeDecoder<Builder>`、
-`TypeBuilder` 的签名与行为全部保持。**有三处刻意的源码破坏**，都只影响自己实现
-`NodePrinterTarget` 或直接构造 printer 的下游（已知的只有 MachOSwiftSection）：
+`NodeBuilder`、`demangleAsNode`、`TypeDecoder<Builder>`、`TypeBuilder` 的签名与行为保持。
+**有六处刻意的源码破坏**，影响自己实现 `NodePrinterTarget`、直接构造 printer、或手工组装
+`Node` 树的下游（已知的只有 MachOSwiftSection）：
 
 | 破坏 | 变更 | 为什么 |
 |---|---|---|
+| `Node.create` / `Node.createTransient` / `NodeCache.createInterned` 全系列 | 不再存在同时接受 `contents:` 与 `children:`/`inlineChildren:`/`childrenBuilder:` 的重载；拆成「只带 contents」与「只带 children」两组 | contents 与 children 在 `Payload` 里互斥（上游 `Node` 同样是 union），`mergedPayload` 让 children 优先且**静默**丢弃 contents，两个 text 不同的请求还会经子树 intern key 合并成同一实例。拆开后无效组合无法拼写。由 `DefectRegressionTests.nodeFactoriesCannotSpellContentsWithChildren` 扫描守住 —— 上一次靠手工删除，漏掉了主力重载，而注释已经宣称删干净了。 |
+| `NodePrinterTarget.count` | 更名并重新定义为 `writtenUnitCount`，契约写进文档：**非空 `write` 必须改变它** | printer 只把它当增量探针用（判断嵌套打印有没有产出，据此决定是否写限定名分隔点），而 `String.count` 违反该契约：往以 `.` 结尾的缓冲追加组合符会并入前一个字素簇，计数不变，分隔点被静默跳过。受害者是 `String` 本身（本库默认 target），不是富文本 target。原成员是该协议**唯一没有契约文档**的成员。 |
+| `Node: Codable` | 已移除 | 见 `06a423c`。 |
 | `NodePrinterTarget.write(_:context:)` | `NodePrintContext?` → `@autoclosure () -> NodePrintContext?`，且**删除了协议扩展里的默认实现** | 默认实现在的时候，一个按旧签名写的实现不构成 witness，默认实现会静默顶替它：打印文本一字不差，所有上下文标注全部消失，且 Swift 对「存在默认实现时的 near-miss witness」没有任何警告。删掉默认实现后，同样的写法变成定义处的编译错误。代价是每个 target 都得写出这个方法（包括纯文本的），这是有意的取舍。 |
 | `NodePrinterTarget.pushTypeReferenceScope(_:)` | `Node?` → `@autoclosure () -> Node?`，同样删除默认实现 | 同上。原来的 no-op 默认实现会吸收掉按 `Node?` 写的实现，scope 事件随之消失而文本不变——文本比对的快照测试同样看不见。 |
 | `NodePrinter<Target>` | `public struct` → `public enum`（只剩静态成员），失去公共 `init`/`printRoot` | 打印逻辑移进泛型引擎 `DemanglingPrinter<Target, SomeNode>`，`NodePrinter` 退化为入口。迁移路径见 `Documentations/StackSafety.md`。 |
@@ -68,8 +71,53 @@ struct 的价值在于**精确布局 + 可平铺进连续缓冲**，所以正确
 此外 `NodeReference.textUTF8` 更名为 `textUTF8Bytes`（F10 维护者裁决），因此提案 0010
 「`NodeReference` 的公开 API 不变」一句已不成立，以本表为准。
 
-> 历史注记：本文档与提案 0010 曾声称「公共 API 零破坏」。那句话写于 PR#6 时期，其后三处
-> 破坏分批落地，声明没有跟着更新。PR#7 review（finding 10）发现了这个矛盾，本节即是更正。
+`DemanglingNode` 新增要求 `var hasChildren: Bool { get }`（带默认实现）。对既有 conformer
+是源码兼容的 —— 默认实现覆盖它 —— 但自定义 conformer 若原先靠扩展成员「覆写」它，现在才
+真正生效。
+
+### 下游迁移（已核对 MachOSwiftSection 当前代码）
+
+**1. 工厂拆分 —— 三处需要改**
+
+| 位置 | 现写法 |
+|---|---|
+| `SwiftLayout/GenericArgumentEnvironment.swift:250` | `Node.create(kind: node.kind, contents: node.contents, children: rewrittenChildren)` |
+| `SwiftDeclarationRendering/RuntimeFieldLayoutBackend.swift:446` | `Node.create(kind: node.kind, contents: node.contents, children: Array(substitutedChildren))` |
+| `SwiftInspection/MetadataReader.swift:572` | `.create(kind: .type, contents: .none, children: [child])` |
+
+第三处直接删掉 `contents: .none` 即可。
+
+前两处是**树重写**模式，值得说明：它们看起来「保留 contents 并换掉 children」，实际上一直
+依赖一个隐含事实 —— `node.contents` 对有 children 的节点恒为 `.none`（两者在 `Payload` 里
+互斥），所以传过去的永远是 `.none`。行为是对的，但正确性来自巧合而非意图。拆分后要显式
+分情况：
+
+```swift
+rewrittenChildren.isEmpty
+    ? Node.create(kind: node.kind, contents: node.contents)
+    : Node.create(kind: node.kind, children: rewrittenChildren)
+```
+
+**2. `NodePrinterTarget.writtenUnitCount` —— `SemanticString` 需加一行**
+
+```swift
+extension SemanticString: @retroactive NodePrinterTarget {
+    public var writtenUnitCount: Int { count }   // atoms.count：非空写入必增，满足契约
+    ...
+}
+```
+
+`SemanticString` 原先靠自身的 `count`（`_storage.atoms.count`）满足旧要求，语义恰好正确 ——
+它是**每次写入 append 一个 atom**，而不是对拼好的文本计数，所以非空写入必然改变它。改名后
+补一行转发即可。反倒是 `String` 违反了契约，那是本库自己修掉的部分。
+
+> 历史注记：本文档与提案 0010 曾声称「公共 API 零破坏」。那句话写于 PR#6 时期，其后破坏
+> 分批落地，声明没有跟着更新。PR#7 review（finding 10）发现了这个矛盾，本节即是更正。
+>
+> **第四轮 review 发现更正本身也不完整**：改成「三处」的那次提交，同时删掉了六个
+> `Node.create` 重载与两个 `NodeCache.intern` 重载、去掉了 `Node: Codable`，本节一处未记 ——
+> 与它修正的问题是同一类。第五批（本轮）把表补全并改为六处。教训是同一个：**兼容性清单要
+> 从「这次改了哪些公开符号」推导，不要从「我记得破坏了什么」推导。**
 
 ## 关键设计
 
