@@ -341,3 +341,125 @@ throw 的理由。
   不站在复现上。
 - **finding 3 的深度边界**：debug 构建约 745 帧就爆栈（KnownIssues #4），768 的边界只能
   在 release 测试构建里跑。测试用 `#if DEBUG` 跳过，`swift test -c release` 时生效。
+
+---
+
+# 第四轮（`max` 档全量复审，2026-08-16）
+
+## 元信息
+
+| 项 | 值 |
+|---|---|
+| 审查目标 | PR #7 `feature/node-store` @ `7eb903a` |
+| 对比基线 | `next` @ `04c959b` |
+| 审查日期 | 2026-08-16 |
+| 复审 | 同仓库第二个 agent 会话独立复核（双侧 `git show` 逐字节比对、上游 `swiftlang/swift` 源码对拍、两个下游仓库实现核查） |
+| 结论 | 15 条主发现无一误报；复审推翻 1 条定性、修正 1 条受害者、重写 1 条第四问 |
+
+## 前置：上一轮的探针跑在了旧代码上
+
+第三轮遗留的 `pr7head` 只读 worktree 停在 `2624d14`，而那正是第三轮的**审查目标**——
+其后的 11 个 commit（`680f8f9` … `7eb903a`）是第三轮的修复成果。本轮 review 读的是新代码
+（引用了 `badb778` / `eff0716` / `5116786` 的内容），**执行探针用的却是那个旧 worktree**。
+本轮全部 15 条已在 `7eb903a` 上逐条重新核对代码，并在 `7eb903a` 与 `04c959b` 各建 worktree +
+probe package 实跑取证。结论未变，但**复用上一轮的 worktree 跑新一轮的探针是个必须避免的坑**：
+它产生的证据看起来完全正常。
+
+## 复审订正的三处（记录以免再犯）
+
+1. **F4 的新旧定性两边都不对**。`UnicodeScalar(_: UInt32)` 是**失败初始化器**，对 surrogate
+   区（0xD800–0xDFFF）与 >0x10FFFF 返回 `nil`，所以 `next` 上 `if let scalar = UnicodeScalar(UInt32(index))`
+   在这些窗口**本来就静默丢标记**；只有 index > `UInt32.max` 才会被 `UInt32(index)` 的窄化 trap。
+   `ffd6f87` 做的是把 >`UInt32.max` 那个窗口从崩溃**并入既有的静默通道**——是扩大触发窗口，
+   既不是「本 PR 引入静默损坏」，也不是「与基线完全相同」。实测（HEAD）：index 取
+   `0xd800` / `0xdfff` / `0x110000` / `0x100000000` 一律得到 `"Yj"` 且 `canMangle` 为 `true`，
+   而正确输出是 `"Yjf"`。
+2. **F8 的受害者判反了**。原判为「下游 `SemanticString` 会打错」，实测相反：printer 对
+   `target.count` 的两处用法（`NodePrinter.swift:1961/1963`、`1990/2007`）都是**增量探针**
+   （`let currentPos = target.count … if target.count != currentPos`），从不做算术、不用绝对值，
+   所需契约仅为「非空写入必使 count 变化」。`SemanticString` 满足它（`SemanticString+Mutation.swift:42`
+   的 `appendAtomElement` 空串直接 `return`，非空必 append ≥1 atom）；**违反契约的是 `String`**：
+   buffer 已以 `.` 结尾时写入组合符 U+0301 会并入前一个字素簇，`String.count` 增量为 0，探针
+   遂跳过分隔符。三目标对拍同一棵以组合符命名的构造器树：
+   `String` → `"Mod.́init() -> Swift.Int"`（少一个 `.`），字节计数目标与 token 计数目标均为
+   `"Mod.́.init() -> Swift.Int"`。**但「构造不出触发场景」的反驳同样不成立**——分歧是实测出来的，
+   只是触发面窄（Swift 标识符不能以组合符开头，非 ASCII 标识符走 punycode 因而是 ASCII），
+   够不上合并阻断。
+   **定性随之改变，修法也要跟着改**：受害者既然是 `String`，这就是核心库自身在**默认 target**
+   上的缺陷——以组合符起首的 identifier 会吞掉限定名的分隔点——而不再只是「下游 rich target
+   的契约风险」。所以后续按「printer 自维护写入计数器」修时，回归测试应当建在本仓库的
+   `String` 路径上，不要等下游来发现。
+3. **F9 的第四问要重写**：死分支是**上游同款**，见 [KnownIssues #1](KnownIssues.md) 的
+   2026-08-16 补充段。连带否掉「五处 `return` 应为 `continue`」的子发现。
+
+## 处置索引
+
+**已修（本批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| F3 | 本轮**唯一的新回归**：0008 把 demangler 的标识符长度前缀改为按字节读，remangler 仍按字素簇写，`mangleAsString(_:usePunycode: false)` 产出本库自己 demangle 不回来的串 | `DefectRegressionTests.nonPunycodeManglingRoundTripsForNonASCIIIdentifiers` |
+| F1 | `mangleDependentGenericInverseConformanceRequirement` 用 `!` 读 child 1 的 index，从公开 `canMangle` 杀进程（exit 133）；`try?` 拦不住 trap | `DefectRegressionTests.inverseConformanceWithoutAnIndexThrowsInsteadOfTrapping` |
+| F1-附 | 同一函数：上游 `case -1` 以 `return ...; // substitution` 结束，本库漏了该 `return`，substitution 分支把 index mangle 了两遍（`3ModRI2_` 写成 `3ModRI2_2_`）。**预存缺陷，非 15 条之一**，对照上游时浮出 | `DefectRegressionTests.inverseConformanceSubstitutionBranchEmitsItsIndexOnce` |
+| F2 | `mangleDependentConformanceIndex` 的 `node.index! + 2` 无溢出守卫，近 `UInt64.max` 的 index 从 `mangleAsString` 与 `canMangle` 双双杀进程 | `DefectRegressionTests.conformanceIndexNearUInt64MaxThrowsInsteadOfTrapping` |
+| F5 | `Node.indexAsCharacter` 在公开**非抛出**访问器上用 trapping 的 `UInt32(_:)` 窄化 | `DefectRegressionTests.indexAsCharacterAboveUInt32MaxIsNilInsteadOfTrapping` |
+| F15 | 双路径 parity 套件无可用性守卫，在 macOS 26 以下整体退化为 legacy-vs-legacy 恒真通过，零信号 | `DualPathParityTests.dualPathParityCoversTheModernLeg` |
+
+**待修（下一批）**：F6 + F12（contents/children 同传，同根，需全库横扫）、F10（`hasChildren`
+覆写因非协议要求而从不派发）、F4、F8、F11（async walk 的 printer 生命周期越界）。
+
+**待排期**：F7（泛型签名 marker 扫描窗口）、F13（`popTypeReferenceScope` 默认实现）、
+F14（`demangleAsNode` 文档给出反向建议）。
+
+**不作为缺陷修**：F9 → 已并入 [KnownIssues #1](KnownIssues.md)。
+
+## F3 的修法：buffer 整体字节化
+
+`Remangler.buffer` 由 `String` 改为 `[UInt8]`，与上游 `Mangler` 的 `SmallString` 语义对齐。
+这不是「把长度前缀改成字节数」能了结的局部改动——`mangleIdentifier` 的 `pos`、
+`SubstitutionWord.start`/`.length`、`WordReplacement.stringPos`、`SubstitutionMerging` 的
+`lastSubstPosition`/`lastSubstSize` 共用同一套位置语义，只改一处会留下字节/字素簇混用，
+把一个清楚的缺陷换成一个隐蔽的。同批新增 `UInt8` 版的 `isDigit` / `isUpperLetter` /
+`isWordStart` / `isWordEnd`：上游的扫描跑在 `char` 上，多字节标量对它就是几个互不相同的
+字符，且没有一个是数字、`_`、NUL 或大写字母——字节版在 `UInt8` 上重现了这一点
+（>= 0x80 的字节对每个范围判定都为假，与上游的负 `char` 一致）。
+
+**ASCII 输出逐字节不变**是这次改动的安全网：现有 552 个测试全部通过，加真实 dyld cache
+符号语料的 remangle / print parity sweep（`DEMANGLING_PRINT_PARITY=1`，release）。
+
+**顺带修掉一个基线上的角落**：`next` 上 remangler 写字素簇数、0008 之前的 demangler 读
+scalar 数，两者对 NFC 的 `café` 恰好相等（1 scalar = 1 字素簇），对 **NFD** 的 `café`
+（`e` + U+0301）则不等。所以「`next` 上能往返」只对 NFC 成立；本 PR 把错配从「非 NFC 才
+触发」扩大到「所有非 ASCII」。回归测试同时覆盖 NFC、NFD 与纯多字节标识符。
+
+## 元教训：横向排查扫的是「拼写」，不是「同一类问题」
+
+15 条里 6 条的第四问答案是「前次修复漏网或声称关闭实未关闭」，且集中在同一个动作上：
+
+- **F5** —— `ffd6f87`（"close the four public-API paths that trap on overflow"）改的正是
+  `UnicodeScalar(UInt32(index))` 这个**一模一样的表达式**，改了 Remangler ×4、TypeDecoder ×3、
+  NodePrinter ×2、Punycode，唯独漏了 `Node+Conversions.swift`。
+- **F1** —— `680f8f9` 修的是同一根因（校验后无条件读子节点），commit message 自述「An earlier
+  round removed the assert-then-read pattern elsewhere in this file」，扫的是 `assert`-then-read
+  这个**拼写**，`index!` 强解包的拼写没扫。
+- **F6** —— `eff0716` 的 commit message 正确描述了根因（"Every factory that accepted both"），
+  实际只删了 `text:+children:` / `index:+children:` 系列，主力的 `contents:+children:` 一个没删，
+  而 `Node+Init.swift` 的注释断言「the invalid combination cannot be spelled」。
+- **F10** —— `db3c604`（8/13）"route print(using:) through a real protocol requirement" 修的是
+  「extension 成员不是协议要求所以泛型上下文不派发」；`badb778`（8/16）在**同一个
+  `DemanglingNode` 协议**上又踩一次。三天内重犯。
+- **F4** —— 同一 commit 内修复方式不一致（两处 `guard...throw`、两处 `if let` 无 `else`）。
+- **F14** —— `5116786` 修了 README 与测试注释，漏了消费者实际会读的 API doc。
+
+本轮的横向排查按「失效模型」而非「写法」重扫，结果反而干净：节点载荷强解包全库只剩
+F1/F2 两处；未守护的索引算术只有 F2；trapping 窄化里作用于**解析产生的 `UInt64`** 的只有
+F5 一处（`Punycode.swift:30/87` 有 `if value < 0x80` 前置守卫；`TypeDecoder+Types.swift:329`
+的 `UInt32(count)` 是 builder 侧参数量，另一种失效模型；`Store/*` 的 `UInt32(nodes.count)`
+是 arena 4G 容量上限，同样另论）。后两类不并入本批，以免回归测试失去焦点。
+
+## 无法测试的部分（如实登记）
+
+- **F15 自身**：它防的是「在旧 OS 上空转通过」，而开发机是 macOS 26，无法直接演示先红。
+  改用两个模拟验证：把 `#available` 的版本临时改为 99.0 → 退出码 1 并 record issue；
+  设 `DEMANGLING_FORCE_LEGACY_PATH=1` → 退出码 0（该路径是有意的 CI 双跑，不应报错）。
+  验证后已还原版本号。

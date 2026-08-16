@@ -145,6 +145,38 @@ inverse requirement 的 index 走 `Ri<十进制>_` 语法同理可达；`.depend
 > 按本文件契约重新裁决为「修」。回归测试
 > `DefectRegressionTests.anOverflowingDigitRunIsRejectedRatherThanWrapped`。
 
+> **2026-08-16 补充：1474 / 1477 两行的「可达性未验证」有答案了 —— 不可达，且是上游同款死代码
+> （第四轮 review）。**
+>
+> 上表最后两行（当前 HEAD 为 `TypeDecoder.swift:1492` / `1495`）留的问题是「`align` / `size`
+> 是否受 layout 语法约束」。答案是这两行**根本执行不到**：`decodeRequirements` 在循环顶部有
+> `guard child.children.count == 2 else { continue }`（当前 HEAD 1439 行），而 layout 分支里的
+> `guard child.children.count >= 3`（1484 行）在此前提下**恒假**，所以 `Int(size)` / `Int(align)`
+> 以及 `getLayoutConstraintWithSizeAlign` 全部是死代码，需要 size/alignment 的 `_LayoutConstraint`
+> 一律走 1486 的 `return`。**这两行不需要 `Int(exactly:)` 修复**，从上表的 8 处待修中扣除，
+> 实际待修为 6 处。
+>
+> **且这不是移植缺陷，是与上游一致。** 核对 `swiftlang/swift` main 的
+> `include/swift/Demangling/TypeDecoder.h`，`decodeRequirement` 是逐字同款的结构：
+>
+> ```c++
+> if (child->getNumChildren() != 2)
+>   return;
+> …
+> if (child->getNumChildren() < 3 || !child->getChild(2)->hasIndex())
+>   return;
+> auto size = child->getChild(2)->getIndex();
+> ```
+>
+> 两处都是 `return`，同样的死分支。也就是说 Apple 自己的 runtime 同样解不出带 size 的布局约束。
+> 由此连带裁决第四轮 review 提出的另一半——「1460 / 1464 / 1475 / 1479 / 1487 五处 `return`
+> 应为 `continue`，否则一条畸形约束会放弃剩余全部 requirement」——**不成立为缺陷**：上游就是
+> `return`；本库顶部反而用了 `continue`（比上游宽松），是既有的有意偏离。真实符号里带 size 的
+> layout requirement 有 3–4 个 child，在 1439 的 `== 2` 就被 `continue` 掉，压根到不了 layout
+> 分支；能走到 1486 `return` 的只有「恰好 2 个 child 但 kind 声称 needsSizeAlignment」的畸形树。
+>
+> 若认为该行为本身是错的，正确路径是先向上游报告，而不是单方面改本库。
+
 ## 2. TypeDecoder 公开入口不经 `StackSafeExecutor`，小栈线程上深度守卫失效
 
 `TypeDecoder.decodeMangledType(node:)`（含 `NodeReference` 重载）在调用线程原地执行——
