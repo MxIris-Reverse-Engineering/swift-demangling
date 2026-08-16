@@ -1274,8 +1274,18 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             firstRequirement += 1
         }
 
+        // `firstRequirement` is an **absolute** child index — it starts at
+        // `numGenericParams` and counts up — so the markers occupy
+        // `children[numGenericParams ..< firstRequirement]`, which upstream
+        // spells `for (unsigned i = numGenericParams; i < firstRequirement; ++i)`.
+        // `prefix(firstRequirement)` after `dropFirst(numGenericParams)` runs to
+        // `numGenericParams + firstRequirement` instead, pulling markers that sit
+        // among the *requirements* into the parameter list — printing `each`/`let`
+        // for parameters upstream leaves bare, with no error channel to notice.
+        let markerCount = firstRequirement - numGenericParams
+
         let isGenericParamPack = { (depth: UInt64, index: UInt64) -> Bool in
-            for var child in name.children.dropFirst(numGenericParams).prefix(firstRequirement) {
+            for var child in name.children.dropFirst(numGenericParams).prefix(markerCount) {
                 guard child.kind == .dependentGenericParamPackMarker else { continue }
 
                 child = child.children.first ?? child
@@ -1293,7 +1303,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         }
 
         let isGenericParamValue = { (depth: UInt64, index: UInt64) -> SomeNode? in
-            for var child in name.children.dropFirst(numGenericParams).prefix(firstRequirement) {
+            for var child in name.children.dropFirst(numGenericParams).prefix(markerCount) {
                 guard child.kind == .dependentGenericParamValueMarker else { continue }
                 child = child.children.first ?? child
 

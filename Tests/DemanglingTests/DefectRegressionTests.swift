@@ -1918,6 +1918,116 @@ struct DefectRegressionTests {
         """)
     }
 
+    /// `printGenericSignature` scans for pack/value markers over
+    /// `dropFirst(numGenericParams).prefix(firstRequirement)`, i.e.
+    /// `[n, n + firstRequirement)`. `firstRequirement` is an **absolute**
+    /// index — it starts at `numGenericParams` and counts up — so the window
+    /// upstream scans is `[numGenericParams, firstRequirement)`
+    /// (`for (unsigned i = numGenericParams; i < firstRequirement; ++i)`).
+    /// The window here is therefore too wide, and markers sitting among the
+    /// *requirements* leak into the parameter list.
+    ///
+    /// Printing has no error channel, so this renders wrong text rather than
+    /// failing. Reachable from any caller-assembled tree and from a malformed
+    /// symbol.
+    @Test func genericSignatureMarkerScanStopsAtTheFirstRequirement() {
+        func parameterType(depth: UInt64, index: UInt64) -> Node {
+            Node.create(kind: .type, child: Node.create(kind: .dependentGenericParamType, children: [
+                Node.create(kind: .index, index: index),
+                Node.create(kind: .index, index: depth),
+            ]))
+        }
+
+        /// Two parameters at depth 0, one leading pack marker, one same-type
+        /// requirement, and optionally a second pack marker *after* the
+        /// requirement — which is outside the window upstream examines and
+        /// must not affect the parameter list.
+        func signature(withMarkerAfterTheRequirement: Bool) -> Node {
+            var children: [Node] = [
+                Node.create(kind: .dependentGenericParamCount, index: 2),
+                Node.create(kind: .dependentGenericParamCount, index: 2),
+                Node.create(kind: .dependentGenericParamPackMarker, child: parameterType(depth: 0, index: 0)),
+                Node.create(kind: .dependentGenericSameTypeRequirement, children: [
+                    parameterType(depth: 1, index: 1),
+                    parameterType(depth: 1, index: 1),
+                ]),
+            ]
+            if withMarkerAfterTheRequirement {
+                children.append(Node.create(kind: .dependentGenericParamPackMarker, child: parameterType(depth: 0, index: 1)))
+            }
+            return Node.create(kind: .dependentGenericSignature, children: children)
+        }
+
+        let withTrailingMarker = signature(withMarkerAfterTheRequirement: true).print(using: .default)
+        let withoutTrailingMarker = signature(withMarkerAfterTheRequirement: false).print(using: .default)
+
+        // Only the first parameter is a pack; the marker past the requirement
+        // is outside the scan window and must not turn `B` into `each B`.
+        #expect(withoutTrailingMarker.hasPrefix("<each A, B>"))
+        #expect(
+            withTrailingMarker.hasPrefix("<each A, B>"),
+            "a marker after the first requirement leaked into the parameter list: \(withTrailingMarker)"
+        )
+    }
+
+    /// The same window bug repeated for value markers, where the consequence
+    /// is a spurious `let ` plus a printed value type.
+    ///
+    /// Note the shape is forced: the over-wide window is
+    /// `[firstRequirement, numGenericParams + firstRequirement)`, and the child
+    /// at `firstRequirement` is by definition *not* a marker (that is what
+    /// ended the leading scan). So a single generic-parameter depth can never
+    /// leak — the test needs at least two, which is why both signatures here
+    /// carry two `dependentGenericParamCount` children.
+    @Test func genericSignatureValueMarkerScanStopsAtTheFirstRequirement() {
+        func parameterType(depth: UInt64, index: UInt64) -> Node {
+            Node.create(kind: .type, child: Node.create(kind: .dependentGenericParamType, children: [
+                Node.create(kind: .index, index: index),
+                Node.create(kind: .index, index: depth),
+            ]))
+        }
+
+        func valueMarker(depth: UInt64, index: UInt64) -> Node {
+            Node.create(kind: .dependentGenericParamValueMarker, child: Node.create(kind: .type, children: [
+                Node.create(kind: .dependentGenericParamType, children: [
+                    Node.create(kind: .index, index: index),
+                    Node.create(kind: .index, index: depth),
+                ]),
+                Node.create(kind: .type, child: Node.create(kind: .structure, children: [
+                    Node.create(kind: .module, text: "Swift"),
+                    Node.create(kind: .identifier, text: "Int"),
+                ])),
+            ]))
+        }
+
+        func signature(withMarkerAfterTheRequirement: Bool) -> Node {
+            var children: [Node] = [
+                Node.create(kind: .dependentGenericParamCount, index: 2),
+                Node.create(kind: .dependentGenericParamCount, index: 2),
+                valueMarker(depth: 0, index: 0),
+                Node.create(kind: .dependentGenericSameTypeRequirement, children: [
+                    parameterType(depth: 1, index: 1),
+                    parameterType(depth: 1, index: 1),
+                ]),
+            ]
+            if withMarkerAfterTheRequirement {
+                children.append(valueMarker(depth: 0, index: 1))
+            }
+            return Node.create(kind: .dependentGenericSignature, children: children)
+        }
+
+        let withTrailingMarker = signature(withMarkerAfterTheRequirement: true).print(using: .default)
+        let withoutTrailingMarker = signature(withMarkerAfterTheRequirement: false).print(using: .default)
+
+        // Only the first parameter is a value; the marker past the requirement
+        // is outside the scan window and must not add a second `let`.
+        #expect(withoutTrailingMarker.hasPrefix("<let A: Swift.Int, B>"))
+        #expect(
+            withTrailingMarker.hasPrefix("<let A: Swift.Int, B>"),
+            "a value marker after the first requirement leaked into the parameter list: \(withTrailingMarker)"
+        )
+    }
+
     @Test func targetsWithDifferentUnitCountsPrintIdenticalText() throws {
         let symbols = [
             "$s4main1fyyF",
