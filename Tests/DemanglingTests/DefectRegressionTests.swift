@@ -1707,6 +1707,76 @@ struct DefectRegressionTests {
         }
     }
 
+    /// A minimal `DemanglingNode` whose `hasChildren` deliberately disagrees
+    /// with `!children.isEmpty`, so a generic call site reveals *which* of the
+    /// two it dispatched to. Nothing else about it needs to be meaningful.
+    private struct HasChildrenDispatchProbe: DemanglingNode {
+        struct ChildrenView: DemanglingNodeChildren {
+            var storage: [HasChildrenDispatchProbe]
+            var startIndex: Int { 0 }
+            var endIndex: Int { storage.count }
+            subscript(position: Int) -> HasChildrenDispatchProbe { storage[position] }
+            func at(_ index: Int) -> HasChildrenDispatchProbe? {
+                storage.indices.contains(index) ? storage[index] : nil
+            }
+            func slice(_ from: Int, _ to: Int) -> ArraySlice<HasChildrenDispatchProbe> {
+                storage[from ..< to]
+            }
+        }
+
+        var childStorage: [HasChildrenDispatchProbe] = []
+
+        var kind: Node.Kind { .identifier }
+        var text: String? { nil }
+        var index: UInt64? { nil }
+        var hasIndex: Bool { false }
+        var children: ChildrenView { ChildrenView(storage: childStorage) }
+        var printCacheIdentity: Int { 0 }
+        var materializedNode: Node { Node.createTransient(kind: .identifier) }
+        func isIdentifier(desired: String) -> Bool { false }
+        var isSwiftModule: Bool { false }
+
+        /// Inverted on purpose — see the test below.
+        var hasChildren: Bool { childStorage.isEmpty }
+    }
+
+    /// `hasChildren` was an extension member, not a protocol requirement, so
+    /// `Node`'s payload-tag override never dispatched from a generic context —
+    /// and every call site in `Sources/` is inside
+    /// `TypeDecoderEngine<Builder, SomeNode>`, where the receiver is
+    /// statically `SomeNode`. The override was dead code while reading as
+    /// landed, because both spellings return the same answer and no
+    /// value-comparison test can tell them apart.
+    ///
+    /// This probe inverts the answer so the dispatch itself is observable:
+    /// pre-fix the generic call binds `!children.isEmpty` and sees the
+    /// opposite of what the witness returns.
+    ///
+    /// Third time for this shape in this protocol — `db3c604` had to promote
+    /// `runPrintWalk` for exactly the same reason three days before `badb778`
+    /// reintroduced it on `hasChildren`. **An extension member is never a
+    /// valid place for a per-conformer performance override.**
+    @Test func hasChildrenDispatchesThroughTheWitnessTable() {
+        func genericHasChildren<SomeNode: DemanglingNode>(_ node: SomeNode) -> Bool {
+            node.hasChildren
+        }
+
+        let leaf = HasChildrenDispatchProbe()
+        let parent = HasChildrenDispatchProbe(childStorage: [leaf])
+
+        #expect(genericHasChildren(leaf) == true, "generic call must select the witness, not !children.isEmpty")
+        #expect(genericHasChildren(parent) == false, "generic call must select the witness, not !children.isEmpty")
+
+        // `Node`'s own override must keep agreeing with its child count.
+        func genericMatchesConcrete(_ node: Node) -> Bool {
+            genericHasChildren(node) == node.hasChildren
+        }
+        #expect(genericMatchesConcrete(Node.createTransient(kind: .identifier, text: "leaf")))
+        #expect(genericMatchesConcrete(Node.createTransient(kind: .type, children: [
+            Node.createTransient(kind: .identifier, text: "leaf"),
+        ])))
+    }
+
     /// The printer decides whether to write a qualified-name separator by
     /// reading the target's size before and after a nested print — a *delta*
     /// probe, never an absolute or arithmetic use. The contract it needs is

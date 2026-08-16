@@ -69,6 +69,25 @@ public protocol DemanglingNode: Sendable {
     /// constructing a `String` per check.
     func isIdentifier(desired: String) -> Bool
     var isSwiftModule: Bool { get }
+
+    /// Whether this node has any children.
+    ///
+    /// A **requirement** with a derived default below, for the same reason
+    /// ``runPrintWalk(using:)`` is one. `Node` overrides it to answer from the
+    /// payload tag, because its `children` getter rebuilds a `Children` value
+    /// and retains every child — but written as an extension member the
+    /// override never dispatched: every call site in `Sources/` is inside
+    /// `TypeDecoderEngine<Builder, SomeNode>`, where the receiver is
+    /// statically `SomeNode`, so the generic spelling bound `!children.isEmpty`
+    /// and the override was dead code. Both spellings return the same answer,
+    /// so no value-comparison test could see it.
+    ///
+    /// This is the third appearance of that shape on this protocol
+    /// (`print(using:)` → `runPrintWalk` in `db3c604`, then `hasChildren` in
+    /// `badb778` three days later). **An extension member is never a valid
+    /// place for a per-conformer performance override** — if a conformer needs
+    /// to answer a question differently, the question has to be a requirement.
+    var hasChildren: Bool { get }
 }
 
 // MARK: - Derived helpers shared by the printer
@@ -365,10 +384,21 @@ extension NodeReference {
     public func runPrintWalk(using options: DemangleOptions) async -> String {
         await StackSafeExecutor.executeAsync {
             withExtendedLifetime(store) {
-                var printer = DemanglingPrinter<String, UnretainedNodeReference>(options: options)
-                return store.withView { pinnedView in
+                store.withView { pinnedView in
                     withUnsafePointer(to: pinnedView) { viewPointer in
-                        printer.printRoot(UnretainedNodeReference(viewPointer: viewPointer, rawIndex: nodeIndex.rawValue))
+                        // `printer` is declared *inside* this scope, matching
+                        // the synchronous override above. Its `printCache` is
+                        // keyed by `UnretainedNodeReference`, whose stored
+                        // `viewPointer` addresses `pinnedView` — a local of
+                        // the `withView` closure. Bound outside, the printer
+                        // outlived the stack slot its keys point at. Benign
+                        // only because those keys are POD and dictionary
+                        // teardown never dereferences them; any later rehash,
+                        // debug description, or reuse would read freed stack,
+                        // and `UnretainedNodeReference`'s own contract says
+                        // not to hold one beyond the anchoring scope.
+                        var printer = DemanglingPrinter<String, UnretainedNodeReference>(options: options)
+                        return printer.printRoot(UnretainedNodeReference(viewPointer: viewPointer, rawIndex: nodeIndex.rawValue))
                     }
                 }
             }
