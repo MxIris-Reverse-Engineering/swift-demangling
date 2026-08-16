@@ -334,6 +334,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
              .structure,
              .enum,
              .protocol,
+             .otherNominalType,
              .typeAlias:
             // The full qualified-name print (module, dots, identifier) for
             // this nominal reference runs inside one scope so rich targets
@@ -563,7 +564,12 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .opaqueTypeDescriptorSymbolicReference:
             target.write("opaque type symbolic reference 0x")
             target.write((name.index ?? 0).hexadecimalString)
-        case .otherNominalType: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true)
+        // `.otherNominalType` is handled with the other nominals above, where it
+        // gets the type-reference scope its identical `printEntity` call always
+        // deserved. It reaches the printer from real mangled input (the `Y`
+        // operator), and because the text it emits is byte-identical either way,
+        // no text-comparison test could see the missing span
+        // (PR #7 review, finding 6).
         case .outlinedAssignWithCopy,
              .outlinedAssignWithCopyNoValueWitness: printFirstChild(name, prefix: "outlined assign with copy of ")
         case .outlinedAssignWithTake,
@@ -2044,6 +2050,15 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             }
         }
         if !asPrefixContext, let pfc = postfixContext, !localName || options.contains(.displayLocalNameContexts) {
+            // Under a barrier, like the nested-type separator dot above: these
+            // separators run inside the enclosing nominal's dispatch scope, so
+            // an unguarded write hands them that nominal's type reference. A
+            // rich target then makes the word "in" navigate to the type while
+            // the type's own name — printed through a nested `printName`, into
+            // a sub-target whose scope stack is empty — navigates nowhere
+            // (PR #7 review, finding 5; the sub-target half is structural and
+            // tracked separately, see Evolutions/0012).
+            target.pushTypeReferenceScope(nil)
             switch name.kind {
             case .defaultArgumentInitializer,
                  .initializer,
@@ -2054,6 +2069,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             default:
                 target.write(" in ")
             }
+            target.popTypeReferenceScope()
             _ = printName(pfc)
             return nil
         }
