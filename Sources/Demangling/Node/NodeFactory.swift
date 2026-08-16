@@ -192,25 +192,15 @@ public final class NodeCache: Sendable {
         }
     }
 
-    /// Creates or retrieves an interned node with text contents and children.
-    public func intern(kind: Node.Kind, text: String, children: [Node]) -> Node {
-        storage.withLockUnchecked { cacheStorage in
-            if children.isEmpty {
-                return Self.internLeaf(kind: kind, contents: .text(text), in: &cacheStorage)
-            }
-            return Self.internTree(Node(kind: kind, contents: .text(text), children: children), in: &cacheStorage)
-        }
-    }
-
-    /// Creates or retrieves an interned node with index contents and children.
-    public func intern(kind: Node.Kind, index: UInt64, children: [Node]) -> Node {
-        storage.withLockUnchecked { cacheStorage in
-            if children.isEmpty {
-                return Self.internLeaf(kind: kind, contents: .index(index), in: &cacheStorage)
-            }
-            return Self.internTree(Node(kind: kind, contents: .index(index), children: children), in: &cacheStorage)
-        }
-    }
+    // There is no `intern(kind:text:children:)` / `intern(kind:index:children:)`.
+    // Contents and children are mutually exclusive in `Payload`, so with
+    // children present `mergedPayload` discarded the contents and the resulting
+    // `SubtreeKey` matched across differently-texted requests — two calls
+    // differing only in `text` returned the *same* instance, both reporting
+    // `text == nil`. With empty children they merely duplicated
+    // ``intern(kind:text:)`` / ``intern(kind:index:)`` above. Deleted rather
+    // than guarded so the invalid combination cannot be spelled
+    // (PR #7 review, finding 8).
 
     // MARK: - Tree Interning (Post-Processing)
 
@@ -600,20 +590,14 @@ extension Node {
         self.init(kind: kind, contents: .none, children: children)
     }
 
-    convenience init(kind: Kind, text: String, child: Node) {
-        self.init(kind: kind, contents: .text(text), children: [child])
+    // Contents-carrying leaves only — see `Node.create(kind:text:)` for why the
+    // `child:`/`children:` counterparts are gone.
+    convenience init(kind: Kind, text: String) {
+        self.init(kind: kind, contents: .text(text))
     }
 
-    convenience init(kind: Kind, text: String, children: [Node] = []) {
-        self.init(kind: kind, contents: .text(text), children: children)
-    }
-
-    convenience init(kind: Kind, index: UInt64, child: Node) {
-        self.init(kind: kind, contents: .index(index), children: [child])
-    }
-
-    convenience init(kind: Kind, index: UInt64, children: [Node] = []) {
-        self.init(kind: kind, contents: .index(index), children: children)
+    convenience init(kind: Kind, index: UInt64) {
+        self.init(kind: kind, contents: .index(index))
     }
 
     convenience init(typeWithChildKind: Kind, childChild: Node) {
@@ -639,13 +623,5 @@ extension Node {
 extension Node {
     convenience init(kind: Kind, contents: Contents = .none, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
         self.init(kind: kind, contents: contents, children: childrenBuilder())
-    }
-
-    convenience init(kind: Kind, text: String, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
-        self.init(kind: kind, contents: .text(text), children: childrenBuilder())
-    }
-
-    convenience init(kind: Kind, index: UInt64, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
-        self.init(kind: kind, contents: .index(index), children: childrenBuilder())
     }
 }

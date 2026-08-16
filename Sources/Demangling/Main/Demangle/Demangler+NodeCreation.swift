@@ -26,24 +26,16 @@ extension Demangler {
         createNode(kind: kind, contents: .none, children: [child])
     }
 
+    // Contents-carrying leaves only — see `Node.create(kind:text:)` for why the
+    // `child:`/`children:` counterparts are gone.
     @inline(__always)
-    func createNode(kind: Node.Kind, text: String, child: Node) -> Node {
-        createNode(kind: kind, contents: .text(text), children: [child])
+    func createNode(kind: Node.Kind, text: String) -> Node {
+        createNode(kind: kind, contents: .text(text))
     }
 
     @inline(__always)
-    func createNode(kind: Node.Kind, text: String, children: [Node] = []) -> Node {
-        createNode(kind: kind, contents: .text(text), children: children)
-    }
-
-    @inline(__always)
-    func createNode(kind: Node.Kind, index: UInt64, child: Node) -> Node {
-        createNode(kind: kind, contents: .index(index), children: [child])
-    }
-
-    @inline(__always)
-    func createNode(kind: Node.Kind, index: UInt64, children: [Node] = []) -> Node {
-        createNode(kind: kind, contents: .index(index), children: children)
+    func createNode(kind: Node.Kind, index: UInt64) -> Node {
+        createNode(kind: kind, contents: .index(index))
     }
 
     /// Compound: `.type` wrapping a node of `typeWithChildKind` with one child.
