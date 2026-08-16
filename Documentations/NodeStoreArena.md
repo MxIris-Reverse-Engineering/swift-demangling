@@ -12,8 +12,8 @@ bump allocator / 物化是什么）。词条速查见 [Glossary.md](Glossary.md)
 `Node` 是 class，每个节点固定要付「对象头 + malloc 档位 + 引用计数 + 8 字节指针」的
 成本，这部分**在 class 形态下已经省无可省**。`NodeStore` 新增一套并存的存储层：节点
 平铺进连续缓冲，每个 12 字节、用 4 字节下标互相引用；printer 与 TypeDecoder 泛型化后
-可以直接读这块缓冲打印，不必先还原成对象树。**公共 API 零破坏，`Node` 路径行为一字
-未变。**
+可以直接读这块缓冲打印，不必先还原成对象树。**`Node` 路径行为一字未变**；公共 API 有
+三处刻意的源码破坏，逐条列在下面的「源码兼容性」一节。
 
 ## 动机
 
@@ -53,8 +53,23 @@ struct 的价值在于**精确布局 + 可平铺进连续缓冲**，所以正确
 - `Main/TypeDecoder/TypeDecoder.swift` — 泛型化为 `TypeDecoderEngine<Builder, SomeNode>`；
 - `Main/Demangle/Demangler+NodeCreation.swift` — demangler 的节点构造 seam，支持绕开全局缓存。
 
-**公共 API 零破坏**：`Node`、`NodeBuilder`、`NodeCache`、`demangleAsNode`、
-`NodePrinter<Target>`、`TypeDecoder<Builder>`、`TypeBuilder` 的签名与行为全部保持。
+## 源码兼容性
+
+`Node`、`NodeBuilder`、`NodeCache`、`demangleAsNode`、`TypeDecoder<Builder>`、
+`TypeBuilder` 的签名与行为全部保持。**有三处刻意的源码破坏**，都只影响自己实现
+`NodePrinterTarget` 或直接构造 printer 的下游（已知的只有 MachOSwiftSection）：
+
+| 破坏 | 变更 | 为什么 |
+|---|---|---|
+| `NodePrinterTarget.write(_:context:)` | `NodePrintContext?` → `@autoclosure () -> NodePrintContext?`，且**删除了协议扩展里的默认实现** | 默认实现在的时候，一个按旧签名写的实现不构成 witness，默认实现会静默顶替它：打印文本一字不差，所有上下文标注全部消失，且 Swift 对「存在默认实现时的 near-miss witness」没有任何警告。删掉默认实现后，同样的写法变成定义处的编译错误。代价是每个 target 都得写出这个方法（包括纯文本的），这是有意的取舍。 |
+| `NodePrinterTarget.pushTypeReferenceScope(_:)` | `Node?` → `@autoclosure () -> Node?`，同样删除默认实现 | 同上。原来的 no-op 默认实现会吸收掉按 `Node?` 写的实现，scope 事件随之消失而文本不变——文本比对的快照测试同样看不见。 |
+| `NodePrinter<Target>` | `public struct` → `public enum`（只剩静态成员），失去公共 `init`/`printRoot` | 打印逻辑移进泛型引擎 `DemanglingPrinter<Target, SomeNode>`，`NodePrinter` 退化为入口。迁移路径见 `Documentations/StackSafety.md`。 |
+
+此外 `NodeReference.textUTF8` 更名为 `textUTF8Bytes`（F10 维护者裁决），因此提案 0010
+「`NodeReference` 的公开 API 不变」一句已不成立，以本表为准。
+
+> 历史注记：本文档与提案 0010 曾声称「公共 API 零破坏」。那句话写于 PR#6 时期，其后三处
+> 破坏分批落地，声明没有跟着更新。PR#7 review（finding 10）发现了这个矛盾，本节即是更正。
 
 ## 关键设计
 

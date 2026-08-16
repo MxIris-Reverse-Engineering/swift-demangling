@@ -344,10 +344,21 @@ public struct NodeStoreBuilder: ~Copyable, Sendable {
         public let uniqueTexts: BufferUtilization
     }
 
-    /// Rounds a per-symbol estimate up to a whole count, clamped to 2^30 so
-    /// an absurd caller value degrades to a huge reservation instead of
-    /// trapping on the `Int` conversion (which a `Double` above `Int.max`
-    /// would — and on watchOS `Int.max` is only 2^31 − 1).
+    /// Rounds a per-symbol estimate up to a whole count, clamped to 2^30.
+    ///
+    /// The clamp defends exactly one thing: the `Int(Double)` conversion, which
+    /// traps for a `Double` above `Int.max` (and on watchOS `Int.max` is only
+    /// 2^31 − 1). It does **not** make an absurd caller value safe. At the
+    /// clamp the reservation asks for roughly 12.9 GB of nodes, 4.3 GB of
+    /// edges, 1.1 GB of text and 8.6 GB of unique-text storage, plus three
+    /// intern tables built with `ContiguousArray(repeating:count:)` — those are
+    /// written, not merely reserved — and `UnsafeMutablePointer.allocate` routes
+    /// to `swift_slowAlloc`, which calls `fatalError` when the allocator says
+    /// no. So the trap moves; it does not go away. `reserveCapacity` is public
+    /// on both `NodeStoreBuilder` and `SharedNodeStore` and documented as
+    /// taking a symbol count, whose natural source is a Mach-O export-table
+    /// count. Capping against a byte budget rather than an element count is the
+    /// real fix and is tracked as a proposal (PR #7 review, finding 13).
     private static func estimatedCount(_ symbolCount: Int, _ coefficientPerSymbol: Double) -> Int {
         let estimated = (Double(symbolCount) * coefficientPerSymbol).rounded(.up)
         return Int(min(estimated, 1_073_741_824))

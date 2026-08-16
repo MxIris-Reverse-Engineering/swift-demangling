@@ -2446,10 +2446,17 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 
 /// Prints a `Node` tree to `Target`.
 ///
-/// A thin, source-compatible facade over `DemanglingPrinter<Target, Node>`.
-/// The printing logic lives in the generic engine so it can also print
-/// `NodeReference` trees straight from a `NodeStore` without materializing
-/// a class tree (see `NodeReference.print(using:)`).
+/// A thin entry point over `DemanglingPrinter<Target, Node>`. The printing
+/// logic lives in the generic engine so it can also print `NodeReference` trees
+/// straight from a `NodeStore` without materializing a class tree (see
+/// `NodeReference.print(using:)`).
+///
+/// - Important: **not** source-compatible with the pre-store `NodePrinter`,
+///   which was a `struct` with a public `init(options:)` and `printRoot(_:)`.
+///   Call the static ``print(_:using:)`` instead, or the engine directly for a
+///   reusable printer. Migration notes are in `Documentations/StackSafety.md`,
+///   and the full list of source breaks in `Documentations/NodeStoreArena.md`
+///   under "源码兼容性" (PR #7 review, finding 10).
 public enum NodePrinter<Target: NodePrinterTarget> {
     /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth``; see
     /// `DemanglingPrinter.maxPrintDepth` for the calibration.
