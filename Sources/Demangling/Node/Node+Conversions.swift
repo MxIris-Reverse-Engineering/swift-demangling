@@ -73,9 +73,23 @@ extension Node {
         }
     }
 
-    // `hasChildren` and `subscript(throwChild:)` live in the `DemanglingNode`
-    // extension (DemanglingNode.swift) as the single implementation for both
-    // `Node` and `NodeReference`.
+    /// Overrides the `DemanglingNode` default, which spells this
+    /// `!children.isEmpty`. That default is right for `NodeReference`, but on
+    /// `Node` the `children` getter rebuilds a `Children` value and retains
+    /// every child reference, so the generic spelling put a retain/release pair
+    /// on a question the payload tag answers for free — across eight
+    /// `TypeDecoderEngine` guards among others (PR #7 review, minor finding).
+    @inlinable
+    public var hasChildren: Bool {
+        switch payload {
+        case .none, .index, .text: return false
+        default: return true
+        }
+    }
+
+    // `subscript(throwChild:)` lives in the `DemanglingNode` extension
+    // (DemanglingNode.swift) as the single implementation for both `Node` and
+    // `NodeReference`.
 
     @inlinable
     public var firstChild: Node? {

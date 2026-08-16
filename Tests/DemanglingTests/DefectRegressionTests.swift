@@ -1558,4 +1558,19 @@ struct DefectRegressionTests {
         )
         #endif
     }
+
+    // MARK: - PR #7 review, minor finding: hasChildren must not touch children
+
+    /// `Node` overrides the `DemanglingNode` default (`!children.isEmpty`)
+    /// because its `children` getter rebuilds a `Children` value and retains
+    /// every child. This pins the behaviour the payload-tag switch must keep.
+    @Test func hasChildrenAgreesWithTheChildCount() throws {
+        let leaf = Node.createTransient(kind: .identifier, text: "leaf")
+        #expect(!leaf.hasChildren)
+        #expect(!Node.createTransient(kind: .type).hasChildren)
+        #expect(!Node.createTransient(kind: .index, index: 7).hasChildren)
+        #expect(Node.createTransient(kind: .type, children: [leaf]).hasChildren)
+        #expect(Node.createTransient(kind: .typeList, children: [leaf, leaf]).hasChildren)
+        #expect(Node.createTransient(kind: .typeList, children: [leaf, leaf, leaf]).hasChildren)
+    }
 }

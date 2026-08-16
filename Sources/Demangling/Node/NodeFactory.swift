@@ -308,9 +308,13 @@ public final class NodeCache: Sendable {
             if let alreadyCanonicalized = canonicalBySourceIdentity[ObjectIdentifier(candidate)] {
                 return alreadyCanonicalized
             }
-            // Leaf node: intern it
+            // Leaf node: intern it, and memoize like every other branch — a
+            // repeated leaf instance otherwise re-pays a `LeafKey` string hash
+            // once per referencing edge (PR #7 review, minor finding).
             if candidate.children.isEmpty {
-                return Self.internLeaf(kind: candidate.kind, contents: candidate.contents, in: &cacheStorage)
+                let canonical = Self.internLeaf(kind: candidate.kind, contents: candidate.contents, in: &cacheStorage)
+                canonicalBySourceIdentity[ObjectIdentifier(candidate)] = canonical
+                return canonical
             }
             // Fast path: a stored entry can only match by identity of children if those
             // children are already canonical, so a hit is authoritative without descending.
