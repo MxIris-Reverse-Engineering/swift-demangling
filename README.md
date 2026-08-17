@@ -199,7 +199,12 @@ struct HighlightedTarget: NodePrinterTarget {
     /// The type reference the current writes belong to (innermost wins).
     private var typeReferenceScopes: [Node?] = []
 
-    var count: Int { fragments.reduce(0) { $0 + $1.text.count } }
+    /// UTF-8 bytes, not `String.count`: the printer uses this purely as a
+    /// delta probe to decide whether a nested print emitted anything, so the
+    /// one contract is that any non-empty write must change it. Appending a
+    /// combining mark leaves `String.count` untouched and would silently drop
+    /// a qualified-name separator.
+    var writtenUnitCount: Int { fragments.reduce(0) { $0 + $1.text.utf8.count } }
 
     init() {}
 
@@ -240,10 +245,13 @@ Both rich-target hooks (`write(_:context:)` and `pushTypeReferenceScope(_:)`)
 take their payload as an `@autoclosure` and deliberately ship **without**
 default implementations: a forwarding default would silently absorb an
 implementation written against the older eager signature, leaving the printed
-text byte-identical while every annotation vanished. Spelling both methods out
-is required even for plain-text targets — `String`'s own conformance is the
-minimal shape to copy. `popTypeReferenceScope()` keeps its default, since a
-method with no arguments has no near-miss to absorb.
+text byte-identical while every annotation vanished. `popTypeReferenceScope()`
+has no default either — a method with no arguments has no near-miss witness to
+absorb, but a target that implements `push` and forgets `pop` would inherit a
+silent no-op, so its scope stack only grows and every write after the first
+nominal reference is attributed to that nominal, again with byte-identical
+text. Spelling all three out is required even for plain-text targets —
+`String`'s own conformance is the minimal shape to copy.
 
 ### Type Decoding
 

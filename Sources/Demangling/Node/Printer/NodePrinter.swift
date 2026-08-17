@@ -109,7 +109,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// `StackSafeExecutor`, so the depth a tree survives does not depend on
     /// how much stack the calling thread happens to have left.
     public static func print(_ root: SomeNode, options: DemangleOptions = .default) -> Target {
-        StackSafeExecutor.executeWithUncheckedSendability {
+        StackSafeExecutor.execute {
             var printer = DemanglingPrinter(options: options)
             return printer.printRoot(root)
         }
@@ -2465,8 +2465,8 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 ///   which was a `struct` with a public `init(options:)` and `printRoot(_:)`.
 ///   Call the static ``print(_:using:)`` instead, or the engine directly for a
 ///   reusable printer. Migration notes are in `Documentations/StackSafety.md`,
-///   and the full list of source breaks in `Documentations/NodeStoreArena.md`
-///   under "源码兼容性" (PR #7 review, finding 10).
+///   and the full list of source breaks in the source-compatibility section of
+///   `Documentations/NodeStoreArena.md` (PR #7 review, finding 10).
 public enum NodePrinter<Target: NodePrinterTarget> {
     /// Mirrors ``swift::Demangle::NodePrinter::MaxDepth``; see
     /// `DemanglingPrinter.maxPrintDepth` for the calibration.
