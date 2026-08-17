@@ -201,7 +201,16 @@ enum Punycode {
 
         // Unlike RFC3492, Swift uses underscore for delimiting
         if let ipos = input.lastIndex(of: "_" as UnicodeScalar) {
-            output.append(contentsOf: input[input.startIndex ..< ipos].map { UnicodeScalar($0) })
+            for basicScalar in input[input.startIndex ..< ipos] {
+                // Upstream fails the decode on any non-basic code point here
+                // (`decodePunycode`: `if (c > 0x7f) return false`). Copying
+                // them through produced identifiers the toolchain rejects
+                // outright.
+                guard basicScalar.value <= 0x7F else {
+                    throw DemanglingError.punycodeParseError
+                }
+                output.append(basicScalar)
+            }
             pos = input.index(ipos, offsetBy: 1)
         }
 
@@ -222,12 +231,21 @@ enum Punycode {
                 guard pos != input.endIndex else {
                     throw DemanglingError.punycodeParseError
                 }
-                // Unlike RFC3492, Swift uses letters A-J for values 26-35
+                // Unlike RFC3492, Swift uses letters A-J for values 26-35.
+                //
+                // Both ranges are closed. Upstream's `digit_index` returns -1
+                // — which rejects the symbol — for every scalar outside `a`-`z`
+                // and `A`-`J`; written as unbounded `>=` comparisons, `K`-`Z`
+                // and `[ \ ] ^ _ \`` decoded as digits 36-57 through the
+                // 26-based branch and `{ | } ~` upward through the 0-based one,
+                // so the library accepted punycode the toolchain refuses and
+                // fabricated identifier text for it.
+                let digitScalar = input[pos]
                 let digit: Int
-                if input[pos] >= UnicodeScalar("a") {
-                    digit = Int(input[pos].value - UnicodeScalar("a").value)
-                } else if input[pos] >= UnicodeScalar("A") {
-                    digit = Int((input[pos].value - UnicodeScalar("A").value) + UInt32(alphaCount))
+                if digitScalar >= UnicodeScalar("a"), digitScalar <= UnicodeScalar("z") {
+                    digit = Int(digitScalar.value - UnicodeScalar("a").value)
+                } else if digitScalar >= UnicodeScalar("A"), digitScalar <= UnicodeScalar("J") {
+                    digit = Int(digitScalar.value - UnicodeScalar("A").value) + alphaCount
                 } else {
                     throw DemanglingError.punycodeParseError
                 }
@@ -281,12 +299,33 @@ enum Punycode {
             }
             n = advancedCodePoint
             i = i % (output.count + 1)
-            var scalarValue = n
+            // Upstream validates every decoded code point and fails the whole
+            // decode (`encodeToUTF8`: `if (!isValidUnicodeScalar(S)) return
+            // false`). Substituting "." instead fabricated identifier text,
+            // and "." is the structural separator in printed output too, so
+            // the result was ambiguous as well as wrong — `main....()` cannot
+            // be told apart from a real nested context. The predicate already
+            // existed here; only the encode path ever called it.
+            //
+            // `UInt32(exactly:)` stands in for upstream's `uint32_t n`: the
+            // accumulator is `Int` here, so a value past `UInt32.max` has to
+            // be rejected rather than truncated.
+            guard let codePoint = UInt32(exactly: n), isValidUnicodeScalar(codePoint) else {
+                throw DemanglingError.punycodeParseError
+            }
+            var scalarValue = codePoint
             if scalarValue >= 0xD800, scalarValue < 0xD880 {
                 scalarValue -= 0xD800
             }
-            let validScalar = UnicodeScalar(scalarValue) ?? UnicodeScalar(".")
-            output.insert(validScalar, at: i)
+            // Unreachable after the check above — every value it admits is a
+            // representable scalar, and subtracting 0xD800 from the mapped
+            // range lands in 0...0x7F. Kept as a throw rather than a force
+            // unwrap so a future change to either range cannot turn it into a
+            // process abort.
+            guard let decodedScalar = UnicodeScalar(scalarValue) else {
+                throw DemanglingError.punycodeParseError
+            }
+            output.insert(decodedScalar, at: i)
             i += 1
         }
         return String(output.map { Character($0) })

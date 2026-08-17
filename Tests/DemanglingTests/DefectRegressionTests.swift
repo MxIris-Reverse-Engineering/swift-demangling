@@ -81,6 +81,49 @@ struct DefectRegressionTests {
         }
     }
 
+    /// The parameter-pack extraction under `.silBoxTypeWithLayout` narrows a
+    /// `UInt64` payload with a trapping `Int(_:)`. `ffd6f87` converted the
+    /// five other reachable narrowings in this file to `Int(exactly:)` with a
+    /// throw — including the `.dependentGenericParamCount` one sixteen lines
+    /// above this in the same block — and its commit message described the
+    /// sweep as complete. This site survived verbatim.
+    ///
+    /// Reachable entirely from public API: `Node.create(kind:index:)` builds
+    /// the payload and `decodeMangledType(node:)` is public, so a
+    /// caller-assembled tree aborts the process where `try?` cannot reach —
+    /// in release too, and at 2^31 rather than 2^63 on 32-bit watchOS.
+    ///
+    /// `KnownIssues.md` #1 carried this whole family as deferred, which is why
+    /// the omission survived a review pass: a reviewer consulting that list
+    /// skips the family wholesale. The entry is corrected in the same batch as
+    /// this fix.
+    @Test func parameterPackDepthAndIndexNearUInt64MaxThrowInsteadOfTrapping() async throws {
+        await #expect(processExitsWith: .success) {
+            for boundaryIndex in [UInt64.max, UInt64.max - 1, UInt64(Int.max) + 1] {
+                let marker = Node.createTransient(kind: .dependentGenericParamType, children: [
+                    Node.create(kind: .index, index: boundaryIndex),
+                    Node.create(kind: .index, index: boundaryIndex),
+                ])
+                let packMarker = Node.createTransient(kind: .dependentGenericParamPackMarker, children: [
+                    Node.create(kind: .type, child: marker),
+                ])
+                // Three children: `children.count > 1` gates the block and the
+                // body then reads `children[2]`, so a two-child tree never
+                // reaches the narrowing (that overrun is upstream-shaped and
+                // adjudicated separately in `KnownIssues.md`).
+                let root = Node.createTransient(kind: .silBoxTypeWithLayout, children: [
+                    Node.create(kind: .typeList),
+                    Node.createTransient(kind: .dependentGenericSignature, children: [packMarker]),
+                    Node.create(kind: .typeList),
+                ])
+                let decoder = TypeDecoder(builder: StringTypeBuilder())
+                #expect(throws: TypeLookupError.self) {
+                    _ = try decoder.decodeMangledType(node: root)
+                }
+            }
+        }
+    }
+
     // MARK: - Structural equality transitivity (#8)
 
     /// `NodeStoreBuilder.internText` deduplicates by raw UTF-8 bytes, so the
@@ -1126,6 +1169,116 @@ struct DefectRegressionTests {
                 _ = try demangleAsNode("$s4main0021aJJJJJJJJJJJJJJJJJJJbyyF")
             }
         }
+    }
+
+    // MARK: - Punycode parity with upstream
+
+    /// Upstream's `digit_index` accepts exactly `a`-`z` (digit values 0-25)
+    /// and `A`-`J` (26-35), returning -1 — which rejects the symbol — for
+    /// everything else. This port spelled both branches as unbounded `>=`
+    /// comparisons, so every scalar from `K` up decodes as a digit: `K`-`Z`
+    /// and `[ \ ] ^ _ ` ` land in the 26-based branch (values 36-57), and
+    /// `{ | } ~` and beyond land in the 0-based one. The library therefore
+    /// accepts punycode the Swift toolchain refuses, and fabricates
+    /// identifier text for it.
+    ///
+    /// `main` carries the identical expressions, so this is a pre-existing
+    /// divergence and not a regression from the byte-scanner rewrite. It is
+    /// fixed because byte-for-byte agreement with upstream is this library's
+    /// first-priority invariant, and it had never been adjudicated — no
+    /// `KnownIssues.md` entry covers punycode.
+    ///
+    /// The `?? "."` substitution (see the test below) is the *other* half of
+    /// this divergence and was the only half review named; on a uniform
+    /// a-zA-Z corpus this branch is the overwhelming majority of it, so
+    /// fixing the substitution alone leaves the divergence essentially
+    /// unchanged.
+    @Test func punycodeDigitDomainMatchesUpstream() throws {
+        // Pre-fix these all decoded successfully, to the scalar named after
+        // each one. Upstream rejects every one at `digit_index`.
+        let rejectedWithTheirPreFixOutput = [
+            ("Ka", "\u{A4}"), ("Za", "\u{B3}"), ("[a", "\u{B4}"),
+            ("`a", "\u{B9}"), ("{a", "\u{9A}"), ("~a", "\u{9D}"),
+        ]
+        for (input, preFixOutput) in rejectedWithTheirPreFixOutput {
+            #expect(throws: DemanglingError.self, "\(input) decoded to \(preFixOutput) pre-fix; upstream rejects it") {
+                _ = try Punycode.decodePunycode(input)
+            }
+        }
+
+        // The legal boundaries stay accepted and decode unchanged: `J` is the
+        // last 26-based digit (35) and `z` the last 0-based one (25).
+        #expect(try Punycode.decodePunycode("Ja") == "\u{A3}")
+        #expect(try Punycode.decodePunycode("ja") == "\u{89}")
+        #expect(try Punycode.decodePunycode("aa") == "\u{80}\u{80}")
+        // A real punycoded identifier — the one the corpus carries — is
+        // untouched by the narrowed domain.
+        #expect(try Punycode.decodePunycode("egbpdajGbuEbxfgehfvwxn")
+            == "\u{644}\u{64A}\u{647}\u{645}\u{627}\u{628}\u{62A}\u{643}\u{644}\u{645}\u{648}\u{634}\u{639}\u{631}\u{628}\u{64A}\u{61F}")
+
+        // End to end: an out-of-domain digit reaches this code from any
+        // mangled identifier, so the whole symbol must be rejected.
+        #expect(throws: DemanglingError.self) { _ = try demangleAsNode("$s4main002KayyF") }
+        #expect(throws: DemanglingError.self) { _ = try demangleAsNode("$s4main002ZayyF") }
+        // ...while the in-domain spelling of the same shape still demangles.
+        #expect(try demangleAsNode("$s4main002JayyF").print(using: .default) == "main.\u{A3}() -> ()")
+    }
+
+    /// A decoded code point that is not a representable Unicode scalar was
+    /// substituted with `UnicodeScalar(".")` instead of rejecting the symbol,
+    /// so the library invented identifier text. The fabricated character is
+    /// `.`, which is also the structural separator in printed output, so the
+    /// result is not merely wrong but ambiguous — `main....()` cannot be told
+    /// apart from a real nested context.
+    ///
+    /// Upstream validates in `encodeToUTF8`: `isValidUnicodeScalar(S)` gates
+    /// every decoded scalar and fails the whole decode. This port has that
+    /// predicate (it is applied on the *encode* path) and simply never called
+    /// it while decoding.
+    ///
+    /// `main` behaves identically — pre-existing, like the digit domain above.
+    @Test func punycodeRejectsUnrepresentableScalarsInsteadOfSubstitutingADot() throws {
+        // Both decode to a surrogate (U+DCC2 and U+D885), which `UnicodeScalar`
+        // cannot represent; pre-fix both produced the single scalar ".".
+        for input in ["bbAc", "bfJb"] {
+            #expect(throws: DemanglingError.self, "\(input) decoded to \".\" pre-fix; upstream rejects it") {
+                _ = try Punycode.decodePunycode(input)
+            }
+        }
+
+        // End to end. `$s4main005tlDIvyyF` came from the differential fuzz
+        // against `xcrun swift-demangle`; pre-fix it printed `main..() -> ()`
+        // while the toolchain returned the input unchanged.
+        //
+        // Both assertions below were confirmed to *fail* before the fix — that
+        // is what makes them evidence. The fuzz's other headline symbol,
+        // `$s4main0016dlGBHpvDzAmnbBryyF`, is deliberately **not** here: on
+        // this branch it is already rejected pre-fix (its 16-character body
+        // leaves a trailing `yF` that fails function-type parsing), so
+        // asserting on it would pass either way and quietly claim coverage
+        // this test does not have.
+        #expect(throws: DemanglingError.self) { _ = try demangleAsNode("$s4main005tlDIvyyF") }
+        #expect(throws: DemanglingError.self) { _ = try demangleAsNode("$s4main004bbAcyyF") }
+    }
+
+    /// The code points before the delimiter are copied to the output verbatim.
+    /// Upstream fails on any that is not a basic (< 0x80) code point; this
+    /// port copied whatever it found, so a non-ASCII scalar ahead of the
+    /// delimiter produced an identifier upstream rejects outright.
+    ///
+    /// Not named by either review round — found by reading upstream's
+    /// `decodePunycode` line by line against this one. Same provenance as the
+    /// other two: `main` has it, and it was never adjudicated.
+    @Test func punycodeRejectsNonBasicCodePointsBeforeTheDelimiter() throws {
+        // Pre-fix "é_a" decoded to "\u{80}é" and "中_a" to "\u{80}中".
+        for input in ["\u{E9}_a", "\u{4E2D}_a", "a\u{E9}_ba"] {
+            #expect(throws: DemanglingError.self, "\(input) has a non-basic code point before the delimiter") {
+                _ = try Punycode.decodePunycode(input)
+            }
+        }
+        // Basic code points before the delimiter are the normal case and stay
+        // accepted.
+        #expect(try Punycode.decodePunycode("ab_ba") == "a\u{80}b")
     }
 
     /// Differentiability payloads are narrowed to a single byte on the way to

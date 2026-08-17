@@ -829,7 +829,15 @@ extension TypeDecoderEngine {
                            marker.children.count >= 2,
                            let depth = marker.children[0].index,
                            let index = marker.children[1].index {
-                            parameterPacks.append((Int(depth), Int(index)))
+                            // Both payloads are caller-reachable up to
+                            // `UInt64.max`, so the narrowing throws like every
+                            // other one in this file rather than aborting the
+                            // process — at 2^31 on 32-bit watchOS.
+                            guard let packDepth = Int(exactly: depth),
+                                  let packIndex = Int(exactly: index) else {
+                                throw TypeLookupError(node: marker, message: "parameter pack depth or index out of range")
+                            }
+                            parameterPacks.append((packDepth, packIndex))
                         }
                     }
                 }
