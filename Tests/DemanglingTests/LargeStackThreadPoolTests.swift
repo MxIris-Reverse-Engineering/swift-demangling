@@ -212,11 +212,13 @@ struct LargeStackThreadPoolTests {
     /// it must drain the queue on its own thread before refusing, or the first
     /// submitter waits forever on a pool that cannot act.
     @Test func spawnFailureNeverStrandsASubmission() {
-        let pool = LargeStackThreadPool()
-        pool.simulatesSpawnFailureForTesting = true
-        // Holds every submitter in the reserved-but-not-yet-failed state at
-        // once, so the roll-backs genuinely race instead of serializing.
-        pool.simulatedSpawnFailureDelayForTesting = 0.25
+        let pool = LargeStackThreadPool(
+            simulatesSpawnFailureForTesting: true,
+            // Holds every submitter in the reserved-but-not-yet-failed state
+            // at once, so the roll-backs genuinely race instead of
+            // serializing.
+            simulatedSpawnFailureDelayForTesting: 0.25
+        )
 
         let submitterCount = 8
         let completionCounter = Counter()

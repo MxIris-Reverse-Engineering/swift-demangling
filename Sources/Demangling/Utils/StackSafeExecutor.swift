@@ -1,13 +1,5 @@
 import Foundation
 
-/// Carries a value across the worker boundary where the compiler cannot see
-/// that the handoff is strict: the submitting thread blocks until the worker
-/// has finished with it, so the value is never reachable from two threads at
-/// once.
-private struct UncheckedSendableBox<Value>: @unchecked Sendable {
-    let value: Value
-}
-
 /// Runs the recursive demangling engines on a stack large enough for real
 /// symbols.
 ///
@@ -110,41 +102,6 @@ public enum StackSafeExecutor {
             } catch {
                 outcome = .failure(error)
             }
-        }
-        return try outcome.get()
-        #else
-        return try block()
-        #endif
-    }
-
-    /// ``execute(_:)`` for callers whose values carry no `Sendable`
-    /// conformance.
-    ///
-    /// `NodePrinterTarget` implementations are deliberately unconstrained, so
-    /// the printing entry points cannot use the checked variant for a generic
-    /// target. The call is still a strict handoff — the calling thread blocks
-    /// for its whole duration and no other thread can reach the values —
-    /// which is precisely the shape the checking cannot express.
-    static func executeWithUncheckedSendability<Success, Failure: Error>(
-        _ block: @escaping () throws(Failure) -> Success
-    ) throws(Failure) -> Success {
-        #if canImport(Darwin)
-        if currentThreadHasSufficientStack {
-            return try block()
-        }
-        // Boxed as a non-throwing closure returning a `Result`: a typed-throws
-        // *function type* stored in a generic container needs a macOS 15
-        // runtime, and this library deploys to 10.15.
-        let blockBox = UncheckedSendableBox(value: { () -> Result<Success, Failure> in
-            do throws(Failure) {
-                return .success(try block())
-            } catch {
-                return .failure(error)
-            }
-        })
-        nonisolated(unsafe) var outcome: Result<Success, Failure>!
-        runOnLargeStack {
-            outcome = blockBox.value()
         }
         return try outcome.get()
         #else
@@ -404,14 +361,34 @@ final class LargeStackThreadPool: @unchecked Sendable {
     /// Test hook: makes every spawn attempt fail as if the OS refused to
     /// create the thread, so the failure paths can be exercised on a private
     /// pool instance. Never set on ``shared``.
-    var simulatesSpawnFailureForTesting = false
+    ///
+    /// Immutable, and set only at construction. Every other mutable property
+    /// on this type is touched exclusively under ``condition``, but
+    /// ``spawnWorker()`` runs *after* the lock is released, so a settable hook
+    /// would be an unsynchronized read racing any writer — leaving the type's
+    /// `@unchecked Sendable` audit resting on call-site discipline rather than
+    /// on the lock it otherwise uses uniformly (and a torn read of the
+    /// 64-bit `TimeInterval` is representable on 32-bit armv7k). `let` removes
+    /// the race outright instead of moving it under the lock, which would make
+    /// the delay's `Thread.sleep` block every other submitter.
+    let simulatesSpawnFailureForTesting: Bool
 
     /// Test hook: how long a simulated spawn failure takes to report. A real
     /// `pthread_create` failure is not instantaneous either; the delay holds
     /// concurrent submitters in the reserved-but-not-yet-failed state at the
     /// same time, which is the interleaving the failure handling has to
     /// survive.
-    var simulatedSpawnFailureDelayForTesting: TimeInterval = 0
+    let simulatedSpawnFailureDelayForTesting: TimeInterval
+
+    /// ``shared`` and every production path use the parameterless form; only
+    /// tests pass the hooks.
+    init(
+        simulatesSpawnFailureForTesting: Bool = false,
+        simulatedSpawnFailureDelayForTesting: TimeInterval = 0
+    ) {
+        self.simulatesSpawnFailureForTesting = simulatesSpawnFailureForTesting
+        self.simulatedSpawnFailureDelayForTesting = simulatedSpawnFailureDelayForTesting
+    }
 
     private let condition = NSCondition()
     private var pendingWorkItems: [@Sendable () -> Void] = []
