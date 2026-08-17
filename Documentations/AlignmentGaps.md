@@ -215,3 +215,34 @@ StandardTypes 替换表（含 `TaskExecutor`/`UnownedJob`/`MainActor`/`Cancellat
    再设计不破坏现有测试的实现；改 A1 时务必同步其下游消费方（NodePrinter/TypeDecoder）。
 4. **Low**：按需。
 5. **测试守护**：任何改动前后跑全套 `swift test`，确保通过数不下降——group-a 正是因破坏既有功能而被移除。
+
+---
+
+## 审计范围补正：工具函数层也有对齐缺口（2026-08-16）
+
+本文件 2026-06-20 的审计沿 `Node.Kind` 表和 `Demangler` / `NodePrinter` / `TypeDecoder`
+的结构逐项对照，**没有覆盖 `Utils/` 下的工具函数**。2026-08-16 发现 `Punycode.swift` 的
+解码路径与上游有三处偏离，全部属于「本库接受上游拒绝的输入」——比 Node Kind 缺口更难
+察觉，因为它不体现为打印差异，而体现为**接受集差异**：两边都能解出的符号输出逐字节相同，
+差异只在「该不该拒绝」上。
+
+成因是移植时的**层合并**：上游把解码分成 `decodePunycode`（产出 code point）和
+`encodeToUTF8`（校验并编码）两层，本库合并成一个返回 `String` 的函数，**两层各自的守卫
+都在合并中丢失**：
+
+| 上游守卫 | 所在层 | 本库状态（修复前） |
+|---|---|---|
+| 分隔符前 `c > 0x7f` → 拒绝 | `decodePunycode` | 缺 |
+| `digit_index` 仅收 `a`-`z` / `A`-`J`，其余 -1 → 拒绝 | `decodePunycode` | 缺上界 |
+| `isValidUnicodeScalar(S)` → 拒绝 | `encodeToUTF8` | 缺（改用 `.` 顶替） |
+
+均已修复，详见
+[`Evolutions/0013`](../Evolutions/0013-punycode-upstream-parity-and-review-round-four-fixes.md)。
+
+**对后续审计的两条指引**：
+
+1. **审计范围要含 `Utils/`**：`Punycode.swift`、`Extensions.swift`、`Common` 常量都有上游
+   对应物，本文件此前一处都没对过。
+2. **对齐检查要看接受集，不只看输出**：`main` 与工具链在这 2582 个符号上输出没有任何差
+   异——因为工具链**根本不输出**，它拒绝。只比对「双方都成功时的输出」的审计方法对这
+   一整类缺口结构性失明；需要的是差分 fuzz（构造语料 → 比对 accept/reject 两侧）。

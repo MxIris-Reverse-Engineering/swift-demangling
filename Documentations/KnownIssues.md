@@ -7,11 +7,14 @@
 概念背景：`Concepts/` 下的五篇（[遍历计价](Concepts/TraversalCost.md)、
 [栈与崩溃](Concepts/RecursionAndStack.md) 与本文关系最紧）。词条速查见 [Glossary.md](Glossary.md)。
 
-- **第一部分（下方 1–6 条）**：已确认真实存在、但经维护者决定**暂缓修复**的问题。
-  每条记录：现象与根因、复现方式、影响面评估、暂缓理由。修复任何一条后请把该条目移除
-  并在对应演进文档中记录修复。
-- **第二部分（文末「误报与非缺陷」）**：经查证**判定为误报或刻意设计**的 review 发现。
-  记录发现内容、裁决结论、理由与裁决日期，目的是让同一个发现不必被反复重新推导。
+- **第一部分（下方 1–6 条，其中第 1 条已关闭）**：已确认真实存在、但经维护者决定**暂缓
+  修复**的问题。每条记录：现象与根因、复现方式、影响面评估、暂缓理由。修复任何一条后请
+  把该条目移除并在对应演进文档中记录修复。
+  **「修复后登记」和「发现后登记」一样是硬要求**：本清单是 review 流程「已裁决即跳过」
+  的依据，所以漏登记已修项会让整族继续挂着「暂缓」标签，把其中尚未修的那处一并遮住——
+  这在 2026-08-16 真实发生过一次，详见第 1 条。
+- **第二部分（文末「误报与非缺陷」，N1–N22）**：经查证**判定为误报或刻意设计**的 review
+  发现。记录发现内容、裁决结论、理由与裁决日期，目的是让同一个发现不必被反复重新推导。
 
 - **记录日期**：2026-07-30（PR #6 review 期间逐条用复现测试确认）。
 - **暂缓决策**：下游消费方（MachOSwiftSection 等）当前未使用 `TypeDecoder` 的任何接口，
@@ -77,10 +80,49 @@
   `demanglerSourceAvoidsUncheckedNarrowingOfParsedNumbers` 钉住三种致陷拼写不得回归
   （对经中间变量洗过的转换失明——由 exit test 兜底，两道防线的盲区互补）。
   第 1 条本体（TypeDecoder 8 处）维持暂缓裁决不变。
+- **2026-08-16 更新（PR #8 review + 独立复核，evolution 0013）**：本轮再次把 `max` 档
+  review 的 15 条发现交给另一个会话独立复核，对方推翻或修正了 4 条。本文件的变动：
+  - **第 1 条关闭**：净待修 6 处已全部修复（5 处 `ffd6f87`，第 6 处本轮）。**这条目自己
+    造成了本轮的漏修**——`ffd6f87` 修完 5 处没有登记，第 6 处便借着整族的「已裁决」标签
+    躲过了一整轮 review。教训写在条目里：**清单的失真是双向的，漏登记已修项和漏登记待修
+    项一样危险。**
+  - 新增 N19–N22 四条裁决（`?? .copyable` 兜底、`<each A, B>`、`silBoxTypeWithLayout` 的
+    `children[2]` 与 layout 死分支、跨 store `NodeIndex` 的 debug-only 守卫）。N21 承接第
+    1 条迁出的死代码裁决。
+  - **本轮最大的一条发现不在 review 的清单里**：punycode 解码与上游有**三处**偏离，
+    review 只点名了一处，而按占比它是最小的那处（2582 例差分里只占 5 例）。已全部修复，
+    见 [0013](../Evolutions/0013-punycode-upstream-parity-and-review-round-four-fixes.md)。
 
 ---
 
-## 1. TypeDecoder：多处会陷入（trap）的整数转换
+## 1. TypeDecoder：多处会陷入（trap）的整数转换 —— **已全部修复，2026-08-16 关闭**
+
+> **本条已关闭。保留编号与正文，因为本文件与其余文档有多处「第 1 条」交叉引用，改
+> 编号会一并失效；也因为它两次成为「清单失真」的样本，那个教训比条目本身更值钱。**
+>
+> **净待修 6 处（8 处清点 − 1492/1495 两处死代码）现已全部修复**：
+>
+> | 位置（当前 HEAD） | 修复者 |
+> |---|---|
+> | 335 `.dependentGenericParamType` | `ffd6f87` |
+> | 816 `.silBoxTypeWithLayout` 的 `genericParamsAtDepth` | `ffd6f87` |
+> | 987 `.integer` | `ffd6f87` |
+> | 996 `.negativeInteger` | `ffd6f87` |
+> | 1467 inverse conformance 的 `UInt32(index)` | `ffd6f87`（**只修了 trap；`?? .copyable` 兜底保留，裁决见 N19**） |
+> | 832 `.silBoxTypeWithLayout` 的 `parameterPacks` | [0013](../Evolutions/0013-punycode-upstream-parity-and-review-round-four-fixes.md) |
+>
+> **这条目自己造成了一次漏修，方式和它警告过的正好相反。** 2026-08-02 的更正写下
+> 「清点不全会把从未裁决过的崩溃点静默转为『已裁决』」。这次是**修完不登记**：
+> `ffd6f87` 修掉 5 处后条目一字未动，5 处已修站点继续挂着「暂缓」，而第 6 处（832）
+> 借着整族的「已裁决」标签躲过了一整轮 `max` 档 review——review 流程的契约就是「已裁
+> 决且理由仍成立的发现直接跳过」。**清单的失真是双向的：漏登记待修项会掩盖崩溃点，
+> 漏登记已修项同样会。** 本文件开头「修复任何一条后请把该条目移除」的要求，是这条契
+> 约的落点，不是可选的整洁习惯。
+>
+> 1492 / 1495 两处死代码的裁决（上游同款，不需要修）**仍然有效**，已迁入第二部分
+> N21 长期保存。
+
+以下为关闭前的原文，保留备查。
 
 对畸形输入，`TypeDecoderEngine` 的契约是抛 `TypeLookupError`；但以下位置用了会 trap 的
 整数转换初始化器，守卫（guard）只挡 `nil` 不挡量级，超范围值直接使进程崩溃（SIGTRAP）。
@@ -667,3 +709,97 @@ ID，需要改 `Payload` 让 contents 与 children 共存 —— 那会偏离上
 
 与 [#1](#1-typedecoder多处会陷入trap的整数转换) 的 layout 死分支同类：**移植缺陷与上游缺陷
 要分开裁决，本库不单方面偏离上游。**
+
+## N19. `decodeInverseRequirement` 的 `?? .copyable` 兜底（PR #8 review + 独立复核）
+
+**发现内容**：`TypeDecoder.swift:1467`
+`let protocolKind = UInt32(exactly: index).flatMap { InvertibleProtocolKind(rawValue: $0) } ?? .copyable`
+——越界或无法识别的 inverse-protocol index 被静默解码成 `.copyable`，于是 `TypeBuilder`
+记下一条符号从未表达过的 `~Copyable` 抑制，或悄悄丢掉一条 `~Escapable`，没有错误通道，
+构造出的类型里也没有任何痕迹表明发生过替换。review 认为它与同批改成硬失败的邻居不一致。
+
+**裁决：不修（记录）。** 两条理由，第二条是决定性的：
+
+1. **兜底不是本 PR 引入的。** `?? .copyable` 在 `main:1405` 逐字存在；`ffd6f87` 只把会
+   trap 的 `UInt32(index)` 换成 `UInt32(exactly:)`。review 把它记成「本 PR 唯独漏改的一
+   处」不准确——本 PR 修的是 trap，不是兜底。
+2. **上游没有「硬失败」可对齐。** `swiftlang/swift` main 的 `TypeDecoder.h` 此处是
+   `static_cast<InvertibleProtocolKind>(index)`，**完全不校验**，任意值直灌 builder。
+   Swift 拼不出无效的枚举值，所以「兜底」与「抛错」都是本库的单方面选择；改成抛错等于
+   在 `ffd6f87` 已收紧的 5 处之外，**再新增一种对上游的单方面收紧**。
+
+按 N18 / layout 死分支确立的先例——**移植缺陷与上游缺陷分开裁决，本库不单方面偏离上
+游**——记录而不改。维护者若偏好抛错，那是一行改动加一条回归测试，但应作为「有意偏离上
+游」的决定作出，而不是当成对齐修复。
+
+**裁决日期**：2026-08-16。
+
+## N20. `<each A, B>` 缺第二个 `each`（PR #8 review 自我推翻，独立复核确认）
+
+**发现内容**：可变参数泛型（variadic generics）符号打印成 `<each A, B>` 而不是
+`<each A, each B>`，看起来是第二个参数包丢了 `each` 标记。
+
+**裁决：误报，上游忠实移植。** review 自己在提出后就推翻了它，独立复核用另一份产物再次
+确认：编译 `public func packPair<each A, each B>(...)` 得到符号
+`$s6vgtest8packPair...RvzRv_r0_lF`，`xcrun swift-demangle` 打印
+
+```
+vgtest.packPair<each A, B>(first: repeat A, second: repeat B) -> ()
+```
+
+本库输出与之**逐字节相同**。这是上游 demangler 的 depth/index 处理产生的行为，不是本库
+的移植缺陷。
+
+**记录它的原因**：这条已经被独立地推导出来两次（review 一次、复核一次），每次都要重新
+建一个 variadic generics dylib 才能证伪。写进本文件正是为了让第三次不必再来一遍——这就
+是本文件第二部分存在的意义。
+
+**裁决日期**：2026-08-16。
+
+## N21. `.silBoxTypeWithLayout` 的 `children[2]` 越界，与 layout 分支死代码（承接第 1 条）
+
+**发现内容**：两处，同属「上游同款、不单方面偏离」一类。
+
+1. `TypeDecoder.swift:800-801`：`if node.children.count > 1 { let substNode = node.children[2] }`
+   ——恰好 2 个 children 的手搭树在声明为 `throws` 的契约内 trap。`main` 同款（767-768），
+   上游同构（`getChild(2)`）。
+2. `TypeDecoder.swift:1492 / 1495`：`Int(size)` / `Int(align)` 是**死代码**。
+   `decodeRequirements` 循环顶部有 `guard child.children.count == 2 else { continue }`，
+   而 layout 分支里的 `guard child.children.count >= 3` 在此前提下恒假。核对
+   `swiftlang/swift` main 的 `TypeDecoder.h`，`decodeRequirement` 是逐字同款结构，两处都是
+   `return`，同样的死分支——**Apple 自己的 runtime 同样解不出带 size 的布局约束**。
+
+**裁决：不修（记录）。** 第 2 点自第 1 条 2026-08-16 更新起即为此结论，随第 1 条关闭迁到
+这里长期保存；第 1 点按同一先例一并裁决。两者都落在 TypeDecoder 健壮性的既有暂缓伞下
+（下游消费方当前未使用 `TypeDecoder` 的任何接口，维护者 2026-07-29 决定）。
+
+若认为该行为本身是错的，正确路径是先向上游报告，而不是单方面改本库。
+
+**裁决日期**：2026-08-16。
+
+## N22. 跨 store `NodeIndex` 误用只有 `#if DEBUG` 守卫（PR #8 review）
+
+**发现内容**：`NodeStore.swift:257` 一带的跨 store 索引校验编译进 debug、不进 release，
+而构成误用所需的两半——`NodeReference.store` 与 `.nodeIndex`——都是 `public let`，
+`NodeStore.reference(at:)` 也是 public，所以
+`referenceFromStoreA.store.reference(at: referenceFromStoreB.nodeIndex)` 从普通 API 就能
+写出来且无任何诊断。release 下它在界内解析到不相关的子树（源码注释自述「silently wrong,
+but well-formed」）。review 建议把 tag 保留到 release，理由是 `NodeReference` 在 release
+下是 12 字节、stride 16，塞回 `UInt16` tag 后是 14 ≤ 16，**装得进现有 padding**。
+
+**裁决：维持 debug-only（不修）。** 技术断言逐条核实为真——两半确实 public 非 unsafe，
+`NodeIndex` 的 `==`/`hash` 确实只比 rawValue（注释成文解释了原因：避免 Debug/Release 身份
+分叉），布局也实测确认（release 12/16，加 tag 后 14/16；debug 14/16）。但：
+
+1. **debug-only 是 [0009](../Evolutions/0009-swift-syntax-arena-lessons.md) 的成文决定**，
+   不是疏漏。源码注释明写它「not a security boundary」且「release 布局与行为不变」，
+   `Glossary.md`、`NodeStoreArena.md`、`AGENTS.md` 三处同文。
+2. **review 没有提出推翻该裁决的新证据**，只是对同一组代价重新权衡了一次。按本文件的契约
+   ——「已裁决且理由仍成立的发现直接跳过」——这不构成重新裁决的理由。
+3. **review 的代价核算漏了一半**：只算了 `NodeReference` 的 padding，没算 `NodeIndex`
+   **自身**的 stride 会从 4 涨到 8。任何 `[NodeIndex]` / `Set<NodeIndex>` 内存翻倍，而
+   `NodeIndex` 正是 arena 里到处传递的 4 字节句柄——这恰恰是 arena 存在的理由。
+
+要改就走提案推翻 0009 的该节，并把 `NodeIndex` 的 stride 代价一并算进去。
+
+**裁决日期**：2026-08-16。
