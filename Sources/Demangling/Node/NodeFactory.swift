@@ -635,7 +635,11 @@ extension Node {
 }
 
 extension Node {
-    convenience init(kind: Kind, contents: Contents = .none, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
-        self.init(kind: kind, contents: contents, children: childrenBuilder())
+    // No `contents:` parameter: this initializer exists to produce children,
+    // and the two are mutually exclusive in `Payload`. Mirrors the public
+    // `Node.create(kind:childrenBuilder:)`, which dropped its own `contents:`
+    // for the same reason.
+    convenience init(kind: Kind, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
+        self.init(kind: kind, children: childrenBuilder())
     }
 }

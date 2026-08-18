@@ -2028,23 +2028,35 @@ struct DefectRegressionTests {
         mutating func popTypeReferenceScope() {}
     }
 
-    /// No node factory may accept contents and children together.
+    /// No node factory or builder initializer may accept contents and children
+    /// together.
     ///
     /// `Payload` merges the two into one discriminated union — as upstream's
-    /// `Node` does — and `mergedPayload` resolves the conflict by giving
-    /// children priority, silently. A factory taking both therefore drops its
-    /// `text`/`index` on the floor whenever children are present, and through
-    /// the subtree intern key it collapses two differently-texted requests
-    /// onto a single shared instance.
+    /// `Node` does — so the combination has no representation at all. It used
+    /// to be resolved by giving children priority, silently: a declaration
+    /// taking both dropped its `text`/`index` on the floor whenever children
+    /// were present, and through the subtree intern key it collapsed two
+    /// differently-texted requests onto a single shared instance.
     ///
-    /// `eff0716` deleted the `text:`/`index:` spellings by hand and left the
-    /// primary `contents:` + `children:` overload — plus `inlineChildren:`,
-    /// `childrenBuilder:` and both SPI `createTransient` forms — in place,
-    /// while its own doc comment stated the combination could not be spelled.
-    /// Hence a scan rather than another hand sweep.
+    /// Two sweeps have now missed a spelling each, which is why this is a scan
+    /// and why the scan looks the way it does. `eff0716` deleted the
+    /// `text:`/`index:` forms by hand and left the primary `contents:` +
+    /// `children:` overload in place, while its own doc comment already claimed
+    /// the combination could not be spelled. The scan that replaced that sweep
+    /// matched `func create` against a single trimmed line, so it could not see
+    /// `NodeBuilder.init(kind:contents:children:)` — public, and by then the
+    /// one remaining way to spell the invalid combination — nor the internal
+    /// `Node.init(kind:contents:childrenBuilder:)`, nor any declaration whose
+    /// parameter list wraps across lines. It therefore scans whole
+    /// declarations, and covers initializers as well as factories.
     ///
-    /// `Node.init` is exempt: it is the internal entry point that
-    /// `mergedPayload` exists for, and it is not public API.
+    /// `Node`'s two designated initializers are exempt **by name**: they are
+    /// the internal entry point the merge exists for, they are not public API,
+    /// and `NodeCache.internTree` rebuilds through one of them, handing a node
+    /// its own contents alongside its own children — a pair that cannot
+    /// conflict, since a node with children always has `.none` contents.
+    /// Exempting them by name rather than by kind is deliberate: any *new*
+    /// initializer is caught.
     @Test func nodeFactoriesCannotSpellContentsWithChildren() throws {
         let librarySourcesDirectory = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -2052,19 +2064,30 @@ struct DefectRegressionTests {
             .deletingLastPathComponent()
             .appendingPathComponent("Sources")
         let fileEnumerator = try #require(FileManager.default.enumerator(at: librarySourcesDirectory, includingPropertiesForKeys: nil))
-        let childParameterLabels = ["children:", "inlineChildren:", "childrenBuilder:"]
+        // Both sides are label *sets*, not single labels. Matching only
+        // `contents:` would let the exact spellings `eff0716` deleted by hand
+        // back in — `create(kind:text:children:)` and `create(kind:index:child:)`
+        // are still live public API on `main`, so "someone re-adds it from
+        // memory after the merge" is the most likely regression there is.
+        let contentsParameterLabels = ["contents:", "text:", "index:"]
+        let childParameterLabels = ["children:", "inlineChildren:", "childrenBuilder:", "child:"]
+        let exemptDeclarations: Set<String> = [
+            "init(kind: Kind, contents: Contents = .none, children: [Node] = [])",
+            "init(kind: Kind, contents: Contents = .none, inlineChildren: Children)",
+        ]
 
         var violations: [String] = []
         for case let fileLocation as URL in fileEnumerator where fileLocation.pathExtension == "swift" {
             let fileContents = try String(contentsOf: fileLocation, encoding: .utf8)
-            for (lineOffset, line) in fileContents.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-                guard !trimmedLine.hasPrefix("//"), !trimmedLine.hasPrefix("///") else { continue }
-                // Declarations of node factories only — `Node.init` is exempt.
-                guard trimmedLine.contains("func create"), trimmedLine.contains("contents:") else { continue }
-                for childLabel in childParameterLabels where trimmedLine.contains(childLabel) {
-                    violations.append("\(fileLocation.lastPathComponent):\(lineOffset + 1): \(trimmedLine)")
-                }
+            for declaration in Self.nodeConstructionDeclarations(in: fileContents) {
+                guard !exemptDeclarations.contains(declaration.signature) else { continue }
+                guard let contentsLabel = contentsParameterLabels.first(where: { declaration.signature.contains($0) }),
+                      let childLabel = childParameterLabels.first(where: { declaration.signature.contains($0) })
+                else { continue }
+                violations.append("""
+                \(fileLocation.lastPathComponent):\(declaration.lineNumber): \
+                `\(contentsLabel)` with `\(childLabel)` — \(declaration.signature)
+                """)
             }
         }
 
@@ -2073,6 +2096,108 @@ struct DefectRegressionTests {
         contents-only and a children-only overload so the invalid combination cannot be spelled:
         \(violations.sorted().joined(separator: "\n"))
         """)
+    }
+
+    /// Every node-constructing factory and `init` declaration in `source`, each
+    /// flattened to one string ending at the closing parenthesis of its
+    /// parameter list — so a declaration that wraps across lines is still
+    /// matchable in one piece.
+    ///
+    /// Calls are skipped rather than parsed: a declaration's keyword is reached
+    /// after nothing but modifiers and attributes, while `self.init(…)` and
+    /// `Node(…)` always have something else in front.
+    ///
+    /// The verb set covers `intern` as well as `create` because the rule in
+    /// `AGENTS.md` is written over *every* node-creating API: leaving
+    /// `NodeCache.intern(kind:contents:children:)` outside the scan would make
+    /// the stated rule broader than the mechanism enforcing it, which is the
+    /// same "the comment claims more than the code does" failure this whole
+    /// guard exists to end. Initializer detection accepts `init?`/`init!` and
+    /// generic `init<…>` for the same reason a plain `init(` is accepted —
+    /// `hasPrefix("init(")` alone let all three through, while the factory side
+    /// already caught `func create<…>(`.
+    private static func nodeConstructionDeclarations(in source: String) -> [(signature: String, lineNumber: Int)] {
+        let declarationModifiers: Set<String> = [
+            "public", "internal", "private", "fileprivate", "package",
+            "static", "convenience", "required", "override", "final",
+            "mutating", "nonmutating", "nonisolated", "open", "class",
+        ]
+        let factoryVerbs = ["create", "intern"]
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var declarations: [(signature: String, lineNumber: Int)] = []
+
+        for (lineOffset, line) in lines.enumerated() {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmedLine.hasPrefix("//") else { continue }
+
+            var tokens = trimmedLine.split(separator: " ").map(String.init)
+            while let leadingToken = tokens.first, leadingToken.hasPrefix("@") || declarationModifiers.contains(leadingToken) {
+                tokens.removeFirst()
+            }
+            let declaresInitializer = tokens.first.map(Self.isInitializerKeyword) ?? false
+            let declaresFactory = tokens.first == "func"
+                && (tokens.dropFirst().first.map { name in factoryVerbs.contains { name.hasPrefix($0) } } ?? false)
+            guard declaresInitializer || declaresFactory else { continue }
+
+            var signature = ""
+            var parenthesisDepth = 0
+            var sawOpeningParenthesis = false
+            collecting: for followingLine in lines[lineOffset...] {
+                if !signature.isEmpty { signature.append(" ") }
+                for character in followingLine.trimmingCharacters(in: .whitespaces) {
+                    signature.append(character)
+                    if character == "(" {
+                        parenthesisDepth += 1
+                        sawOpeningParenthesis = true
+                    } else if character == ")" {
+                        parenthesisDepth -= 1
+                        if sawOpeningParenthesis, parenthesisDepth == 0 { break collecting }
+                    }
+                }
+            }
+            declarations.append((signature, lineOffset + 1))
+        }
+        return declarations
+    }
+
+    /// Whether `token` opens an initializer declaration: `init(`, `init?(`,
+    /// `init!(` or `init<…>(`.
+    private static func isInitializerKeyword(_ token: String) -> Bool {
+        guard token.hasPrefix("init") else { return false }
+        guard let following = token.dropFirst("init".count).first else { return false }
+        return following == "(" || following == "?" || following == "!" || following == "<"
+    }
+
+    /// A node that carries contents keeps them across every builder operation
+    /// that is legal on it.
+    ///
+    /// This is the other half of the contents/children split, and the half the
+    /// factory scan above cannot see. Even with every factory and initializer
+    /// made unspellable, `NodeBuilder(someIdentifier)` followed by `addChild`
+    /// reached the merge with a text *and* a child, which resolved the
+    /// impossible pair in favour of the child and dropped the text — silently,
+    /// so the node remangled to a different symbol with no diagnostic, and two
+    /// differently-texted nodes could intern to one instance. That direction
+    /// now traps in `mergedPayload`, which no assertion can observe in-process;
+    /// what is pinned here is the surrounding behaviour, so a future change
+    /// that goes back to resolving the pair silently fails loudly somewhere.
+    @Test func nodeCarryingContentsKeepsThemAcrossLegalBuilderOperations() {
+        let identifier = Node.create(kind: .identifier, text: "test")
+        let builder = NodeBuilder(identifier)
+
+        #expect(builder.node.text == "test")
+        // No-ops on a childless node — each one still routes through the merge.
+        #expect(builder.removeChild(at: 0).node.text == "test")
+        #expect(builder.setChild(identifier, at: 0).node.text == "test")
+        #expect(builder.reverseChildren().node.text == "test")
+        #expect(builder.reverseFirst(2).node.text == "test")
+        #expect(builder.changingKind(.module).text == "test")
+        #expect(builder.build().text == "test")
+
+        // The two initializers each keep their own half.
+        #expect(NodeBuilder(kind: .identifier, contents: .text("kept")).node.text == "kept")
+        #expect(NodeBuilder(kind: .type, children: [identifier]).node.children.count == 1)
+        #expect(NodeBuilder(kind: .type, children: [identifier]).node.text == nil)
     }
 
     /// `printGenericSignature` scans for pack/value markers over

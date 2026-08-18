@@ -225,7 +225,12 @@ struct NodeBuilderTests {
     }
 
     @Test func copy() {
-        let original = Node(kind: .type, contents: .text("Test"), children: [
+        // No contents on the parent: it has children, and the two are mutually
+        // exclusive. The `.text("Test")` this used to pass was dropped before
+        // the node was ever built, so the parent-text assertion that used to
+        // stand here compared nil to nil. It is replaced below by one on the
+        // child, where the text actually lives.
+        let original = Node(kind: .type, children: [
             Node(kind: .identifier, contents: .text("Child"))
         ])
         let builder = NodeBuilder(original)
@@ -234,9 +239,9 @@ struct NodeBuilderTests {
 
         #expect(copy !== original)
         #expect(copy.kind == original.kind)
-        #expect(copy.text == original.text)
         #expect(copy.children.count == original.children.count)
         #expect(copy.children[0] !== original.children[0], "Children should also be copied")
+        #expect(copy.children[0].text == "Child", "Contents should survive the copy")
     }
 
     // MARK: - Edge Cases

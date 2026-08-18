@@ -139,21 +139,40 @@ public final class Node: Sendable {
         }
     }
 
-    /// Merge contents and children into the most compact payload case.
-    /// When children are present, they take priority (contents and children are mutually exclusive).
+    /// Reduce contents and children to the one payload case that can hold them.
+    ///
+    /// Contents and children are mutually exclusive — `Payload` is a single
+    /// union, so there is no case that carries both. Asking for both is
+    /// therefore a caller error, and it traps here rather than being resolved
+    /// silently: this used to give children priority and drop the `text`/`index`
+    /// on the floor, which the subtree intern key then compounded by collapsing
+    /// two differently-texted requests onto one shared instance.
+    ///
+    /// Reachable only from the two designated initializers and the in-place
+    /// mutators, all of which are internal or `fileprivate`; the public surface
+    /// (`Node.create`, `NodeBuilder.init`) no longer lets the combination be
+    /// spelled at all, pinned by
+    /// `DefectRegressionTests.nodeFactoriesCannotSpellContentsWithChildren`.
     @usableFromInline
     static func mergedPayload(contents: Contents, children: Children) -> Payload {
-        if children.count > 0 {
-            switch children.count {
-            case 1: return .oneChild(children[0])
-            case 2: return .twoChildren(children[0], children[1])
-            default: return .manyChildren(children.toContiguousArray())
+        guard children.count > 0 else {
+            switch contents {
+            case .none: return .none
+            case .index(let i): return .index(i)
+            case .text(let s): return .text(s)
             }
         }
-        switch contents {
-        case .none: return .none
-        case .index(let i): return .index(i)
-        case .text(let s): return .text(s)
+        guard case .none = contents else {
+            preconditionFailure("""
+            a node cannot carry contents and children at once: `Payload` merges them into one \
+            union, so one of the two would have to be dropped. Give the node either contents \
+            or children.
+            """)
+        }
+        switch children.count {
+        case 1: return .oneChild(children[0])
+        case 2: return .twoChildren(children[0], children[1])
+        default: return .manyChildren(children.toContiguousArray())
         }
     }
 
@@ -267,8 +286,12 @@ extension Node {
         case .manyChildren(var arr):
             arr.append(newChild)
             payload = .manyChildren(arr)
-        default:
-            // Rare path: node has both contents and children
+        case .index, .text:
+            // Not "a node with both contents and children", as this branch used
+            // to say: `Payload` is one union, so that state has never existed.
+            // It is a node carrying contents being asked to take its first
+            // child — which used to drop the contents silently. `mergedPayload`
+            // is left to reject it, so there is one place that decides.
             var c = children
             c.append(newChild)
             payload = Self.mergedPayload(contents: contents, children: c)
@@ -453,6 +476,25 @@ extension Node {
 /// let node = builder.build()
 /// ```
 ///
+/// ### Contents and children are mutually exclusive
+///
+/// A node carries *either* contents (`text`/`index`) *or* children, never both:
+/// `Node.Payload` is one discriminated union, exactly as upstream's `Node` is.
+/// That is why there are two initializers — ``init(kind:contents:)`` and
+/// ``init(kind:children:)`` — rather than one taking both.
+///
+/// **It is a programmer error to give a child to a node that carries contents,
+/// and it traps.** Every method that adds or sets children is affected:
+/// ``addChild(_:)``, ``addChildren(_:)``, ``insertChild(_:at:)``,
+/// ``setChildren(_:)``, ``addingChild(_:)``, ``addingChildren(_:)``,
+/// ``insertingChild(_:at:)``, ``withChildren(_:)`` and
+/// ``changingKind(_:additionalChildren:)``. The alternative was to keep
+/// resolving the impossible pair silently, and there is no lossless way to do
+/// that: dropping the contents was the defect this replaced, and dropping the
+/// child instead is the same defect mirrored. Operations that cannot lose data
+/// — removing or replacing a child that is not there, reversing an empty child
+/// list — remain silent no-ops, as they always were.
+///
 /// ### Every node the builder hands out is frozen
 ///
 /// The instance the builder mutates is never exposed: ``node`` returns a
@@ -494,9 +536,21 @@ public final class NodeBuilder: Sendable {
         self._node = Mutex(node.shallowCopy())
     }
 
-    /// Creates a builder with a new node.
-    public init(kind: Node.Kind, contents: Node.Contents = .none, children: [Node] = []) {
-        self._node = Mutex(Node(kind: kind, contents: contents, children: children))
+    /// Creates a builder for a node carrying `contents` and no children.
+    ///
+    /// There is deliberately no `children` parameter here, and no `contents`
+    /// parameter on the overload below: contents and children are mutually
+    /// exclusive in ``Node/Payload``, so a single initializer taking both
+    /// accepted a combination that has no representation — and silently
+    /// resolved it in favour of the children, dropping the `text`/`index`.
+    /// See ``Node/create(kind:text:)`` for the full reasoning.
+    public init(kind: Node.Kind, contents: Node.Contents = .none) {
+        self._node = Mutex(Node(kind: kind, contents: contents))
+    }
+
+    /// Creates a builder for a node carrying `children` and no contents.
+    public init(kind: Node.Kind, children: [Node]) {
+        self._node = Mutex(Node(kind: kind, children: children))
     }
 
     /// `withLockUnchecked` rather than `withLock`: the closures below mutate
@@ -525,6 +579,10 @@ public final class NodeBuilder: Sendable {
     // MARK: - Mutating Operations
 
     /// Adds a child node.
+    ///
+    /// - Precondition: the node under construction carries no contents —
+    ///   contents and children are mutually exclusive. See the type's
+    ///   documentation.
     @discardableResult
     public func addChild(_ child: Node) -> Self {
         withLock { $0.addChild(child) }
@@ -630,6 +688,10 @@ public final class NodeBuilder: Sendable {
     // MARK: - Transformations
 
     /// Returns a new node with a different kind.
+    ///
+    /// - Precondition: `additionalChildren` is empty unless the node carries no
+    ///   contents — contents and children are mutually exclusive. Changing the
+    ///   kind alone is always safe; it is the added children that conflict.
     public func changingKind(_ newKind: Node.Kind, additionalChildren: [Node] = []) -> Node {
         withLockDetaching { $0.changeKind(newKind, additionalChildren: additionalChildren) }
     }

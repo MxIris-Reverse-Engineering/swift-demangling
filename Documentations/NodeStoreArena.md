@@ -13,7 +13,7 @@ bump allocator / 物化是什么）。词条速查见 [Glossary.md](Glossary.md)
 成本，这部分**在 class 形态下已经省无可省**。`NodeStore` 新增一套并存的存储层：节点
 平铺进连续缓冲，每个 12 字节、用 4 字节下标互相引用；printer 与 TypeDecoder 泛型化后
 可以直接读这块缓冲打印，不必先还原成对象树。**`Node` 路径行为一字未变**；公共 API 有
-三处刻意的源码破坏，逐条列在下面的「源码兼容性」一节。
+八处刻意的源码破坏，逐条列在下面的「源码兼容性」一节。
 
 ## 动机
 
@@ -55,13 +55,14 @@ struct 的价值在于**精确布局 + 可平铺进连续缓冲**，所以正确
 
 ## 源码兼容性
 
-`NodeBuilder`、`demangleAsNode`、`TypeDecoder<Builder>`、`TypeBuilder` 的签名与行为保持。
-**有七处刻意的源码破坏**，影响自己实现 `NodePrinterTarget`、直接构造 printer、或手工组装
+`demangleAsNode`、`TypeDecoder<Builder>`、`TypeBuilder` 的签名与行为保持。
+**有八处刻意的源码破坏**，影响自己实现 `NodePrinterTarget`、直接构造 printer、或手工组装
 `Node` 树的下游（已知的只有 MachOSwiftSection）：
 
 | 破坏 | 变更 | 为什么 |
 |---|---|---|
 | `Node.create` / `Node.createTransient` / `NodeCache.createInterned` 全系列 | 不再存在同时接受 `contents:` 与 `children:`/`inlineChildren:`/`childrenBuilder:` 的重载；拆成「只带 contents」与「只带 children」两组 | contents 与 children 在 `Payload` 里互斥（上游 `Node` 同样是 union），`mergedPayload` 让 children 优先且**静默**丢弃 contents，两个 text 不同的请求还会经子树 intern key 合并成同一实例。拆开后无效组合无法拼写。由 `DefectRegressionTests.nodeFactoriesCannotSpellContentsWithChildren` 扫描守住 —— 上一次靠手工删除，漏掉了主力重载，而注释已经宣称删干净了。 |
+| `NodeBuilder.init(kind:contents:children:)` | 拆成 `init(kind:contents:)` 与 `init(kind:children:)` 两个 | 与上一行同一个缺陷，同一个理由 —— 但它在上一行那次清理里**活了下来**，因为守卫扫描只匹配 `func create`，看不见 `init`。于是「无效组合无法拼写」这句话在写下之后仍然是假的：`NodeBuilder` 是它唯一幸存的公开拼法。守卫已改为扫描完整跨行声明并覆盖 `init`（`Node` 的两个 designated init 按名字豁免，它们是 `mergedPayload` 的内部入口）。同批次还去掉了内部 `Node.init(kind:contents:childrenBuilder:)` 的 `contents:`，它是同一个漏网。**对下游为零影响**：MachOSwiftSection 只用 `NodeBuilder(_ node:)`（4 处），不用被拆的这个。**同批次另有一处行为变更**（非源码破坏，故不单列一行）：给带 contents 的节点加 child，从「静默丢弃 contents」改为 `preconditionFailure`，影响 9 个公开方法（`addChild`、`addChildren`、`insertChild`、`setChildren`、`addingChild`、`addingChildren`、`insertingChild`、`withChildren`、`changingKind(additionalChildren:)`）。之所以不保留静默：这个组合没有无损的静默解法——丢 contents 是刚修掉的缺陷，改成丢 child 是同一缺陷的镜像。不丢数据的操作（删/替换不存在的 child、反转空列表）仍是静默 no-op。对当前 MachOSwiftSection 亦为零影响（四处调用的后续操作都不触及这条路径），但对假想中依赖旧行为的下游，这是行为破坏。 |
 | `NodePrinterTarget.count` | 更名并重新定义为 `writtenUnitCount`，契约写进文档：**非空 `write` 必须改变它** | printer 只把它当增量探针用（判断嵌套打印有没有产出，据此决定是否写限定名分隔点），而 `String.count` 违反该契约：往以 `.` 结尾的缓冲追加组合符会并入前一个字素簇，计数不变，分隔点被静默跳过。受害者是 `String` 本身（本库默认 target），不是富文本 target。原成员是该协议**唯一没有契约文档**的成员。 |
 | `Node: Codable` | 已移除 | 见 `06a423c`。 |
 | `NodePrinterTarget.write(_:context:)` | `NodePrintContext?` → `@autoclosure () -> NodePrintContext?`，且**删除了协议扩展里的默认实现** | 默认实现在的时候，一个按旧签名写的实现不构成 witness，默认实现会静默顶替它：打印文本一字不差，所有上下文标注全部消失，且 Swift 对「存在默认实现时的 near-miss witness」没有任何警告。删掉默认实现后，同样的写法变成定义处的编译错误。代价是每个 target 都得写出这个方法（包括纯文本的），这是有意的取舍。 |
@@ -119,6 +120,14 @@ extension SemanticString: @retroactive NodePrinterTarget {
 它是**每次写入 append 一个 atom**，而不是对拼好的文本计数，所以非空写入必然改变它。改名后
 补一行转发即可。反倒是 `String` 违反了契约，那是本库自己修掉的部分。
 
+**4. `NodeBuilder.init(kind:contents:children:)` 拆分 —— `MachOSwiftSection` 不受影响**
+
+下游对 `NodeBuilder` 的四处使用全部走 `NodeBuilder(_ node:)`（`OpaqueType+.swift` 三处、
+`SubscriptNodePrinter.swift` 一处），没有一处用被拆的那个初始化器，所以无需改动。列在这里
+是因为对**其它**手工组装 `Node` 树的下游是破坏性的 —— 但只有**同时**传 `contents:` 与
+`children:` 的写法会断，而那正是要断掉的写法。只传其中一个的调用（含无参的
+`NodeBuilder(kind:)`）在拆分后照常解析，一行都不用改。
+
 > 历史注记：本文档与提案 0010 曾声称「公共 API 零破坏」。那句话写于 PR#6 时期，其后破坏
 > 分批落地，声明没有跟着更新。PR#7 review（finding 10）发现了这个矛盾，本节即是更正。
 >
@@ -126,6 +135,16 @@ extension SemanticString: @retroactive NodePrinterTarget {
 > `Node.create` 重载与两个 `NodeCache.intern` 重载、去掉了 `Node: Codable`，本节一处未记 ——
 > 与它修正的问题是同一类。第五批（本轮）把表补全并改为六处。教训是同一个：**兼容性清单要
 > 从「这次改了哪些公开符号」推导，不要从「我记得破坏了什么」推导。**
+>
+> **第六轮 review：数字本身漂成了三份互相打架的。** 补全那次只改了本节开头的计数，文档
+> 第 16 行仍写「三处」、上面这段仍写「六处」，而表已经是七行 —— PR 正文抄的正是第 16 行
+> 那个最旧的数字。同一份文档里同一个量有三个值，等于没有值。本轮把**两处活的计数**
+> （第 16 行、本节开头）对齐为八处（新增 `NodeBuilder.init` 的拆分）；上一段那句「第五批
+> 把表补全并改为六处」**故意保持原样**，它陈述的是当时发生的事，改掉等于伪造历史。
+>
+> 由此得出的推论：**计数写在正文里就必然会漂**，唯一不漂的是表本身，所以以后只认表的
+> 行数，正文的数字若与表不符以表为准。这条推论在写下它的同一轮里就被自己验证了一次 ——
+> 本段初稿写的是「把三处一并对齐」，把不该动的那句历史陈述也算了进去，审核时才发现。
 
 ## 关键设计
 
