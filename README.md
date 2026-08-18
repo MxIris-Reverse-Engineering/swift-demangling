@@ -165,10 +165,16 @@ builder.addChild(element2)
 let tupleNode = builder.build()
 
 // Non-mutating transformations (return new nodes)
-let modified = node.addingChild(newChild)
-let replaced = node.replacingDescendant(oldNode, with: newNode)
-let changed  = node.changeKind(.structure)
+let modified = NodeBuilder(node).addingChild(newChild)
+let replaced = NodeBuilder(node).replacingDescendant(oldNode, with: newNode)
+let changed  = NodeBuilder(node).changingKind(.structure)
 ```
+
+`NodeBuilder` is the entry point for all of these: `Node`'s own mutating and
+copying helpers are internal, because a node handed out by the builder is
+frozen — that is what makes cyclic trees unconstructible. Note also that a node
+carries *either* contents or children, never both, so the builder has one
+initializer for each (`init(kind:contents:)` and `init(kind:children:)`).
 
 ### Tree Rewriting
 
@@ -178,7 +184,7 @@ Subclass `Node.Rewriter` for bottom-up tree transformations:
 class ModuleRenamer: Node.Rewriter {
     override func visit(_ node: Node) -> Node {
         if node.kind == .module, node.text == "OldName" {
-            return Node(kind: .module, contents: .text("NewName"))
+            return Node.create(kind: .module, text: "NewName")
         }
         return node
     }
