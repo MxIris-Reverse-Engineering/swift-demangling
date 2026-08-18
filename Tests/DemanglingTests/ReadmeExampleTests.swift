@@ -106,3 +106,9 @@ struct ReadmeExampleTests {
 /// breakage would otherwise appear.
 private func requiresSendableConformance<Value: Sendable>(_: Value.Type) {}
 private let nodePrintStateIsSendable: Void = requiresSendableConformance(NodePrintState.self)
+
+/// `NodePrintContext` must carry one for the same reason, and it is the type
+/// that actually reaches a target: `write(_:context:)` delivers a context, not
+/// a state, so pinning only `NodePrintState` left the hook's own payload
+/// unstorable downstream. Pinned here alongside it so the pair cannot drift.
+private let nodePrintContextIsSendable: Void = requiresSendableConformance(NodePrintContext.self)
