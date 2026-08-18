@@ -225,7 +225,12 @@ struct NodeBuilderTests {
     }
 
     @Test func copy() {
-        let original = Node(kind: .type, contents: .text("Test"), children: [
+        // No contents on the parent: it has children, and the two are mutually
+        // exclusive. The `.text("Test")` this used to pass was dropped before
+        // the node was ever built, so the parent-text assertion that used to
+        // stand here compared nil to nil. It is replaced below by one on the
+        // child, where the text actually lives.
+        let original = Node(kind: .type, children: [
             Node(kind: .identifier, contents: .text("Child"))
         ])
         let builder = NodeBuilder(original)
@@ -234,9 +239,9 @@ struct NodeBuilderTests {
 
         #expect(copy !== original)
         #expect(copy.kind == original.kind)
-        #expect(copy.text == original.text)
         #expect(copy.children.count == original.children.count)
         #expect(copy.children[0] !== original.children[0], "Children should also be copied")
+        #expect(copy.children[0].text == "Child", "Contents should survive the copy")
     }
 
     // MARK: - Edge Cases
@@ -269,5 +274,52 @@ struct NodeBuilderTests {
 
         #expect(result.children.count == 2)
         #expect(result.children.map { $0.text } == ["A", "B"])
+    }
+
+    // MARK: - Concurrency
+
+    /// `NodeBuilder` is `Sendable`, so this is a supported use rather than a
+    /// stress test: concurrent mutations must serialize on its mutex. A lost
+    /// update or a torn payload shows up as a short child list — or as a crash,
+    /// since the mutations rewrite `Node.payload` in place.
+    @Test func concurrentMutationsAllLand() async {
+        let builder = NodeBuilder(kind: .tuple)
+        let expectedChildCount = 500
+
+        await withTaskGroup(of: Void.self) { group in
+            for childIndex in 0 ..< expectedChildCount {
+                group.addTask {
+                    builder.addChild(Node.create(kind: .identifier, text: "child\(childIndex)"))
+                }
+            }
+        }
+
+        let children = builder.node.children
+        #expect(children.count == expectedChildCount)
+        #expect(Set(children.compactMap { $0.text }).count == expectedChildCount, "no child was overwritten")
+    }
+
+    /// Readers run concurrently with writers. Every snapshot must be internally
+    /// consistent — a partially applied mutation would surface as a child that
+    /// is nil or duplicated, and the detached snapshot must never alias the
+    /// instance the builder keeps mutating.
+    @Test func concurrentReadsSeeConsistentSnapshots() async {
+        let builder = NodeBuilder(kind: .tuple)
+
+        await withTaskGroup(of: Void.self) { group in
+            for childIndex in 0 ..< 200 {
+                group.addTask {
+                    builder.addChild(Node.create(kind: .identifier, text: "child\(childIndex)"))
+                }
+                group.addTask {
+                    let snapshot = builder.node
+                    // Reading every child of a snapshot taken mid-mutation must
+                    // not observe a half-written payload.
+                    #expect(snapshot.children.count == snapshot.children.map { $0 }.count)
+                }
+            }
+        }
+
+        #expect(builder.node.children.count == 200)
     }
 }

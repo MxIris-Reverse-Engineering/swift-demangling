@@ -86,7 +86,8 @@ struct NodeTests {
 
     @Test func copyCreatesDeepCopy() {
         let child = Node(kind: .identifier, contents: .text("Child"))
-        let original = Node(kind: .type, contents: .text("Parent"), children: [child])
+        // No contents on the parent — see `NodeBuilderTests.copy()`.
+        let original = Node(kind: .type, children: [child])
 
         let copy = original.copy()
 

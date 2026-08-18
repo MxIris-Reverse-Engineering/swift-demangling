@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Demangling
 
@@ -208,15 +209,59 @@ struct TypeDecoderTests {
     func existentialMetatypes(mangled: String, expected: String) throws {
         #expect(try Self.decodeType(mangled) == expected)
     }
+
+    // MARK: - Store-Backed Decoding Parity (proposal 0001, Phase 2)
+
+    @Test(arguments: [
+        "$sBbD",
+        "$sBf32_Bv4_D",
+        "$sSiD",
+        "$sSaySiGD",
+        "$sSDySSSiGD",
+        "$s17lowered_metatypes5ProtoPXmT",
+    ])
+    func storeBackedDecodingMatchesNodePath(mangled: String) throws {
+        let nodePathResult = try Self.decodeType(mangled)
+
+        var builder = NodeStoreBuilder()
+        let rootIndex = try builder.demangle(mangled)
+        let store = builder.freeze()
+
+        let decoder = TypeDecoder(builder: StringTypeBuilder())
+        let storePathResult = try decoder.decodeMangledType(node: store.reference(at: rootIndex))
+        #expect(storePathResult == nodePathResult, "Store-backed decoding should match the Node path for \(mangled)")
+    }
 }
 
 // MARK: - StringTypeBuilder
+
+/// Records which threads a `TypeBuilder`'s callbacks ran on, so tests can pin
+/// the decoder's contract that user code never leaves the calling thread.
+final class CallbackThreadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedThreads: Set<mach_port_t> = []
+
+    func record() {
+        lock.lock()
+        recordedThreads.insert(pthread_mach_thread_np(pthread_self()))
+        lock.unlock()
+    }
+
+    var observedThreads: Set<mach_port_t> {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedThreads
+    }
+}
 
 /// A `TypeBuilder` that produces a string representation of a type. Output
 /// format approximates the Swift AST type printer: nominal types use just the
 /// type name (module stripped), generics use `<>`, sugar types use `?`/`[]`,
 /// metatypes use `T.Type` with optional `@repr` prefix.
-private struct StringTypeBuilder: TypeBuilder {
+struct StringTypeBuilder: TypeBuilder {
+    /// When set, key creation callbacks note the thread they were invoked on.
+    var callbackThreadRecorder: CallbackThreadRecorder?
+
     typealias BuiltType = String
     typealias BuiltTypeDecl = String
     typealias BuiltProtocolDecl = String
@@ -239,6 +284,7 @@ private struct StringTypeBuilder: TypeBuilder {
     // MARK: Type Decls
 
     func createTypeDecl(node: Node, typeAlias: inout Bool) -> String? {
+        callbackThreadRecorder?.record()
         typeAlias = node.kind == .typeAlias || node.kind == .boundGenericTypeAlias
         return Self.extractName(from: node)
     }
@@ -264,11 +310,13 @@ private struct StringTypeBuilder: TypeBuilder {
     // MARK: Nominals
 
     func createNominalType(typeDecl: String, parent: String?) -> String {
+        callbackThreadRecorder?.record()
         if let parent { return "\(parent).\(typeDecl)" }
         return typeDecl
     }
 
     func createBoundGenericType(typeDecl: String, args: [String], parent: String?) -> String {
+        callbackThreadRecorder?.record()
         let head = parent.map { "\($0).\(typeDecl)" } ?? typeDecl
         return "\(head)<\(args.joined(separator: ", "))>"
     }

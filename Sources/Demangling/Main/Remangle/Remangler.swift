@@ -14,8 +14,22 @@ struct Remangler {
     /// Capacity of inline substitution array (avoids heap allocation for common case)
     private static let inlineSubstCapacity = 16
 
-    /// Maximum recursion depth to prevent stack overflow
-    private static let maxDepth = 1024
+    /// Maximum mangling recursion depth.
+    ///
+    /// Upstream's `Remangler::MaxDepth`. Restored after a brief lowering to
+    /// 384 on the `feature/node-store` branch: that value came from an
+    /// unoptimized-build measurement (an 8MB thread overflowed between depth
+    /// 565 and 605, at four depth units and ~six real frames per nesting
+    /// level) plus a corpus scan that put the deepest real symbol at 41
+    /// levels. The corpus figure did not hold up — downstream consumers hit
+    /// the sibling printer limit on ordinary SwiftUI-class modules — so all
+    /// three engine limits went back to upstream's rather than keep a
+    /// calibration whose premise was disproved.
+    ///
+    /// Reachable at all only because `hashForNode` ↔ `entryForNode` is
+    /// iterative; while that recursion sat outside `mangle(_:depth:)`'s
+    /// counter it overflowed first. Upstream has the identical hole.
+    static let maxDepth = 1024
 
     /// Maximum number of words to track (matches C++ MaxNumWords = 26)
     private static let maxNumWords = 26
@@ -34,8 +48,18 @@ struct Remangler {
     /// List of word replacements in the current identifier
     private var substWordsInIdent: [WordReplacement] = []
 
-    /// Output buffer for mangled string
-    private var buffer: String = ""
+    /// Output buffer for the mangled string, as UTF-8 **bytes**.
+    ///
+    /// Upstream's `Buffer` is a byte stream (`SmallString`), and every position
+    /// this file records into it — `words[].start`, `SubstitutionMerging`'s
+    /// `lastSubstPosition`/`lastSubstSize`, `bufferPosition` — is a byte
+    /// offset there. Holding it as a `String` made all of those
+    /// grapheme-cluster offsets instead, which agrees with bytes only while
+    /// the content is ASCII. Identifier length prefixes are the visible
+    /// consequence: proposal 0008 moved the *demangler* to counting bytes,
+    /// so a grapheme-counted prefix produced manglings this library could no
+    /// longer read back (PR #7 review, fourth round).
+    private var buffer: [UInt8] = []
 
     /// Hash table for caching node hashes (avoids expensive recursive computation)
     private var hashHash: [SubstitutionEntry?] = Array(repeating: nil, count: hashHashCapacity)
@@ -58,48 +82,54 @@ struct Remangler {
 
     /// Append a string to the output buffer
     private mutating func append(_ string: String) {
-        buffer.append(string)
+        buffer.append(contentsOf: string.utf8)
     }
 
     /// Append a character to the output buffer
     private mutating func append(_ char: Character) {
-        buffer.append(char)
+        for scalar in String(char).unicodeScalars {
+            UTF8.encode(scalar) { buffer.append($0) }
+        }
     }
 
     /// Append an integer to the output buffer
     private mutating func append(_ value: UInt64) {
-        buffer.append(String(value))
+        buffer.append(contentsOf: String(value).utf8)
     }
 
-    /// Reset the buffer to a previous position (index-based)
-    private mutating func resetBuffer(to position: String.Index) {
-        buffer = String(buffer[..<position])
-    }
-
-    /// Reset the buffer to a previous position (count-based)
+    /// Reset the buffer to a previous **byte** position
     private mutating func resetBuffer(to position: Int) {
-        let idx = buffer.index(buffer.startIndex, offsetBy: position)
-        buffer = String(buffer[..<idx])
+        buffer.removeLast(buffer.count - position)
     }
 
-    /// Get current buffer position
-    private var bufferPosition: String.Index {
-        return buffer.endIndex
+    /// Current buffer position, in bytes
+    private var bufferPosition: Int {
+        return buffer.count
     }
 
     /// Clear the buffer
     private mutating func clearBuffer() {
-        buffer = ""
+        buffer.removeAll(keepingCapacity: true)
+    }
+
+    /// The buffer decoded as text. UTF-8 validity is structural here: every
+    /// byte was appended from a `String`/`Character`/`UnicodeScalar`, and the
+    /// only positional edits (`resetBuffer`, the substitution merge) cut on
+    /// boundaries this file recorded from `buffer.count` after a whole append.
+    private var bufferText: String {
+        String(decoding: buffer, as: UTF8.self)
     }
 
     // MARK: - Hash Computation
 
-    /// Compute hash for a node, with caching to avoid expensive recursion
-    private mutating func hashForNode(_ node: Node, treatAsIdentifier: Bool = false) -> Int {
+    /// Hash contribution of a node's own kind and payload, before any child is
+    /// folded in.
+    private func seedHash(of node: Node, treatAsIdentifier: Bool) -> Int {
         var hash = 0
 
         if treatAsIdentifier {
-            // Treat as identifier regardless of actual kind
+            // Treat as identifier regardless of actual kind. This branch never
+            // descends into children, so it needs no explicit stack.
             hash = combineHash(hash, Node.Kind.identifier.hashValue)
 
             if let text = node.text {
@@ -114,31 +144,103 @@ struct Remangler {
                     }
                 }
             }
-        } else {
-            // Use actual node kind
-            hash = combineHash(hash, node.kind.hashValue)
-
-            // Combine index or text
-            if let index = node.index {
-                hash = combineHash(hash, Int(index))
-            } else if let text = node.text {
-                for char in text {
-                    hash = combineHash(hash, char.hashValue)
-                }
-            }
-
-            // Recursively hash children
-            for child in node.children {
-                let childEntry = entryForNode(child, treatAsIdentifier: treatAsIdentifier)
-                hash = combineHash(hash, childEntry.storedHash)
-            }
+            return hash
         }
 
+        // Use actual node kind
+        hash = combineHash(hash, node.kind.hashValue)
+
+        // Combine index or text
+        if let index = node.index {
+            // Hash combine only: truncation keeps equal payloads hashing
+            // equally on every word size, where Int(_:) would trap on a
+            // caller-assembled node whose index exceeds the platform Int.max.
+            hash = combineHash(hash, Int(truncatingIfNeeded: index))
+        } else if let text = node.text {
+            for char in text {
+                hash = combineHash(hash, char.hashValue)
+            }
+        }
         return hash
+    }
+
+    /// One suspended level of ``hashForNode(_:treatAsIdentifier:)``'s walk.
+    private struct HashFrame {
+        let node: Node
+        var nextChildIndex: Int
+        var accumulatedHash: Int
+    }
+
+    /// Compute the substitution hash for a node.
+    ///
+    /// Walks the subtree with an explicit stack rather than by recursion. The
+    /// C++ original (`RemanglerBase::hashForNode`, `Remangler.cpp:80`) recurses
+    /// mutually with `entryForNode` and relies on the caller having arranged a
+    /// large stack; here the walk is a whole-subtree traversal that does not
+    /// pass through ``mangle(_:depth:)``, so it would sit entirely outside that
+    /// method's stack guard and overflow before the guard ever ran. Folding it
+    /// iteratively removes the exposure instead of trying to probe it.
+    ///
+    /// Children that already have a cache entry are folded in without being
+    /// walked again, and each completed subtree is written back into the cache,
+    /// so the amortized cost matches the recursive version.
+    private mutating func hashForNode(_ node: Node, treatAsIdentifier: Bool = false) -> Int {
+        // The identifier treatment ignores children entirely.
+        if treatAsIdentifier {
+            return seedHash(of: node, treatAsIdentifier: true)
+        }
+
+        var frames: [HashFrame] = [
+            HashFrame(node: node, nextChildIndex: 0, accumulatedHash: seedHash(of: node, treatAsIdentifier: false)),
+        ]
+        var pendingChildHash: Int?
+
+        while var frame = frames.popLast() {
+            if let childHash = pendingChildHash {
+                frame.accumulatedHash = combineHash(frame.accumulatedHash, childHash)
+                pendingChildHash = nil
+            }
+
+            if frame.nextChildIndex < frame.node.children.count {
+                let child = frame.node.children[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                frames.append(frame)
+
+                let slot = cacheSlot(for: child, treatAsIdentifier: false)
+                if let cachedEntry = slot.cachedEntry {
+                    pendingChildHash = cachedEntry.storedHash
+                } else {
+                    frames.append(
+                        HashFrame(node: child, nextChildIndex: 0, accumulatedHash: seedHash(of: child, treatAsIdentifier: false))
+                    )
+                }
+                continue
+            }
+
+            // This subtree is complete.
+            if frames.isEmpty {
+                return frame.accumulatedHash
+            }
+            // Mirror `entryForNode`'s caching for every node reached through a
+            // parent, so repeated back-references stay O(1).
+            let slot = cacheSlot(for: frame.node, treatAsIdentifier: false)
+            if let freeSlotIndex = slot.freeSlotIndex {
+                hashHash[freeSlotIndex] = SubstitutionEntry(
+                    node: frame.node,
+                    storedHash: frame.accumulatedHash,
+                    treatAsIdentifier: false
+                )
+            }
+            pendingChildHash = frame.accumulatedHash
+        }
+
+        // Unreachable: the loop returns as soon as the root frame completes.
+        return seedHash(of: node, treatAsIdentifier: false)
     }
 
     /// Combine two hash values
     private func combineHash(_ currentHash: Int, _ newValue: Int) -> Int {
+        // wrapping-audited: hash mixing — wrap-around is the point, and the result only ever feeds a masked table index.
         return 33 &* currentHash &+ newValue
     }
 
@@ -169,38 +271,50 @@ struct Remangler {
     // MARK: - Substitution Entry Creation
 
     /// Create a SubstitutionEntry for a node, using the hash cache
-    private mutating func entryForNode(_ node: Node, treatAsIdentifier: Bool = false) -> SubstitutionEntry {
-        // Compute hash of node pointer + treatment flag for cache lookup
+    /// Result of probing the pointer-keyed hash cache for one node: either the
+    /// entry that is already stored, or the first free slot it may be written
+    /// to. Both are `nil` when every probed slot is taken by another node, in
+    /// which case the hash is computed without being cached.
+    private func cacheSlot(for node: Node, treatAsIdentifier: Bool) -> (cachedEntry: SubstitutionEntry?, freeSlotIndex: Int?) {
         let ident = treatAsIdentifier ? 4 : 0
+        // wrapping-audited: hash mixing; the sum is masked into a slot below, so a wrap is a different slot, never a bad one.
         let nodeHash = nodePointerHash(node) &+ ident
 
         // Linear probing with limited attempts
         for probe in 0 ..< Self.hashHashMaxProbes {
+            // wrapping-audited: open-addressing probe — the mask below makes any wrap land in range.
             let index = (nodeHash &+ probe) & (Self.hashHashCapacity - 1)
 
             if let cachedEntry = hashHash[index] {
                 if cachedEntry.matches(node: node, treatAsIdentifier: treatAsIdentifier) {
-                    // Cache hit
-                    return cachedEntry
+                    return (cachedEntry, nil)
                 }
             } else {
-                // Cache miss - compute hash and store
-                let hash = hashForNode(node, treatAsIdentifier: treatAsIdentifier)
-                let entry = SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
-                hashHash[index] = entry
-                return entry
+                return (nil, index)
             }
         }
+        return (nil, nil)
+    }
 
-        // Hash table full at this location - compute without caching
+    private mutating func entryForNode(_ node: Node, treatAsIdentifier: Bool = false) -> SubstitutionEntry {
+        let slot = cacheSlot(for: node, treatAsIdentifier: treatAsIdentifier)
+        if let cachedEntry = slot.cachedEntry {
+            return cachedEntry
+        }
+
         let hash = hashForNode(node, treatAsIdentifier: treatAsIdentifier)
-        return SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
+        let entry = SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
+        if let freeSlotIndex = slot.freeSlotIndex {
+            hashHash[freeSlotIndex] = entry
+        }
+        return entry
     }
 
     /// Compute a hash from a node pointer (for cache indexing)
     private func nodePointerHash(_ node: Node) -> Int {
         // Use ObjectIdentifier for pointer-like hashing
         let objectId = ObjectIdentifier(node)
+        // wrapping-audited: hash mixing over a full-width value; every bit pattern is an acceptable output.
         let prime = objectId.hashValue &* 2043
 
         // Rotate for better distribution (simulate pointer alignment patterns)
@@ -287,6 +401,7 @@ struct Remangler {
         if value == 0 {
             append("_")
         } else {
+            // wrapping-audited: unreachable at 0 — the `value == 0` arm above returns, so this branch has `value >= 1`.
             append(value &- 1)
             append("_")
         }
@@ -343,20 +458,42 @@ struct Remangler {
     // MARK: - Public API
 
     /// Remangle a node tree into a mangled string
+    ///
+    /// Every piece of walk state is reset, not just the buffer. `words`
+    /// stores offsets *into* the buffer, so clearing one but not the other
+    /// made the second use of a remangler index into an empty string and
+    /// trap; the substitution tables would have emitted back-references into
+    /// the previous tree's output.
     mutating func mangle(_ node: Node) throws(ManglingError) -> String {
         clearBuffer()
+        words.removeAll(keepingCapacity: true)
+        substWordsInIdent.removeAll(keepingCapacity: true)
+        hashHash = Array(repeating: nil, count: Self.hashHashCapacity)
+        inlineSubstitutions.removeAll(keepingCapacity: true)
+        overflowSubstitutions.removeAll(keepingCapacity: true)
+        substMerging = .init()
         try mangle(node, depth: 0)
-        return buffer
+        return bufferText
     }
 
     // MARK: - Core Mangling
 
-    /// Main entry point for mangling a single node
-    private mutating func mangle(_ node: Node, depth: Int) throws(ManglingError) {
-        // Check recursion depth
+    /// Bails with ``ManglingError/tooComplex(_:)`` once the walk exceeds
+    /// ``maxDepth`` frames.
+    ///
+    /// Called from every recursion in this engine that is reachable without
+    /// passing back through ``mangle(_:depth:)`` — a call-graph audit found six
+    /// such cycles, which is why the C++ original's single check on `mangle`
+    /// was never enough.
+    private func checkDepthLimit(_ node: Node, depth: Int) throws(ManglingError) {
         if depth > Self.maxDepth {
             throw .tooComplex(node)
         }
+    }
+
+    /// Main entry point for mangling a single node
+    private mutating func mangle(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
 
         // Dispatch to specific handler based on node kind
         switch node.kind {
@@ -1408,6 +1545,7 @@ extension Remangler {
 
     /// Mangle generic arguments from a context chain
     private mutating func mangleGenericArgs(_ node: Node, separator: inout Character, depth: Int, fullSubstitutionMap: Bool = false) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         var fullSubst = fullSubstitutionMap
 
         switch node.kind {
@@ -1577,7 +1715,9 @@ extension Remangler {
 
     private mutating func mangleBoundGenericEnum(_ node: Node, depth: Int) throws(ManglingError) {
         let enumNode = try node[_child: 0][_child: 0]
-        assert(enumNode.kind == .enum)
+        // Not asserted: the `Swift.Optional` test below already falls through
+        // to the non-sugar path for any other shape, so a debug-only trap here
+        // rejected trees the release path mangles fine.
         let moduleNode = try enumNode[_child: 0]
         let identNode = try enumNode[_child: 1]
         if moduleNode.kind == .module, moduleNode.text == "Swift",
@@ -2332,9 +2472,7 @@ extension Remangler {
 
     /// Mangle any nominal type (generic or not)
     private mutating func mangleAnyNominalType(_ node: Node, depth: Int) throws(ManglingError) {
-        if depth > Self.maxDepth {
-            throw .tooComplex(node)
-        }
+        try checkDepthLimit(node, depth: depth)
 
         // Check if this is a specialized type
         if isSpecialized(node) {
@@ -2537,6 +2675,7 @@ extension Remangler {
     }
 
     private mutating func mangleConcreteProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleType(node[_child: 0], depth: depth + 1)
         try mangle(node[_child: 1], depth: depth + 1)
         if node.numberOfChildren > 2 {
@@ -2553,6 +2692,7 @@ extension Remangler {
     }
 
     private mutating func mangleAnyProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         // Dispatch to specific conformance handler
         switch node.kind {
         case .concreteProtocolConformance:
@@ -2583,10 +2723,18 @@ extension Remangler {
         try mangleChildNodes(proto, depth: depth + 1)
     }
 
-    private func getChildOfType(_ node: Node) -> Node {
-        assert(node.kind == .type)
-        assert(node.children.count == 1)
-        return node.children[0]
+    /// The child of a `.type` wrapper.
+    ///
+    /// The shape used to be asserted and then read unconditionally. Asserts are
+    /// compiled out of release builds, so a caller-supplied childless `.type`
+    /// took the `children[0]` subscript instead and trapped — an unrecoverable
+    /// process abort reached from the public `mangleAsString` and, worse, from
+    /// `canMangle`, whose whole contract is to answer that question without
+    /// failing. `try?` cannot catch a trap in either configuration. The
+    /// throwing subscript is this file's standard shape for reading a
+    /// caller-supplied tree (PR #7 review, finding 1).
+    private func getChildOfType(_ node: Node) throws(ManglingError) -> Node {
+        try node[_child: 0]
     }
 
     // MARK: - Metadata Descriptors
@@ -2857,6 +3005,7 @@ extension Remangler {
     }
 
     private mutating func manglePackProtocolConformance(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformanceList(node[_child: 0], depth: depth + 1)
         append("HX")
     }
@@ -2974,9 +3123,19 @@ extension Remangler {
     }
 
     private mutating func mangleDependentGenericParamValueMarker(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.numberOfChildren == 2)
-        assert(node.children[0].children[0].kind == .dependentGenericParamType)
-        assert(node.children[1].kind == .type)
+        // These were `assert`s, which is the wrong instrument for validating
+        // an *input* tree: they trap in debug and vanish in release, where
+        // the subscripts below then read out of bounds. `mangleAsString` is
+        // public and its contract is to reject a malformed tree through
+        // `ManglingError`, and public node construction can hand it either
+        // shape. Internal invariants of the remangler's own buffer state
+        // keep their asserts — this one describes the caller's data.
+        guard node.numberOfChildren == 2,
+              let firstChild = node.children.first,
+              firstChild.children.first?.kind == .dependentGenericParamType,
+              node.children.at(1)?.kind == .type else {
+            throw .invalidNodeStructure(node, message: "DependentGenericParamValueMarker needs a generic param type and a type")
+        }
         try mangleType(node[_child: 1], depth: depth + 1)
         append("RV")
         try mangleDependentGenericParamIndex(node[_child: 0][_child: 0])
@@ -3261,9 +3420,20 @@ extension Remangler {
     }
 
     private mutating func mangleImplDifferentiabilityKind(_ node: Node, depth: Int) throws(ManglingError) {
-        if let index = node.index, let scalar = UnicodeScalar(UInt32(index)) {
-            append(Character(scalar))
+        // `UInt32(index)` trapped for an index above UInt32.max. Mangling is
+        // a typed-throws API whose contract is to reject malformed trees, so
+        // an out-of-range index has to reach that channel, not abort.
+        //
+        // It also must not be dropped: without the `else` this emitted the
+        // node's other bytes and silently omitted the marker, so `canMangle`
+        // answered `true` for a mangling that is missing a payload byte.
+        // `UnicodeScalar(_: UInt32)` is failable, so surrogates and
+        // out-of-plane values take this path too — not just >UInt32.max.
+        guard let index = node.index, let narrowedIndex = UInt32(exactly: index),
+              let scalar = UnicodeScalar(narrowedIndex) else {
+            throw .invalidNodeStructure(node, message: "ImplDifferentiabilityKind index does not name a Unicode scalar")
         }
+        append(Character(scalar))
     }
 
     private mutating func mangleImplCoroutineKind(_ node: Node, depth: Int) throws(ManglingError) {
@@ -3271,7 +3441,10 @@ extension Remangler {
     }
 
     private mutating func mangleImplParameterIsolated(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.text != nil)
+        // No `assert(node.text != nil)`: the switch below already routes a
+        // missing or unrecognized text through `invalidImplParameterAttr`,
+        // which is the channel `mangleAsString` promises. The assert only
+        // added a debug-build trap on a tree public API can construct.
         let diffChar: String? = switch node.text {
         case "isolated": "I"
         default: nil
@@ -3284,7 +3457,10 @@ extension Remangler {
     }
 
     private mutating func mangleImplParameterSending(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.text != nil)
+        // No `assert(node.text != nil)`: the switch below already routes a
+        // missing or unrecognized text through `invalidImplParameterAttr`,
+        // which is the channel `mangleAsString` promises. The assert only
+        // added a debug-build trap on a tree public API can construct.
         let diffChar: String? = switch node.text {
         case "sending": "T"
         default: nil
@@ -3297,7 +3473,10 @@ extension Remangler {
     }
 
     private mutating func mangleImplParameterImplicitLeading(_ node: Node, depth: Int) throws(ManglingError) {
-        assert(node.text != nil)
+        // No `assert(node.text != nil)`: the switch below already routes a
+        // missing or unrecognized text through `invalidImplParameterAttr`,
+        // which is the channel `mangleAsString` promises. The assert only
+        // added a debug-build trap on a tree public API can construct.
         let diffChar: String? = switch node.text {
         case "sil_implicit_leading_param": "L"
         default: nil
@@ -3967,25 +4146,41 @@ extension Remangler {
     // MARK: - Node Index Methods (8 methods)
 
     private mutating func mangleAutoDiffFunctionKind(_ node: Node, depth: Int) throws(ManglingError) {
-        guard let index = node.index, let scalar = UnicodeScalar(UInt32(index)) else {
+        guard let index = node.index, let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) else {
             throw .invalidNodeStructure(node, message: "AutoDiffFunctionKind has no index")
         }
         append(Character(scalar))
     }
 
     private mutating func mangleDependentConformanceIndex(_ node: Node, depth: Int) throws(ManglingError) {
-        let indexValue = node.index != nil ? node.index! + 2 : 1
+        // Upstream's `+ 2` is unguarded because its index came from the
+        // demangler; here the payload is caller-reachable up to `UInt64.max`,
+        // and an overflow trap is not catchable by `try?` — so it has to reach
+        // the typed-throws channel like every other malformed shape.
+        let indexValue: UInt64
+        if let index = node.index {
+            let (shifted, overflowed) = index.addingReportingOverflow(2)
+            guard !overflowed else {
+                throw .invalidNodeStructure(node, message: "DependentConformanceIndex is out of range")
+            }
+            indexValue = shifted
+        } else {
+            indexValue = 1
+        }
         mangleIndex(indexValue)
     }
 
     private mutating func mangleDifferentiableFunctionType(_ node: Node, depth: Int) throws(ManglingError) {
+        // See `mangleImplDifferentiabilityKind` for why the narrowing must
+        // throw rather than silently omit the marker byte.
         guard let index = node.index else {
             throw .invalidNodeStructure(node, message: "DifferentiableFunctionType has no index")
         }
-        append("Yj")
-        if let scalar = UnicodeScalar(UInt32(index)) {
-            append(Character(scalar))
+        guard let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) else {
+            throw .invalidNodeStructure(node, message: "DifferentiableFunctionType index does not name a Unicode scalar")
         }
+        append("Yj")
+        append(Character(scalar))
     }
 
     private mutating func mangleDirectness(_ node: Node, depth: Int) throws(ManglingError) {
@@ -4092,6 +4287,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceOpaque(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try mangleType(node[_child: 1], depth: depth + 1)
@@ -4186,11 +4382,24 @@ extension Remangler {
             throw .invalidNodeStructure(node, message: "DependentGenericInverseConformanceRequirement needs 2 children")
         }
 
+        // Upstream reads `getChild(1)->getIndex()` on every path, so a child 1
+        // without an index is a malformed tree. The two-child guard above does
+        // not imply an index payload, and `!` here aborted the process through
+        // `canMangle` — whose contract is to answer *without* failing, and
+        // which `try?` cannot defend because a trap is not an error.
+        guard let requirementIndex = try node[_child: 1].index else {
+            throw .invalidNodeStructure(node, message: "DependentGenericInverseConformanceRequirement child 1 has no index")
+        }
+
         let mangling = try mangleConstrainedType(node[_child: 0], depth: depth + 1)
         switch mangling.numMembers {
         case -1:
             append("RI")
-            try mangleIndex(node[_child: 1].index!)
+            mangleIndex(requirementIndex)
+            // Upstream ends the substitution branch here (`return ...;
+            // // substitution`). Falling through emitted the index a second
+            // time below, mangling `3ModRI2_` as `3ModRI2_2_`.
+            return
         case 0:
             append("Ri")
         case 1:
@@ -4198,9 +4407,7 @@ extension Remangler {
         default:
             append("RJ")
         }
-        if let index = try node[_child: 1].index {
-            mangleIndex(index)
-        }
+        mangleIndex(requirementIndex)
         if let paramIdx = mangling.paramIdx {
             try mangleDependentGenericParamIndex(paramIdx)
         }
@@ -4482,6 +4689,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceRoot(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleType(node[_child: 0], depth: depth + 1)
 
         try manglePureProtocol(node[_child: 1], depth: depth + 1)
@@ -4491,6 +4699,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceInherited(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try manglePureProtocol(node[_child: 1], depth: depth + 1)
@@ -4500,6 +4709,7 @@ extension Remangler {
     }
 
     private mutating func mangleDependentProtocolConformanceAssociated(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         try mangleAnyProtocolConformance(node[_child: 0], depth: depth + 1)
 
         try mangleDependentAssociatedConformance(node[_child: 1], depth: depth + 1)
@@ -5022,6 +5232,7 @@ extension Remangler {
     }
 
     private mutating func mangleAnyProtocolConformanceList(_ node: Node, depth: Int) throws(ManglingError) {
+        try checkDepthLimit(node, depth: depth)
         var firstElem = true
         for child in node.children {
             try mangleAnyProtocolConformance(child, depth: depth + 1)
@@ -5062,7 +5273,7 @@ extension Remangler {
         var node = node
         var resultNode: Node? = node
         if node.kind == .type {
-            node = getChildOfType(node)
+            node = try getChildOfType(node)
             resultNode = node
         }
 
@@ -5231,6 +5442,43 @@ extension Remangler {
         return false
     }
 
+    // MARK: - Byte-level word predicates
+
+    // Upstream runs the word-substitution scan over `char`, so a multi-byte
+    // scalar is several separate characters to it and none of them is a digit,
+    // `_`, NUL or an upper letter. These reproduce that on `UInt8`: a byte
+    // >= 0x80 fails every range test here exactly as a negative `char` does
+    // upstream. `mangleIdentifier` must use these rather than the `Character`
+    // forms above, because its positions index the UTF-8 buffer.
+
+    @inline(__always)
+    private static func isDigit(_ byte: UInt8) -> Bool {
+        return byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9")
+    }
+
+    @inline(__always)
+    private static func isUpperLetter(_ byte: UInt8) -> Bool {
+        return byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z")
+    }
+
+    @inline(__always)
+    private static func isWordStart(_ byte: UInt8) -> Bool {
+        return !isDigit(byte) && byte != UInt8(ascii: "_") && byte != 0
+    }
+
+    @inline(__always)
+    private static func isWordEnd(_ byte: UInt8, _ previousByte: UInt8) -> Bool {
+        if byte == UInt8(ascii: "_") || byte == 0 {
+            return true
+        }
+
+        if !isUpperLetter(previousByte) && isUpperLetter(byte) {
+            return true
+        }
+
+        return false
+    }
+
     /// Returns true if the character is a valid character which may appear at the start of a symbol mangling
     @inline(__always)
     private static func isValidSymbolStart(_ ch: Character) -> Bool {
@@ -5311,12 +5559,18 @@ extension Remangler {
 
     // MARK: - Word Substitution
 
-    /// Describes a word in a mangled identifier
+    /// Describes a word in a mangled identifier.
+    ///
+    /// Both fields are **UTF-8 byte** quantities, and `start` is an offset into
+    /// whichever byte sequence the word currently lives in: the identifier
+    /// being scanned, then `buffer` once the word has been emitted (see the
+    /// `word.start = buffer.count` handoff in ``mangleIdentifier(_:)``). They
+    /// must stay in the same unit as `buffer`, which is why that is `[UInt8]`.
     private struct SubstitutionWord {
-        /// The position of the first word character in the mangled string
+        /// Byte offset of the first character of the word
         var start: Int
 
-        /// The length of the word
+        /// The length of the word, in bytes
         var length: Int
 
         init(start: Int, length: Int) {
@@ -5327,7 +5581,7 @@ extension Remangler {
 
     /// Helper struct which represents a word replacement
     private struct WordReplacement {
-        /// The position in the identifier where the word is substituted
+        /// The **byte** position in the identifier where the word is substituted
         var stringPos: Int
 
         /// The index into the mangler's Words array (-1 if invalid)
@@ -5478,15 +5732,16 @@ extension Remangler {
         /// substitution separately in the form 'S<Subst>' or 'A<Subst>'.
         ///
         /// - Parameters:
-        ///   - buffer: Current buffer content
+        ///   - buffer: Current buffer content, as UTF-8 bytes. Every position
+        ///     this type records (`lastSubstPosition`, `lastSubstSize`) is a
+        ///     byte offset, matching upstream's `SmallString` buffer.
+        ///     Substitutions are themselves ASCII, so slicing on these offsets
+        ///     always lands on a scalar boundary.
         ///   - subst: The substitution to merge
         ///   - isStandardSubst: True if this is an 'S' substitution, false for 'A'
-        ///   - resetBuffer: Callback to reset buffer to a position
-        ///   - appendToBuffer: Callback to append string to buffer
-        ///   - getBuffer: Callback to get current buffer content
         /// - Returns: True if merge was successful
         mutating func tryMergeSubst(
-            buffer: inout String,
+            buffer: inout [UInt8],
             subst: String,
             isStandardSubst: Bool
         ) -> Bool {
@@ -5501,13 +5756,14 @@ extension Remangler {
                 assert(lastSubstPosition > 0 && lastSubstPosition < bufferCount)
                 assert(lastSubstSize > 0)
 
-                let lastSubstStart = buffer.index(buffer.endIndex, offsetBy: -lastSubstSize)
-                var lastSubst = String(buffer[lastSubstStart...])
+                var lastSubstBytes = ArraySlice(buffer.suffix(lastSubstSize))
 
                 // Drop leading digits
-                while let first = lastSubst.first, Remangler.isDigit(first) {
-                    lastSubst = String(lastSubst.dropFirst())
+                while let first = lastSubstBytes.first,
+                      first >= UInt8(ascii: "0"), first <= UInt8(ascii: "9") {
+                    lastSubstBytes = lastSubstBytes.dropFirst()
                 }
+                let lastSubst = String(decoding: lastSubstBytes, as: UTF8.self)
 
                 assert(Remangler.isUpperLetter(lastSubst.last!) || (isStandardSubst && Remangler.isLowerLetter(lastSubst.last!)))
 
@@ -5516,14 +5772,13 @@ extension Remangler {
                     // e.g. 'AB' -> 'AbC'
                     lastSubstPosition = bufferCount
                     lastNumSubsts = 1
-                    let resetPos = bufferCount - 1
-                    let resetIndex = buffer.index(buffer.startIndex, offsetBy: resetPos)
-                    buffer = String(buffer[..<resetIndex])
+                    buffer.removeLast(1)
                     assert(Remangler.isUpperLetter(lastSubst.last!))
 
                     let lastChar = lastSubst.last!
-                    let lowercaseChar = Character(UnicodeScalar(lastChar.asciiValue! - Character("A").asciiValue! + Character("a").asciiValue!))
-                    buffer.append(String(lowercaseChar) + subst)
+                    let lowercaseByte = lastChar.asciiValue! - UInt8(ascii: "A") + UInt8(ascii: "a")
+                    buffer.append(lowercaseByte)
+                    buffer.append(contentsOf: subst.utf8)
                     lastSubstSize = 1
                     return true
                 }
@@ -5532,9 +5787,8 @@ extension Remangler {
                     // We can merge with the same 'A' or 'S' substitution
                     // e.g. 'AB' -> 'A2B', or 'S3i' -> 'S4i'
                     lastNumSubsts += 1
-                    let resetIndex = buffer.index(buffer.startIndex, offsetBy: lastSubstPosition)
-                    buffer = String(buffer[..<resetIndex])
-                    buffer.append("\(lastNumSubsts)\(subst)")
+                    buffer.removeLast(bufferCount - lastSubstPosition)
+                    buffer.append(contentsOf: "\(lastNumSubsts)\(subst)".utf8)
 
                     // Get updated buffer to calculate the new size
                     lastSubstSize = buffer.count - lastSubstPosition
@@ -5545,7 +5799,7 @@ extension Remangler {
             // We can't merge with the previous substitution, but let's remember this
             // substitution which will be mangled by the caller
             lastSubstPosition = bufferCount + 1
-            lastSubstSize = subst.count
+            lastSubstSize = subst.utf8.count
             lastNumSubsts = 1
             lastSubstIsStandardSubst = isStandardSubst
             return false
@@ -5561,6 +5815,14 @@ extension Remangler {
     ///
     /// - Parameters:
     ///   - ident: The identifier to mangle
+    /// - Note: every position in here — `pos`, `wordStartPos`,
+    ///   `SubstitutionWord.start`/`.length`, `WordReplacement.stringPos` and
+    ///   the emitted length prefixes — is a **UTF-8 byte** offset, matching
+    ///   upstream's `StringRef` and the byte-based reader on the demangling
+    ///   side (proposal 0008). Counting grapheme clusters here made the length
+    ///   prefix disagree with the reader for any non-ASCII identifier, so
+    ///   `mangleAsString(_:usePunycode: false)` emitted manglings this library
+    ///   could not read back (PR #7 review, fourth round).
     private mutating func mangleIdentifier(_ ident: String) {
         let wordsInBuffer = words.count
         assert(substWordsInIdent.isEmpty)
@@ -5569,8 +5831,8 @@ extension Remangler {
         if usePunycode, Self.needsPunycodeEncoding(ident) {
             if let encoded = Punycode.encodePunycode(ident, mapNonSymbolChars: true) {
                 let pcIdent = encoded
-                append("00\(pcIdent.count)")
-                if let first = pcIdent.first, Self.isDigit(first) || first == "_" {
+                append("00\(pcIdent.utf8.count)")
+                if let first = pcIdent.utf8.first, Self.isDigit(first) || first == UInt8(ascii: "_") {
                     append("_")
                 }
                 append(pcIdent)
@@ -5578,29 +5840,27 @@ extension Remangler {
             }
         }
 
+        let identBytes = Array(ident.utf8)
+
         // Search for word substitutions and new words
         let notInsideWord = -1
         var wordStartPos = notInsideWord
 
-        for pos in 0 ... ident.count {
-            let ch: Character = pos < ident.count ? ident[ident.index(ident.startIndex, offsetBy: pos)] : "\0"
+        for pos in 0 ... identBytes.count {
+            let byte: UInt8 = pos < identBytes.count ? identBytes[pos] : 0
 
-            if wordStartPos != notInsideWord, Self.isWordEnd(ch, pos > 0 ? ident[ident.index(ident.startIndex, offsetBy: pos - 1)] : "\0") {
+            if wordStartPos != notInsideWord, Self.isWordEnd(byte, pos > 0 ? identBytes[pos - 1] : 0) {
                 // End of a word
                 assert(pos > wordStartPos)
                 let wordLen = pos - wordStartPos
-                let wordStart = ident.index(ident.startIndex, offsetBy: wordStartPos)
-                let wordEnd = ident.index(wordStart, offsetBy: wordLen)
-                let word = String(ident[wordStart ..< wordEnd])
+                let word = identBytes[wordStartPos ..< pos]
 
                 // Look up word in buffer and existing words
-                func lookupWord(in str: String, from: Int, to: Int) -> Int? {
+                func lookupWord(in bytes: [UInt8], from: Int, to: Int) -> Int? {
                     for idx in from ..< to {
                         let w = words[idx]
-                        let existingWordStart = str.index(str.startIndex, offsetBy: w.start)
-                        let existingWordEnd = str.index(existingWordStart, offsetBy: w.length)
-                        let existingWord = String(str[existingWordStart ..< existingWordEnd])
-                        if word == existingWord {
+                        let existingWord = bytes[w.start ..< (w.start + w.length)]
+                        if word.elementsEqual(existingWord) {
                             return idx
                         }
                     }
@@ -5612,7 +5872,7 @@ extension Remangler {
 
                 // Check if word exists in this identifier
                 if wordIdx == nil {
-                    wordIdx = lookupWord(in: ident, from: wordsInBuffer, to: words.count)
+                    wordIdx = lookupWord(in: identBytes, from: wordsInBuffer, to: words.count)
                 }
 
                 if let idx = wordIdx {
@@ -5627,7 +5887,7 @@ extension Remangler {
                 wordStartPos = notInsideWord
             }
 
-            if wordStartPos == notInsideWord, Self.isWordStart(ch) {
+            if wordStartPos == notInsideWord, Self.isWordStart(byte) {
                 // Begin of a word
                 wordStartPos = pos
             }
@@ -5642,7 +5902,7 @@ extension Remangler {
         var wordsInBufferMutable = wordsInBuffer
 
         // Add dummy word at end
-        addSubstWordInIdent(WordReplacement(stringPos: ident.count, wordIdx: -1))
+        addSubstWordInIdent(WordReplacement(stringPos: identBytes.count, wordIdx: -1))
 
         for idx in 0 ..< substWordsInIdent.count {
             let repl = substWordsInIdent[idx]
@@ -5662,13 +5922,13 @@ extension Remangler {
                         wordsInBufferMutable += 1
                     }
 
-                    let ch = ident[ident.index(ident.startIndex, offsetBy: pos)]
+                    let byte = identBytes[pos]
 
                     // Error recovery for invalid identifiers
-                    if first, Self.isDigit(ch) {
+                    if first, Self.isDigit(byte) {
                         append("X")
                     } else {
-                        append(String(ch))
+                        buffer.append(byte)
                     }
 
                     pos += 1
@@ -5683,13 +5943,11 @@ extension Remangler {
 
                 if idx < substWordsInIdent.count - 2 {
                     // Lowercase letter
-                    let ch = Character(UnicodeScalar(UInt8(ascii: "a") + UInt8(repl.wordIdx)))
-                    append(String(ch))
+                    buffer.append(UInt8(ascii: "a") + UInt8(repl.wordIdx))
                 } else {
                     // Last word substitution is uppercase
-                    let ch = Character(UnicodeScalar(UInt8(ascii: "A") + UInt8(repl.wordIdx)))
-                    append(String(ch))
-                    if pos == ident.count {
+                    buffer.append(UInt8(ascii: "A") + UInt8(repl.wordIdx))
+                    if pos == identBytes.count {
                         append("0")
                     }
                 }
@@ -5803,20 +6061,75 @@ extension Remangler {
         }
 
         /// Perform deep equality comparison of two nodes.
+        /// Structural equality over two subtrees.
+        ///
+        /// Walked with an explicit work list rather than by recursion: like
+        /// ``Remangler/hashForNode(_:treatAsIdentifier:)`` this is a
+        /// whole-subtree traversal reached from the substitution machinery, not
+        /// from `mangle(_:depth:)`, so recursion here would sit outside every
+        /// stack guard the remangler has. Visit order differs from the
+        /// recursive version; the result does not, because every pair must
+        /// match for the answer to be `true`.
+        ///
+        /// Long walks additionally memoize visited pairs, exactly like
+        /// `Node.==`: comparing two separately built copies of a shared DAG
+        /// costs their node counts rather than their path counts. Without the
+        /// memo this was the one pairwise walk of four that re-descended once
+        /// per path, and a signature holding two instance-distinct copies of a
+        /// shared bound-generic subtree made mangling exponential in the
+        /// sharing depth. The memo is created lazily because the overwhelmingly
+        /// common comparisons — substitution probes against demangler-shaped
+        /// trees — finish long before the threshold and must not allocate.
         private static func deepEquals(_ lhs: Node, _ rhs: Node) -> Bool {
-            // Nodes must be similar (same kind, same text/index)
-            guard lhs.isSimilar(to: rhs) else {
-                return false
-            }
+            // `SubstitutionEntry.==` calls this on every hash match, so the
+            // shallow cases must not allocate.
+            if lhs === rhs { return true }
+            guard lhs.isSimilar(to: rhs) else { return false }
+            let rootLeftChildren = lhs.children
+            let rootRightChildren = rhs.children
+            guard rootLeftChildren.count == rootRightChildren.count else { return false }
+            if rootLeftChildren.isEmpty { return true }
 
-            // Check all children recursively
-            guard lhs.children.count == rhs.children.count else {
-                return false
+            struct VisitedPair: Hashable {
+                let leftIdentity: ObjectIdentifier
+                let rightIdentity: ObjectIdentifier
             }
+            /// Walk length at which the pair memo switches on: real
+            /// substitution probes finish long before this, while a
+            /// path-exploding DAG blows past it immediately.
+            let visitedPairTrackingThreshold = 256
+            var visitedPairs: Set<VisitedPair>?
+            var processedPairCount = 0
 
-            for (lhsChild, rhsChild) in zip(lhs.children, rhs.children) {
-                if !deepEquals(lhsChild, rhsChild) {
+            var pendingPairs: [(left: Node, right: Node)] = Array(zip(rootLeftChildren, rootRightChildren).map { ($0, $1) })
+
+            while let pair = pendingPairs.popLast() {
+                if pair.left === pair.right { continue }
+
+                processedPairCount += 1
+                if processedPairCount > visitedPairTrackingThreshold, visitedPairs == nil {
+                    visitedPairs = []
+                }
+                if visitedPairs != nil {
+                    let visitedPair = VisitedPair(
+                        leftIdentity: ObjectIdentifier(pair.left),
+                        rightIdentity: ObjectIdentifier(pair.right)
+                    )
+                    // A repeated pair repeats the identical subtree comparison,
+                    // and any mismatch below it already aborted the whole walk
+                    // the first time.
+                    guard visitedPairs!.insert(visitedPair).inserted else { continue }
+                }
+
+                // Nodes must be similar (same kind, same text/index)
+                guard pair.left.isSimilar(to: pair.right) else {
                     return false
+                }
+                guard pair.left.children.count == pair.right.children.count else {
+                    return false
+                }
+                for (leftChild, rightChild) in zip(pair.left.children, pair.right.children) {
+                    pendingPairs.append((leftChild, rightChild))
                 }
             }
 
@@ -5872,7 +6185,7 @@ extension Node {
 
     fileprivate var character: Character {
         get throws(ManglingError) {
-            if let index, let scalar = UnicodeScalar(UInt32(index)) {
+            if let index, let narrowedIndex = UInt32(exactly: index), let scalar = UnicodeScalar(narrowedIndex) {
                 return Character(scalar)
             } else {
                 throw .genericError("")
@@ -5881,150 +6194,212 @@ extension Node {
     }
 }
 
+/// Strips the generic arguments off a nominal/context chain.
+///
+/// Unlike ``isSpecialized(_:)`` this rebuilds nodes as it unwinds, so it cannot
+/// be a plain loop; it carries its own stack of pending reconstructions
+/// instead. Written recursively it was reached from `mangleAnyNominalType`
+/// without passing back through `mangle(_:depth:)`, which put it outside every
+/// guard the remangler had — and adding a stack probe made things worse rather
+/// than better, because the resulting `nil` was indistinguishable from "this
+/// node cannot be unspecialized". Callers turn that `nil` into
+/// `.invalidNodeStructure`, so a depth problem was reported as a malformed
+/// tree and `.tooComplex` was unreachable on this path. With no recursion there
+/// is no depth to run out of, and `nil` means exactly one thing again.
 func getUnspecialized(_ node: Node) -> Node? {
-    var numToCopy = 2
+    /// A node whose unspecialized form can only be built once its parent
+    /// context has been unspecialized.
+    enum PendingRebuild {
+        case context(node: Node, childrenToCopy: Int)
+        case extensionNode(Node)
+    }
 
-    switch node.kind {
-    case .function,
-         .getter,
-         .setter,
-         .willSet,
-         .didSet,
-         .readAccessor,
-         .modifyAccessor,
-         .unsafeAddressor,
-         .unsafeMutableAddressor,
-         .allocator,
-         .constructor,
-         .destructor,
-         .variable,
-         .subscript,
-         .explicitClosure,
-         .implicitClosure,
-         .initializer,
-         .propertyWrapperBackingInitializer,
-         .propertyWrapperInitFromProjectedValue,
-         .defaultArgumentInitializer,
-         .static:
-        numToCopy = node.children.count
-        fallthrough
-
-    case .structure,
-         .enum,
-         .class,
-         .typeAlias,
-         .otherNominalType:
-        guard node.children.count > 0 else { return nil }
-
-        var resultChildren: [Node] = []
-        var parentOrModule = node.children[0]
-        if isSpecialized(parentOrModule) {
-            guard let unspec = getUnspecialized(parentOrModule) else { return nil }
-            parentOrModule = unspec
-        }
-        resultChildren.append(parentOrModule)
-        for idx in 1 ..< numToCopy {
-            if idx < node.children.count {
-                resultChildren.append(node.children[idx])
-            }
-        }
-        return Node(kind: node.kind, children: resultChildren)
-
-    case .boundGenericStructure,
-         .boundGenericEnum,
-         .boundGenericClass,
-         .boundGenericProtocol,
-         .boundGenericOtherNominalType,
-         .boundGenericTypeAlias:
-        guard node.children.count > 0 else { return nil }
-        let unboundType = node.children[0]
-        guard unboundType.kind == .type, unboundType.children.count > 0 else { return nil }
-        let nominalType = unboundType.children[0]
-        if isSpecialized(nominalType) {
-            return getUnspecialized(nominalType)
-        }
-        return nominalType
-
-    case .constrainedExistential:
-        guard node.children.count > 0 else { return nil }
-        let unboundType = node.children[0]
-        guard unboundType.kind == .type else { return nil }
-        return unboundType
-
-    case .boundGenericFunction:
-        guard node.children.count > 0 else { return nil }
-        let unboundFunction = node.children[0]
-        guard unboundFunction.kind == .function || unboundFunction.kind == .constructor else {
+    /// How many of a context node's children survive unspecialization, or
+    /// `nil` if this kind is not a context chain at all.
+    func contextChildrenToCopy(_ contextNode: Node) -> Int? {
+        switch contextNode.kind {
+        case .function,
+             .getter,
+             .setter,
+             .willSet,
+             .didSet,
+             .readAccessor,
+             .modifyAccessor,
+             .unsafeAddressor,
+             .unsafeMutableAddressor,
+             .allocator,
+             .constructor,
+             .destructor,
+             .variable,
+             .subscript,
+             .explicitClosure,
+             .implicitClosure,
+             .initializer,
+             .propertyWrapperBackingInitializer,
+             .propertyWrapperInitFromProjectedValue,
+             .defaultArgumentInitializer,
+             .static:
+            return contextNode.children.count
+        case .structure,
+             .enum,
+             .class,
+             .typeAlias,
+             .otherNominalType:
+            return 2
+        default:
             return nil
         }
-        if isSpecialized(unboundFunction) {
-            return getUnspecialized(unboundFunction)
-        }
-        return unboundFunction
-
-    case .extension:
-        guard node.children.count >= 2 else { return nil }
-        let parent = node.children[1]
-        if !isSpecialized(parent) {
-            return node
-        }
-        guard let unspec = getUnspecialized(parent) else { return nil }
-        var resultChildren: [Node] = [node.children[0], unspec]
-        if node.children.count == 3 {
-            resultChildren.append(node.children[2])
-        }
-        return Node(kind: .extension, children: resultChildren)
-
-    default:
-        return nil
     }
+
+    func rebuiltContext(_ contextNode: Node, parentOrModule: Node, childrenToCopy: Int) -> Node {
+        var resultChildren: [Node] = [parentOrModule]
+        for childIndex in 1 ..< max(childrenToCopy, 1) where childIndex < contextNode.children.count {
+            resultChildren.append(contextNode.children[childIndex])
+        }
+        return Node(kind: contextNode.kind, children: resultChildren)
+    }
+
+    var pendingRebuilds: [PendingRebuild] = []
+    var currentNode = node
+    var unspecializedNode: Node
+
+    descend: while true {
+        if let childrenToCopy = contextChildrenToCopy(currentNode) {
+            guard let parentOrModule = currentNode.children.first else { return nil }
+            if isSpecialized(parentOrModule) {
+                pendingRebuilds.append(.context(node: currentNode, childrenToCopy: childrenToCopy))
+                currentNode = parentOrModule
+                continue descend
+            }
+            unspecializedNode = rebuiltContext(currentNode, parentOrModule: parentOrModule, childrenToCopy: childrenToCopy)
+            break descend
+        }
+
+        switch currentNode.kind {
+        case .boundGenericStructure,
+             .boundGenericEnum,
+             .boundGenericClass,
+             .boundGenericProtocol,
+             .boundGenericOtherNominalType,
+             .boundGenericTypeAlias:
+            guard let unboundType = currentNode.children.first,
+                  unboundType.kind == .type,
+                  let nominalType = unboundType.children.first
+            else {
+                return nil
+            }
+            if isSpecialized(nominalType) {
+                currentNode = nominalType
+                continue descend
+            }
+            unspecializedNode = nominalType
+            break descend
+
+        case .constrainedExistential:
+            guard let unboundType = currentNode.children.first, unboundType.kind == .type else { return nil }
+            unspecializedNode = unboundType
+            break descend
+
+        case .boundGenericFunction:
+            guard let unboundFunction = currentNode.children.first,
+                  unboundFunction.kind == .function || unboundFunction.kind == .constructor
+            else {
+                return nil
+            }
+            if isSpecialized(unboundFunction) {
+                currentNode = unboundFunction
+                continue descend
+            }
+            unspecializedNode = unboundFunction
+            break descend
+
+        case .extension:
+            guard currentNode.children.count >= 2 else { return nil }
+            let parent = currentNode.children[1]
+            if !isSpecialized(parent) {
+                unspecializedNode = currentNode
+                break descend
+            }
+            pendingRebuilds.append(.extensionNode(currentNode))
+            currentNode = parent
+            continue descend
+
+        default:
+            return nil
+        }
+    }
+
+    while let pendingRebuild = pendingRebuilds.popLast() {
+        switch pendingRebuild {
+        case .context(let contextNode, let childrenToCopy):
+            unspecializedNode = rebuiltContext(contextNode, parentOrModule: unspecializedNode, childrenToCopy: childrenToCopy)
+        case .extensionNode(let extensionNode):
+            var resultChildren: [Node] = [extensionNode.children[0], unspecializedNode]
+            if extensionNode.children.count == 3 {
+                resultChildren.append(extensionNode.children[2])
+            }
+            unspecializedNode = Node(kind: .extension, children: resultChildren)
+        }
+    }
+    return unspecializedNode
 }
 
+/// Whether `node` — or the context chain it hangs off — is a specialized
+/// generic.
+///
+/// The descent is linear (each step moves to one child), so it runs as a loop.
+/// Written recursively it would be one more whole-chain recursion outside
+/// ``Remangler``'s stack guard, for no benefit.
 func isSpecialized(_ node: Node) -> Bool {
-    switch node.kind {
-    case .boundGenericStructure,
-         .boundGenericEnum,
-         .boundGenericClass,
-         .boundGenericOtherNominalType,
-         .boundGenericTypeAlias,
-         .boundGenericProtocol,
-         .boundGenericFunction,
-         .constrainedExistential:
-        return true
+    var currentNode = node
+    while true {
+        switch currentNode.kind {
+        case .boundGenericStructure,
+             .boundGenericEnum,
+             .boundGenericClass,
+             .boundGenericOtherNominalType,
+             .boundGenericTypeAlias,
+             .boundGenericProtocol,
+             .boundGenericFunction,
+             .constrainedExistential:
+            return true
 
-    case .structure,
-         .enum,
-         .class,
-         .typeAlias,
-         .otherNominalType,
-         .protocol,
-         .function,
-         .allocator,
-         .constructor,
-         .destructor,
-         .variable,
-         .subscript,
-         .explicitClosure,
-         .implicitClosure,
-         .initializer,
-         .propertyWrapperBackingInitializer,
-         .propertyWrapperInitFromProjectedValue,
-         .defaultArgumentInitializer,
-         .getter,
-         .setter,
-         .willSet,
-         .didSet,
-         .readAccessor,
-         .modifyAccessor,
-         .unsafeAddressor,
-         .unsafeMutableAddressor,
-         .static:
-        return node.children.count > 0 && isSpecialized(node.children[0])
+        case .structure,
+             .enum,
+             .class,
+             .typeAlias,
+             .otherNominalType,
+             .protocol,
+             .function,
+             .allocator,
+             .constructor,
+             .destructor,
+             .variable,
+             .subscript,
+             .explicitClosure,
+             .implicitClosure,
+             .initializer,
+             .propertyWrapperBackingInitializer,
+             .propertyWrapperInitFromProjectedValue,
+             .defaultArgumentInitializer,
+             .getter,
+             .setter,
+             .willSet,
+             .didSet,
+             .readAccessor,
+             .modifyAccessor,
+             .unsafeAddressor,
+             .unsafeMutableAddressor,
+             .static:
+            guard currentNode.children.count > 0 else { return false }
+            currentNode = currentNode.children[0]
 
-    case .extension:
-        return node.children.count > 1 && isSpecialized(node.children[1])
+        case .extension:
+            guard currentNode.children.count > 1 else { return false }
+            currentNode = currentNode.children[1]
 
-    default:
-        return false
+        default:
+            return false
+        }
     }
 }

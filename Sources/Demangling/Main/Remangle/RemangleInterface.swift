@@ -20,9 +20,9 @@ public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: Mangl
 
 /// Asynchronous variant of ``mangleAsString(_:usePunycode:flavor:)``.
 ///
-/// Always runs on a dedicated 8MB-stack `Thread` and suspends the calling task
-/// via a continuation, so Swift Concurrency cooperative workers are not blocked
-/// while remangling deeply nested types. Prefer this overload in high-throughput
+/// Suspends the calling task instead of blocking a cooperative worker when
+/// the walk has to move to a large-stack thread; with enough stack on the
+/// calling thread it runs inline. Prefer this overload in high-throughput
 /// async pipelines.
 public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: ManglingFlavor = .default) async throws(ManglingError) -> String {
     let mangleBlock: @Sendable () throws(ManglingError) -> String = {
@@ -32,6 +32,28 @@ public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: Mangl
     return try await StackSafeExecutor.executeAsync(mangleBlock)
 }
 
+// MARK: - Store-Backed Remangling
+
+/// Remangle any `DemanglingNode` representation — in particular a
+/// `NodeReference` pointing into a `NodeStore`.
+///
+/// The remangling algorithm constructs transient helper nodes while walking
+/// (unspecialized nominals, SIL box layout wrappers), exactly like the C++
+/// `Remangler` does with its `NodeFactory` — it is not a read-only consumer,
+/// so it runs on the class representation. This entry bridges by
+/// materializing the subtree once (subtree sharing preserved); the cost is
+/// transient and proportional to the subtree, and remangling's output is a
+/// fresh `String` either way, so the store's resident-memory goals are
+/// unaffected.
+public func mangleAsString(_ node: some DemanglingNode, usePunycode: Bool = true, flavor: ManglingFlavor = .default) throws(ManglingError) -> String {
+    try mangleAsString(node.materializedNode, usePunycode: usePunycode, flavor: flavor)
+}
+
+/// Asynchronous variant of the `DemanglingNode` overload.
+public func mangleAsString(_ node: some DemanglingNode, usePunycode: Bool = true, flavor: ManglingFlavor = .default) async throws(ManglingError) -> String {
+    try await mangleAsString(node.materializedNode, usePunycode: usePunycode, flavor: flavor)
+}
+
 // MARK: - Validation Helpers
 
 /// Check if a node tree can be successfully remangled
@@ -39,5 +61,10 @@ public func mangleAsString(_ node: Node, usePunycode: Bool = true, flavor: Mangl
 /// - Parameter node: The node to check
 /// - Returns: True if the node can be remangled
 public func canMangle(_ node: Node) -> Bool {
+    return (try? mangleAsString(node)) != nil
+}
+
+/// Check if any `DemanglingNode` representation can be successfully remangled.
+public func canMangle(_ node: some DemanglingNode) -> Bool {
     return (try? mangleAsString(node)) != nil
 }

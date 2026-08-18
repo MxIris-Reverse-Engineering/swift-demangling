@@ -1,5 +1,6 @@
 import Foundation
 import FoundationToolbox
+import SwiftStdlibToolbox
 
 /// Global cache for interning Node instances (full hash-consing).
 ///
@@ -20,7 +21,10 @@ import FoundationToolbox
 /// invariant holds as long as nodes are created through the public API.
 ///
 /// ## Thread Safety
-/// The cache uses a lock for thread-safe access.
+/// Both interning tables live in a single ``Mutex``, so every entry point is
+/// synchronized and the type is `Sendable` without an `@unchecked` opt-out.
+/// One mutex rather than one per table: interning a tree canonicalizes leaves
+/// and interior nodes in the same walk, and that has to be atomic.
 ///
 /// ## Usage
 ///
@@ -35,12 +39,12 @@ import FoundationToolbox
 /// // Clear cache when done processing a binary
 /// NodeCache.shared.clear()
 /// ```
-public final class NodeCache: @unchecked Sendable {
+public final class NodeCache: Sendable {
     /// The shared global cache instance.
     /// NodeFactory singletons are registered at initialization time.
     public static let shared: NodeCache = {
         let cache = NodeCache()
-        cache.registerFactorySingletons()
+        cache.storage.withLockUnchecked { NodeCache.registerFactorySingletons(in: &$0) }
         return cache
     }()
 
@@ -93,27 +97,30 @@ public final class NodeCache: @unchecked Sendable {
 
     // MARK: - Storage
 
-    /// Storage for leaf nodes (no children).
-    private var leafStorage: [LeafKey: Node] = [:]
+    /// Everything mutable about the cache, reachable only inside
+    /// ``Mutex/withLockUnchecked(_:)``.
+    ///
+    /// Both tables live in one value so that a single acquisition covers an
+    /// operation touching both — `internTree` walks a subtree canonicalizing
+    /// leaves and interior nodes as it goes, and splitting them across two
+    /// mutexes would make that walk non-atomic.
+    private struct Storage {
+        /// Leaf nodes (no children), keyed by kind + contents.
+        var leaves: [LeafKey: Node] = [:]
+        /// Interior nodes, keyed by kind + contents + child identities.
+        var subtrees: Set<SubtreeKey> = []
+    }
 
-    /// Storage for interior nodes (with children), keyed by kind + contents + child identities.
-    private var subtreeStorage: Set<SubtreeKey> = []
-
-    /// Lock for thread-safe access.
-    private let lock = NSLock()
+    private let storage = Mutex(Storage())
 
     /// Number of unique leaf nodes in the cache.
     public var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return leafStorage.count
+        storage.withLockUnchecked { $0.leaves.count }
     }
 
     /// Number of unique interior nodes (subtrees with children) in the cache.
     public var subtreeCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return subtreeStorage.count
+        storage.withLockUnchecked { $0.subtrees.count }
     }
 
     /// Creates a new empty cache.
@@ -122,28 +129,34 @@ public final class NodeCache: @unchecked Sendable {
 
     // MARK: - Inline Interning (used by Node.create)
 
+    // Contents and children are never accepted together here either, so the
+    // invalid combination has no internal back door — see
+    // `Node.create(kind:text:)`. An empty `children` still interns as a leaf.
+
     /// Creates or retrieves an interned node.
     /// Called by `Node.create()`. Only leaf nodes (no children) are cached.
     @usableFromInline
-    func createInterned(kind: Node.Kind, contents: Node.Contents, children: [Node]) -> Node {
+    func createInterned(kind: Node.Kind, children: [Node]) -> Node {
         if children.isEmpty {
-            lock.lock()
-            defer { lock.unlock() }
-            return internLeafUnsafe(kind: kind, contents: contents)
+            return storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: .none, in: &$0) }
         }
-        return Node(kind: kind, contents: contents, children: children)
+        return Node(kind: kind, contents: .none, children: children)
+    }
+
+    /// Creates or retrieves an interned leaf carrying `contents`.
+    @usableFromInline
+    func createInterned(kind: Node.Kind, contents: Node.Contents) -> Node {
+        storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: contents, in: &$0) }
     }
 
     /// Creates or retrieves an interned node from inline children.
     /// Called by `Node.create()`. Only leaf nodes (no children) are cached.
     @usableFromInline
-    func createInterned(kind: Node.Kind, contents: Node.Contents, inlineChildren: Node.Children) -> Node {
+    func createInterned(kind: Node.Kind, inlineChildren: Node.Children) -> Node {
         if inlineChildren.isEmpty {
-            lock.lock()
-            defer { lock.unlock() }
-            return internLeafUnsafe(kind: kind, contents: contents)
+            return storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: .none, in: &$0) }
         }
-        return Node(kind: kind, contents: contents, inlineChildren: inlineChildren)
+        return Node(kind: kind, contents: .none, inlineChildren: inlineChildren)
     }
 
     // MARK: - Leaf Node Interning (No Children)
@@ -151,63 +164,53 @@ public final class NodeCache: @unchecked Sendable {
     /// Interns a leaf node with no contents and no children.
     /// Returns an existing cached node if one exists, otherwise creates and caches a new one.
     public func intern(kind: Node.Kind) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        return internLeafUnsafe(kind: kind, contents: .none)
+        storage.withLockUnchecked { cacheStorage in
+            Self.internLeaf(kind: kind, contents: .none, in: &cacheStorage)
+        }
     }
 
     /// Interns a leaf node with text contents.
     public func intern(kind: Node.Kind, text: String) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        return internLeafUnsafe(kind: kind, contents: .text(text))
+        storage.withLockUnchecked { cacheStorage in
+            Self.internLeaf(kind: kind, contents: .text(text), in: &cacheStorage)
+        }
     }
 
     /// Interns a leaf node with index contents.
     public func intern(kind: Node.Kind, index: UInt64) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        return internLeafUnsafe(kind: kind, contents: .index(index))
+        storage.withLockUnchecked { cacheStorage in
+            Self.internLeaf(kind: kind, contents: .index(index), in: &cacheStorage)
+        }
     }
 
     // MARK: - Node with Children
 
     /// Creates or retrieves an interned node with a single child.
     public func intern(kind: Node.Kind, child: Node) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        return internTreeUnsafe(Node(kind: kind, contents: .none, children: [child]))
+        storage.withLockUnchecked { cacheStorage in
+            Self.internTree(Node(kind: kind, contents: .none, children: [child]), in: &cacheStorage)
+        }
     }
 
     /// Creates or retrieves an interned node with multiple children.
     public func intern(kind: Node.Kind, children: [Node]) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        if children.isEmpty {
-            return internLeafUnsafe(kind: kind, contents: .none)
+        storage.withLockUnchecked { cacheStorage in
+            if children.isEmpty {
+                return Self.internLeaf(kind: kind, contents: .none, in: &cacheStorage)
+            }
+            return Self.internTree(Node(kind: kind, contents: .none, children: children), in: &cacheStorage)
         }
-        return internTreeUnsafe(Node(kind: kind, contents: .none, children: children))
     }
 
-    /// Creates or retrieves an interned node with text contents and children.
-    public func intern(kind: Node.Kind, text: String, children: [Node]) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        if children.isEmpty {
-            return internLeafUnsafe(kind: kind, contents: .text(text))
-        }
-        return internTreeUnsafe(Node(kind: kind, contents: .text(text), children: children))
-    }
-
-    /// Creates or retrieves an interned node with index contents and children.
-    public func intern(kind: Node.Kind, index: UInt64, children: [Node]) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        if children.isEmpty {
-            return internLeafUnsafe(kind: kind, contents: .index(index))
-        }
-        return internTreeUnsafe(Node(kind: kind, contents: .index(index), children: children))
-    }
+    // There is no `intern(kind:text:children:)` / `intern(kind:index:children:)`.
+    // Contents and children are mutually exclusive in `Payload`, so with
+    // children present `mergedPayload` discarded the contents and the resulting
+    // `SubtreeKey` matched across differently-texted requests — two calls
+    // differing only in `text` returned the *same* instance, both reporting
+    // `text == nil`. With empty children they merely duplicated
+    // ``intern(kind:text:)`` / ``intern(kind:index:)`` above. Deleted rather
+    // than guarded so the invalid combination cannot be spelled
+    // (PR #7 review, finding 8).
 
     // MARK: - Tree Interning (Post-Processing)
 
@@ -221,95 +224,197 @@ public final class NodeCache: @unchecked Sendable {
     /// - Parameter node: The root node to intern.
     /// - Returns: The canonical node for the tree.
     public func intern(_ node: Node) -> Node {
-        lock.lock()
-        defer { lock.unlock() }
-        return internTreeUnsafe(node)
+        storage.withLockUnchecked { cacheStorage in
+            Self.internTree(node, in: &cacheStorage)
+        }
     }
 
     /// Recursively interns multiple trees bottom-up (full hash-consing).
     public func intern(_ nodes: [Node]) -> [Node] {
-        lock.lock()
-        defer { lock.unlock() }
-        return nodes.map { internTreeUnsafe($0) }
+        storage.withLockUnchecked { cacheStorage in
+            nodes.map { Self.internTree($0, in: &cacheStorage) }
+        }
     }
 
-    // MARK: - Unsynchronized Methods (for single-threaded use)
+    // MARK: - Historically Unsynchronized Methods
 
-    /// Interns a node without locking. Use only in single-threaded contexts.
+    // These once skipped the lock to save the cost of an `NSLock` acquisition
+    // in single-threaded callers. The state now lives in a `Mutex`, which is
+    // reachable only from inside `withLock`, so they acquire like everything
+    // else — an uncontended `os_unfair_lock` is a couple of atomics, cheaper
+    // than the `NSLock` the old fast path was avoiding. The names are kept for
+    // source compatibility; there is no longer an unsynchronized variant, and
+    // calling these from several threads is now simply correct.
+
+    /// Interns a leaf node with no contents.
     public func internUnsafe(kind: Node.Kind) -> Node {
-        internLeafUnsafe(kind: kind, contents: .none)
+        storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: .none, in: &$0) }
     }
 
-    /// Interns a node with text without locking.
+    /// Interns a leaf node with text contents.
     public func internUnsafe(kind: Node.Kind, text: String) -> Node {
-        internLeafUnsafe(kind: kind, contents: .text(text))
+        storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: .text(text), in: &$0) }
     }
 
-    /// Interns a node with index without locking.
+    /// Interns a leaf node with index contents.
     public func internUnsafe(kind: Node.Kind, index: UInt64) -> Node {
-        internLeafUnsafe(kind: kind, contents: .index(index))
+        storage.withLockUnchecked { Self.internLeaf(kind: kind, contents: .index(index), in: &$0) }
     }
 
-    /// Creates a node with children without locking. Interns fully (leaf or subtree).
+    /// Creates a node with children. Interns fully (leaf or subtree).
     public func internUnsafe(kind: Node.Kind, children: [Node]) -> Node {
-        if children.isEmpty {
-            return internLeafUnsafe(kind: kind, contents: .none)
+        storage.withLockUnchecked { cacheStorage in
+            if children.isEmpty {
+                return Self.internLeaf(kind: kind, contents: .none, in: &cacheStorage)
+            }
+            return Self.internTree(Node(kind: kind, contents: .none, children: children), in: &cacheStorage)
         }
-        return internTreeUnsafe(Node(kind: kind, contents: .none, children: children))
     }
 
-    /// Recursively interns a tree bottom-up without locking (full hash-consing).
+    /// One suspended level of ``internTreeUnsafe(_:)``'s bottom-up walk.
+    private struct InternFrame {
+        let node: Node
+        var nextChildIndex: Int
+        var internedChildren: [Node]
+        var childrenChanged: Bool
+    }
+
+    /// Interns a tree bottom-up (full hash-consing).
+    ///
+    /// The name is kept for source compatibility; the walk is synchronized like
+    /// every other entry point (see the note above ``internUnsafe(kind:)``).
     public func internTreeUnsafe(_ node: Node) -> Node {
-        // Leaf node: intern it
-        if node.children.isEmpty {
-            return internLeafUnsafe(kind: node.kind, contents: node.contents)
-        }
+        storage.withLockUnchecked { Self.internTree(node, in: &$0) }
+    }
 
-        // Fast path: a stored entry can only match by identity of children if those
-        // children are already canonical, so a hit is authoritative without descending.
-        // This also makes re-interning an already-canonical subtree O(children).
-        if let existingIndex = subtreeStorage.firstIndex(of: SubtreeKey(node: node)) {
-            return subtreeStorage[existingIndex].node
-        }
+    /// Interns a tree bottom-up into `storage` (full hash-consing).
+    ///
+    /// Walked with an explicit stack rather than by recursion. This runs on
+    /// every `demangleAsNode` call that leaves `internsSubtrees` at its default,
+    /// so it is on the hot path for the deepest trees the library ever sees, and
+    /// as a whole-tree walk it sits outside every engine's stack guard.
+    ///
+    /// The walk memoizes canonical results by source-instance identity for its
+    /// own duration. The `SubtreeKey` probe alone is not enough: it keys by the
+    /// probed node's *original* child identities, so it only short-cuts while
+    /// those children are already canonical. As soon as canonicalization
+    /// replaces a child anywhere below — structural duplicates inside the tree,
+    /// or overlap with previously interned structure, the normal case for every
+    /// tree after the first — every repeated instance probe-misses and, without
+    /// the memo, re-descends its whole subtree once per *path*: 2^N on a
+    /// doubling DAG, reachable straight through default `demangleAsNode`
+    /// because substitution back-references repeat instances (evolution 0006).
+    ///
+    /// - Precondition: the caller holds the mutex — that is what the `inout
+    ///   Storage` stands for.
+    private static func internTree(_ node: Node, in cacheStorage: inout Storage) -> Node {
+        var frames: [InternFrame] = []
+        var completedChild: Node?
+        var canonicalBySourceIdentity: [ObjectIdentifier: Node] = [:]
 
-        // Canonicalize children bottom-up
-        var childrenChanged = false
-        var internedChildren = [Node]()
-        internedChildren.reserveCapacity(node.children.count)
-
-        for child in node.children {
-            let interned = internTreeUnsafe(child)
-            internedChildren.append(interned)
-            if interned !== child {
-                childrenChanged = true
+        func canonicalizeWithoutDescending(_ candidate: Node) -> Node? {
+            // A source instance this walk already canonicalized repeats its
+            // result — this is what keeps the walk priced by node count.
+            if let alreadyCanonicalized = canonicalBySourceIdentity[ObjectIdentifier(candidate)] {
+                return alreadyCanonicalized
             }
+            // Leaf node: intern it, and memoize like every other branch — a
+            // repeated leaf instance otherwise re-pays a `LeafKey` string hash
+            // once per referencing edge (PR #7 review, minor finding).
+            if candidate.children.isEmpty {
+                let canonical = Self.internLeaf(kind: candidate.kind, contents: candidate.contents, in: &cacheStorage)
+                canonicalBySourceIdentity[ObjectIdentifier(candidate)] = canonical
+                return canonical
+            }
+            // Fast path: a stored entry can only match by identity of children if those
+            // children are already canonical, so a hit is authoritative without descending.
+            // This also makes re-interning an already-canonical subtree O(children).
+            if let existingIndex = cacheStorage.subtrees.firstIndex(of: SubtreeKey(node: candidate)) {
+                let canonical = cacheStorage.subtrees[existingIndex].node
+                canonicalBySourceIdentity[ObjectIdentifier(candidate)] = canonical
+                return canonical
+            }
+            return nil
         }
 
-        // Only reconstruct if a child was replaced by its canonical instance; the
-        // candidate is dropped again if an equivalent subtree is already stored.
-        let candidate = childrenChanged
-            ? Node(kind: node.kind, contents: node.contents, children: internedChildren)
-            : node
-        return subtreeStorage.insert(SubtreeKey(node: candidate)).memberAfterInsert.node
+        if let canonical = canonicalizeWithoutDescending(node) {
+            return canonical
+        }
+        frames.append(InternFrame(node: node, nextChildIndex: 0, internedChildren: [], childrenChanged: false))
+        frames[0].internedChildren.reserveCapacity(node.children.count)
+
+        while var frame = frames.popLast() {
+            if let interned = completedChild {
+                frame.internedChildren.append(interned)
+                if interned !== frame.node.children[frame.nextChildIndex - 1] {
+                    frame.childrenChanged = true
+                }
+                completedChild = nil
+            }
+
+            if frame.nextChildIndex < frame.node.children.count {
+                let child = frame.node.children[frame.nextChildIndex]
+                frame.nextChildIndex += 1
+                frames.append(frame)
+
+                if let canonical = canonicalizeWithoutDescending(child) {
+                    completedChild = canonical
+                } else {
+                    var childFrame = InternFrame(node: child, nextChildIndex: 0, internedChildren: [], childrenChanged: false)
+                    childFrame.internedChildren.reserveCapacity(child.children.count)
+                    frames.append(childFrame)
+                }
+                continue
+            }
+
+            // Only reconstruct if a child was replaced by its canonical instance; the
+            // candidate is dropped again if an equivalent subtree is already stored.
+            let candidate = frame.childrenChanged
+                ? Node(kind: frame.node.kind, contents: frame.node.contents, children: frame.internedChildren)
+                : frame.node
+            let canonical = cacheStorage.subtrees.insert(SubtreeKey(node: candidate)).memberAfterInsert.node
+            canonicalBySourceIdentity[ObjectIdentifier(frame.node)] = canonical
+
+            if frames.isEmpty {
+                return canonical
+            }
+            completedChild = canonical
+        }
+
+        // Unreachable: the loop returns as soon as the root frame completes.
+        return node
     }
 
     // MARK: - Cache Management
 
+    /// Whether a leaf with this kind and contents is already canonical here,
+    /// without making it so.
+    ///
+    /// Every other way of asking is a mutation: `intern` builds and stores the
+    /// leaf on a miss, and `count` is a shared counter that concurrent work
+    /// moves. Tests that assert a code path left the global cache alone need a
+    /// question that is both read-only and specific to one leaf.
+    func containsCanonicalLeaf(kind: Node.Kind, contents: Node.Contents) -> Bool {
+        storage.withLockUnchecked { cacheStorage in
+            cacheStorage.leaves[LeafKey(kind: kind, contents: contents)] != nil
+        }
+    }
+
     /// Clears all cached nodes.
     /// Call this when you're done processing a binary to free memory.
     public func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        leafStorage.removeAll()
-        subtreeStorage.removeAll()
-        registerFactorySingletons()
+        storage.withLockUnchecked { cacheStorage in
+            cacheStorage.leaves.removeAll()
+            cacheStorage.subtrees.removeAll()
+            Self.registerFactorySingletons(in: &cacheStorage)
+        }
     }
 
     /// Reserves capacity for the expected number of unique leaf nodes.
     public func reserveCapacity(_ minimumCapacity: Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        leafStorage.reserveCapacity(minimumCapacity)
+        storage.withLockUnchecked { cacheStorage in
+            cacheStorage.leaves.reserveCapacity(minimumCapacity)
+        }
     }
 
     // MARK: - Private Helpers
@@ -318,7 +423,7 @@ public final class NodeCache: @unchecked Sendable {
     ///
     /// Ensures identity consistency: `Node.create(kind: .emptyList)` returns the same
     /// instance as `NodeFactory.emptyList`.
-    private func registerFactorySingletons() {
+    private static func registerFactorySingletons(in cacheStorage: inout Storage) {
         let singletons: [Node] = [
             NodeFactory.emptyList,
             NodeFactory.firstElementMarker,
@@ -368,17 +473,22 @@ public final class NodeCache: @unchecked Sendable {
 
         for singleton in singletons {
             let key = LeafKey(singleton)
-            leafStorage[key] = singleton
+            cacheStorage.leaves[key] = singleton
         }
     }
 
-    private func internLeafUnsafe(kind: Node.Kind, contents: Node.Contents) -> Node {
+    /// Returns the canonical leaf for `kind`/`contents`, creating and storing
+    /// it on a miss.
+    ///
+    /// - Precondition: the caller holds the mutex — that is what the `inout
+    ///   Storage` stands for.
+    private static func internLeaf(kind: Node.Kind, contents: Node.Contents, in cacheStorage: inout Storage) -> Node {
         let key = LeafKey(kind: kind, contents: contents)
-        if let existing = leafStorage[key] {
+        if let existing = cacheStorage.leaves[key] {
             return existing
         }
         let node = Node(kind: kind, contents: contents)
-        leafStorage[key] = node
+        cacheStorage.leaves[key] = node
         return node
     }
 }
@@ -494,20 +604,14 @@ extension Node {
         self.init(kind: kind, contents: .none, children: children)
     }
 
-    convenience init(kind: Kind, text: String, child: Node) {
-        self.init(kind: kind, contents: .text(text), children: [child])
+    // Contents-carrying leaves only — see `Node.create(kind:text:)` for why the
+    // `child:`/`children:` counterparts are gone.
+    convenience init(kind: Kind, text: String) {
+        self.init(kind: kind, contents: .text(text))
     }
 
-    convenience init(kind: Kind, text: String, children: [Node] = []) {
-        self.init(kind: kind, contents: .text(text), children: children)
-    }
-
-    convenience init(kind: Kind, index: UInt64, child: Node) {
-        self.init(kind: kind, contents: .index(index), children: [child])
-    }
-
-    convenience init(kind: Kind, index: UInt64, children: [Node] = []) {
-        self.init(kind: kind, contents: .index(index), children: children)
+    convenience init(kind: Kind, index: UInt64) {
+        self.init(kind: kind, contents: .index(index))
     }
 
     convenience init(typeWithChildKind: Kind, childChild: Node) {
@@ -531,15 +635,11 @@ extension Node {
 }
 
 extension Node {
-    convenience init(kind: Kind, contents: Contents = .none, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
-        self.init(kind: kind, contents: contents, children: childrenBuilder())
-    }
-
-    convenience init(kind: Kind, text: String, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
-        self.init(kind: kind, contents: .text(text), children: childrenBuilder())
-    }
-
-    convenience init(kind: Kind, index: UInt64, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
-        self.init(kind: kind, contents: .index(index), children: childrenBuilder())
+    // No `contents:` parameter: this initializer exists to produce children,
+    // and the two are mutually exclusive in `Payload`. Mirrors the public
+    // `Node.create(kind:childrenBuilder:)`, which dropped its own `contents:`
+    // for the same reason.
+    convenience init(kind: Kind, @ArrayBuilder<Node> childrenBuilder: () -> [Node]) {
+        self.init(kind: kind, children: childrenBuilder())
     }
 }

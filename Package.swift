@@ -45,6 +45,12 @@ func envEnable(_ key: String, default defaultValue: Bool = false) -> Bool {
 
 let usingLocalDependencies = envEnable("USING_LOCAL_DEPENDENCIES")
 
+/// Opt-in acceptance harness for proposal 0008 B2 (store print walk must not
+/// retain/release the store per visited child). Gated behind an environment
+/// flag so ordinary consumers never see the extra executable; see
+/// `Sources/RetainCountVerification/main.swift` for the run recipe.
+let buildingRetainCountVerification = envEnable("DEMANGLING_RETAIN_HARNESS")
+
 extension Package.Dependency {
     enum LocalSearchPath {
         case package(path: String, isRelative: Bool, isEnabled: Bool = usingLocalDependencies, traits: Set<PackageDescription.Package.Dependency.Trait> = [.defaults])
@@ -110,6 +116,18 @@ let package = Package(
             name: "Demangling",
             dependencies: [
                 .product(name: "FoundationToolbox", package: "FrameworkToolbox"),
+                .product(name: "SwiftStdlibToolbox", package: "FrameworkToolbox"),
+            ],
+            swiftSettings: [
+                // Proposal 0008: the byte-based demangler stores Span<UInt8>
+                // in its ~Escapable scanner, which requires lifetime
+                // dependence support; @_lifetime-based direct-return borrowed
+                // views are additionally gated by #if hasFeature(Lifetimes)
+                // at each use site. Compilers that do not know the feature
+                // name ignore the flag (verified on 6.3.3) — the module then
+                // fails on the Span stored property, so the effective
+                // compiler floor is a Lifetimes-capable toolchain.
+                .enableExperimentalFeature("Lifetimes"),
             ],
         ),
         .target(
@@ -130,6 +148,19 @@ let package = Package(
                 "Demangling",
                 "DemanglingTestingSupport",
             ],
+            swiftSettings: [
+                // Must mirror the Demangling target: #if hasFeature(Lifetimes)
+                // tests compile out silently when the flag is missing here,
+                // leaving the direct-return borrowed views with zero coverage
+                // while the suite stays green (ReviewFindingsPR7 F3). Guarded
+                // by BorrowedTextViewTests.lifetimesFeatureIsEnabledInTestTarget.
+                .enableExperimentalFeature("Lifetimes"),
+            ],
         ),
-    ],
+    ] + (buildingRetainCountVerification ? [
+        .executableTarget(
+            name: "RetainCountVerification",
+            dependencies: ["Demangling"],
+        ),
+    ] : []),
 )

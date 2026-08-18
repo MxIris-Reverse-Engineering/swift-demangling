@@ -14,9 +14,9 @@ public struct TypeLookupError: Error, CustomStringConvertible, Sendable {
     }
 
     /// Initialize from a node error
-    public init(node: Node, message: String, file: String = #file, line: Int = #line) {
+    public init(node: some DemanglingNode, message: String, file: String = #file, line: Int = #line) {
         let nodeInfo = "Node kind \(node.kind)"
-        let textInfo = node.hasText ? " \"\(node.text ?? "")\"" : ""
+        let textInfo = node.text.map { " \"\($0)\"" } ?? ""
         self.message = "\(nodeInfo)\(textInfo) - \(message)"
         self.file = file
         self.line = line

@@ -14,6 +14,22 @@ struct AppleAlignmentTests {
         #expect(node.print(using: .default) == "use.x : use.OfP<lib.G<<<opaque return type of use.f() -> some>>.0>>")
     }
 
+    // A9: 0xFF alignment padding before an operator must be skipped (upstream
+    // Demangler.cpp:1029, merged in 8d0b396). Metadata mangled names carry the
+    // padding; a Latin-1-decoded String presents it as U+00FF, which reaches
+    // the byte scanner as its UTF-8 encoding C3 BF — so the original scalar
+    // comparison went dead when the scanner byte-ized and the corpus (all
+    // ASCII) could never notice (ReviewFindingsPR7 F2). This is the targeted
+    // test 8d0b396 never had.
+    @Test func alignmentPaddingBeforeOperatorIsSkipped() throws {
+        let padded = try demangleAsNode("$s4main1AV\u{FF}6methodyyF")
+        #expect(padded.print(using: .default) == "main.A.method() -> ()")
+        let doublyPadded = try demangleAsNode("$s4main1AV\u{FF}\u{FF}6methodyyF")
+        #expect(doublyPadded.print(using: .default) == "main.A.method() -> ()")
+        let transient = try demangleAsNodeTransient("$s4main1AV\u{FF}6methodyyF")
+        #expect(transient.print(using: .default) == "main.A.method() -> ()")
+    }
+
     // B-H2 + B-H3: attached-macro remangling must put the discriminator (child 3)
     // AFTER the "fM<role>" code, and use role char 'e' for extension (and 'r' for
     // member-attribute). A stable round-trip proves the child order is correct.

@@ -1,0 +1,142 @@
+// Proposal 0008 B2 acceptance harness: counts swift_retain/swift_release
+// events targeting the frozen `NodeStore` during a print walk, comparing the
+// ARC-free `UnretainedNodeReference` engine (what `NodeReference.print` runs)
+// against the retained-handle engine (`DemanglingPrinter<String,
+// NodeReference>`) on identical input.
+//
+// Requires the interpose dylib from `Scripts/RetainCounter/retain-counter.c`
+// inserted at launch:
+//
+//   clang -dynamiclib Scripts/RetainCounter/retain-counter.c -o /tmp/claude/libretaincounter.dylib
+//   DEMANGLING_RETAIN_HARNESS=1 swift build -c release --product RetainCountVerification --scratch-path <agent scratch>
+//   DYLD_INSERT_LIBRARIES=/tmp/claude/libretaincounter.dylib <build dir>/RetainCountVerification [symbols file]
+//
+// Exit codes: 0 parity holds (unretained walk below 5% of the retained
+// walk's store ARC traffic), 1 it does not, 2 the dylib was not inserted.
+
+import Darwin
+import Foundation
+@_spi(Internals) import Demangling
+
+typealias WatchFunction = @convention(c) (UnsafeMutableRawPointer?) -> Void
+typealias EventCountFunction = @convention(c) () -> UInt64
+
+guard
+    let watchSymbol = dlsym(dlopen(nil, RTLD_NOW), "retain_counter_watch"),
+    let retainCountSymbol = dlsym(dlopen(nil, RTLD_NOW), "retain_counter_retains"),
+    let releaseCountSymbol = dlsym(dlopen(nil, RTLD_NOW), "retain_counter_releases")
+else {
+    print("retain-counter dylib not loaded; insert it with DYLD_INSERT_LIBRARIES (see Scripts/RetainCounter/retain-counter.c)")
+    exit(2)
+}
+
+let watch = unsafeBitCast(watchSymbol, to: WatchFunction.self)
+let retainEvents = unsafeBitCast(retainCountSymbol, to: EventCountFunction.self)
+let releaseEvents = unsafeBitCast(releaseCountSymbol, to: EventCountFunction.self)
+
+let defaultSymbols = [
+    "$s7SwiftUI4ViewPAAE4task8priority_QrScP_yyYaYbScMYccntF",
+    "$s10Foundation4DataV15withUnsafeBytesyxxSWKXEKlF",
+    "$s7Combine9PublisherPAAE4sink18receiveCompletion0C5ValueAA14AnyCancellableCyAA11SubscribersO0D0Oy_7FailureQZGc_y6OutputQZctF",
+    "$s7SwiftUI18DynamicViewContentPAAE8onDelete7performQrys8IndexSetVcSg_tF",
+    "$ss2eeoiySbx_xtSQRzlF",
+    "$s8mangling0022egbpdajGbuEbxfgehfvwxnyyF",
+    "$s3use1xAA3OfPVy3lib1GVyAA1fQryFQOyQo_GAjE1PAAxAeKHD1_AIHO_HCg_Gvp",
+    "_$s9localtest5outeryyF11LocalStructL_V6methodyyF",
+]
+
+// A corpus file that fails to load must abort, not silently downgrade to the
+// built-in eight symbols: the harness would go on to report PASS for a corpus
+// nobody asked it to measure. This is the same swallow F4 removed from the
+// demangle loop below — it survived here, six lines above the comment that
+// explains why it is wrong (ReviewFindingsPR7 F4, second instance).
+let symbols: [String]
+if CommandLine.arguments.count > 1 {
+    let corpusPath = CommandLine.arguments[1]
+    do {
+        let contents = try String(contentsOfFile: corpusPath, encoding: .utf8)
+        symbols = contents.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    } catch {
+        print("[0008-retain-verification] failed to read symbol file \(corpusPath): \(error)")
+        print("[0008-retain-verification] refusing to fall back to the built-in corpus — that would report PASS for a different input than requested")
+        exit(1)
+    }
+    guard !symbols.isEmpty else {
+        print("[0008-retain-verification] symbol file \(corpusPath) contained no symbols")
+        exit(1)
+    }
+} else {
+    symbols = defaultSymbols
+}
+
+// A silently skipped symbol changes what the harness measures without
+// changing what it reports measuring, so a demangle failure aborts the run
+// instead of shrinking the input (ReviewFindingsPR7 F4).
+func buildStore(from symbols: [String]) -> (NodeStore, [NodeStore.NodeIndex]) {
+    var builder = NodeStoreBuilder()
+    var roots: [NodeStore.NodeIndex] = []
+    roots.reserveCapacity(symbols.count)
+    var failedSymbolCount = 0
+    for mangled in symbols {
+        do {
+            roots.append(try builder.demangle(mangled))
+        } catch {
+            failedSymbolCount += 1
+            print("[0008-retain-verification] failed to demangle \(mangled): \(error)")
+        }
+    }
+    if failedSymbolCount > 0 {
+        print("[0008-retain-verification] \(failedSymbolCount) of \(symbols.count) symbols failed to demangle; refusing to measure a different corpus than requested")
+        exit(1)
+    }
+    return (builder.freeze(), roots)
+}
+
+let (store, roots) = buildStore(from: symbols)
+guard !roots.isEmpty else {
+    print("no symbols demangled; nothing to measure")
+    exit(1)
+}
+
+// Warm both engines so lazy runtime setup does not land in a window.
+for root in roots {
+    _ = store.reference(at: root).print(using: .default)
+    _ = DemanglingPrinter<String, NodeReference>.print(store.reference(at: root), options: .default)
+}
+
+let storePointer = Unmanaged.passUnretained(store).toOpaque()
+let passCount = 20
+
+watch(storePointer)
+for _ in 0 ..< passCount {
+    for root in roots {
+        _ = store.reference(at: root).print(using: .default)
+    }
+}
+let unretainedWalkRetains = retainEvents()
+let unretainedWalkReleases = releaseEvents()
+
+watch(storePointer)
+for _ in 0 ..< passCount {
+    for root in roots {
+        _ = DemanglingPrinter<String, NodeReference>.print(store.reference(at: root), options: .default)
+    }
+}
+let retainedWalkRetains = retainEvents()
+let retainedWalkReleases = releaseEvents()
+watch(nil)
+
+let walkCount = roots.count * passCount
+print("""
+[0008-retain-verification] symbols=\(roots.count) passes=\(passCount) (\(walkCount) walks)
+[0008-retain-verification] unretained engine (NodeReference.print): store retains=\(unretainedWalkRetains) releases=\(unretainedWalkReleases) (\(String(format: "%.2f", Double(unretainedWalkRetains) / Double(walkCount))) per walk)
+[0008-retain-verification] retained engine (DemanglingPrinter<String, NodeReference>): store retains=\(retainedWalkRetains) releases=\(retainedWalkReleases) (\(String(format: "%.2f", Double(retainedWalkRetains) / Double(walkCount))) per walk)
+""")
+
+if unretainedWalkRetains * 20 < retainedWalkRetains {
+    print("[0008-retain-verification] PASS: unretained walk carries <5% of the retained walk's store ARC traffic")
+    exit(0)
+} else {
+    print("[0008-retain-verification] FAIL: unretained walk still pays comparable store ARC traffic")
+    exit(1)
+}

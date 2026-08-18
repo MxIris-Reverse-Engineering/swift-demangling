@@ -1,0 +1,527 @@
+# PR #7 code-review 发现清单（`feature/node-store`）—— 两轮，均已闭环
+
+本文件曾是 **PR #7 一轮 `max` 档 code-review 的完整发现记录**（15 条已验证发现 +
+9 条未验证补充发现 + 1 条流程问题，每条带「四问」答案与修法方向）。按本文件的契约——
+判定为「不修 / 误报」的条目迁进 [KnownIssues.md](KnownIssues.md)，判定为「修」的条目
+修完后移除并在对应演进提案的决策日志里留一行——**第一轮全部条目已于 2026-08-09 处理
+完毕**。本文件保留为闭环索引；完整的发现原文见引入本文件的 commit（`15f4b40`）。
+
+**2026-08-13：第二轮（对抗性复核）已闭环，见文末[第二轮](#第二轮对抗性复核2026-08-13)。**
+那一轮推翻了第一轮的两条结论、订正了一条数据，并找到一条前五轮全部漏掉的新缺陷。
+
+## 元信息
+
+| 项 | 值 |
+|---|---|
+| 审查目标 | PR #7 `feature/node-store` @ `9464265` |
+| 对比基线 | merge-base `f913742`（已在 `main` 上） |
+| 审查日期 | 2026-08-09 |
+| 修复落地 | 同日，commit `e3bb13c`（F3/F4）→ `3b47e48`（F2/F1）→ `ef9c1f4`（F5–F10）→ `c432b33`（F11–F13）→ 第 5 步批（F14/F15 + 补充发现） |
+
+## 处置索引
+
+**已修（决策日志行所在提案）**：
+
+| 发现 | 一句话 | 决策日志 |
+|---|---|---|
+| F1 | 整数陷阱家族第四次露头，清点范围扩到 Demangler/Remangler | 0004；清点全文在 KnownIssues 2026-08-09 更新。**补遗（同日）**：review 会话核实时发现第一轮横向排查按「窄化转换」特征扫、漏了 `demangleSwift3Index` 的纯环绕族（函数内 + 三个调用点共四处，无窄化），已实测确认可 trap 并同批补修；正确排查特征与元教训见 KnownIssues 补遗段 |
+| F2 | 0xFF 对齐填充跳过在字节化后死代码（功能回归） | 0008；AlignmentGaps A9 行注记 |
+| F3 | 测试 target 缺 `Lifetimes`，借用视图测试零覆盖 | 0008 |
+| F4 | 语料验收 `try?` 吞失败；重跑翻出 11 个 stdlib 同拒符号 | 0008 / 0010 / 0011 各一行 |
+| F5 | 空代跳过退休登记（维护者裁决方案 A：空代也保活） | 0010 |
+| F6 | range 读丢 release 边界陷阱 | 0010 |
+| F7 | 内存安全不变量只用 `assert` 守 | 0010 |
+| F8 | `reserveCapacity` 精确扩容 + 退休链 = O(k²) | 0010 |
+| F9 | 前缀匹配按字素簇比较（回字节域） | 0008；提案「行为差异，明示」补记 |
+| F10 | `textUTF8` 索引基静默变 0 基（维护者裁决：改签名 `textUTF8Bytes`） | 0010 |
+| F11 | store 侧文本物化没接 seam + 无有效性闸门 | 0008；分流点清单在 SpanBorrowedViews.md |
+| F12 | 翻进程级 seam 污染并行套件（改直接入口） | 0008 |
+| F13 | benchmark 窗口重叠 + `malloc_logger` 不恢复 | 0008；数字订正行在 0008/0009/0010 |
+| F14 | 共享 store 散点读逐节点过锁（walk 级单次解析；原子发布暂不做已留档） | 0010 |
+| F15 | 异步 `print` 缺生命周期锚点 | 0010 |
+
+**补充发现（9 条，逐条复现后裁决）**：#1/#3/#6/#7/#9 见 KnownIssues **N9–N13**；
+#2（采样器挂死守卫）与 #8（EmbeddedFlavorTests 双配置）已修，决策日志行在 0008；
+#5（publish 每 intern 分配）已修，决策日志行在 0010；**#4（`SharedNodeStore` 无
+`reference(at:)`，存下来的 `NodeIndex` 无法解析回引用）为真实 API 缺口但无当前消费方，
+按提案制留维护者决定——若要补，属新增公开 API，走提案。**
+
+## 流程问题（维护者已裁决：以后再说）
+
+本 PR 覆盖的四份提案（0008 / 0009 / 0010 / 0011）状态轨迹均未经过 `Accepted` 即落地
+实现（状态更新与实现同 commit）。**维护者 2026-08-09 裁决：补办与否以后再说**，本节
+保留为该开放事项的记录。
+
+## 留给后续的两件事
+
+1. **吞吐空载复测**：F13 修复后的首次干净窗口 benchmark 因机器连续满载存在 ±17%
+   跑次方差，吞吐数字只记录未定案（分配账目已定案并订正）。若需评估 F1/F6/F7 新增
+   界检查的代价，须另行空载 A/B——见 0008/0009/0010 的 2026-08-09 订正行。
+2. **补充发现 #4** 的 API 决定（上文）。
+
+---
+
+# 第二轮：对抗性复核（2026-08-13）
+
+第一轮的结论被送去做独立复核。复核**没有**只是确认既有结论：它推翻了两条、订正了一条
+数据、并找到一条第一轮到第五轮全部漏掉的新缺陷。三处修正如下，都带实测证据。
+
+## 修正 1：F1-punycode 的归属判错了
+
+第一轮把 punycode 越界 trap 判为「本 PR 新引入」（`ec3769a` 把 `readScalars(count:)`
+换成 `readRange(count:)`，长度前缀从 scalar 数变字节数）。
+
+**实测推翻**：`Punycode.swift` 在 head 与 main 两棵树里**逐字节相同**（`diff` 无输出）。
+真正的缺陷在 `decodePunycode` 的内层循环——它在**读** `input[pos]` 前不检查越界，
+`pos != endIndex` 那个判断只保护了**前进**。数字串耗尽时 `pos` 停在 `endIndex`，
+下一轮迭代越界。lldb 在两棵树上给出同一个崩溃点：
+
+```
+Swift runtime failure: String index is out of bounds
+frame #3: Punycode.decodePunycode(value="JJJJ") at Punycode.swift:220:25
+```
+
+**纯 ASCII 触发串 `$s4main004JJJJyyF`（17 字符）让 head 和 main 同时崩。** 它的字节数
+等于 scalar 数，与 byte/scalar 语义毫无关系（`J` 解出的 digit 恒为 35，永远满足
+`digit >= t`，循环不会正常退出）。
+
+**后果不只是归属**：按第一轮的修法（改 `Demangler.swift` 的长度语义）**堵不住这个洞**。
+修复落在 `decodePunycode` 的读取边界上。
+
+## 修正 2：F9-`stripManglePrefix` 是误报
+
+第一轮据此推断 `stripManglePrefix` 存在字节域/字素域错配。实测两版输出逐字节相同。
+详见 [KnownIssues N14](KnownIssues.md)——那里记了推断错在哪（`getManglingPrefixLength`
+返回的是字面常量，F9 改的是匹配方式不是计数方式）。
+
+## 修正 3：长度语义变更的裁判数据不对
+
+第一轮记「6 万条语料，Apple 100:0 站 HEAD」。用 1068 条**专门压 byte/scalar 边界**的
+非 ASCII 差分语料复测，以 `xcrun swift-demangle` 为裁判：
+
+| | 条数 |
+|---|---|
+| HEAD 正确 | 194 |
+| **MAIN 正确** | **41** |
+| 平局 | 578 |
+
+方向仍是 HEAD 更优，但**不是 100:0**。那 41 条形态高度一致：全部 `head=OK, apple=REJ`，
+且 41/41 带 punycode 标记——HEAD 在 punycode 路径上有一类系统性**误接受**。另外仅崩 head
+的输入 92 条 vs 仅崩 main 的 52 条，本 PR 在非 ASCII 上净增 40 条会崩的输入。
+
+## 新发现 F16：`NodePrinter` 的加法溢出（不可抛错的公开 API）
+
+`demangleIndex()` 先 `require(value != UInt64.max)` 再 `return value + 1`——所以它
+**能合法返回 `UInt64.max`**（输入 `18446744073709551614_` 时）。`NodePrinter.swift`
+随后有六处 `(… .index ?? 0) + 1` 作用在同一个 `UInt64` 上。
+
+实测三个触发串，**head 和 main 全崩，Apple 全部干净拒绝**：
+
+| 触发串 | 站点 |
+|---|---|
+| `$s4main1fyyFyycfU18446744073709551614_` | `.explicitClosure` |
+| `$s4main1fyyFyycfu18446744073709551614_` | `.implicitClosure` |
+| `_$s9localtest5outeryyF11LocalStructL18446744073709551614_V6methodyyF` | `.localDeclName`，**默认选项下触发** |
+
+lldb 确认崩在打印阶段而非解析阶段（`arithmetic overflow` at `NodePrinter.swift:378`）。
+
+**这一条与整数陷阱族的其余成员属于不同的严重度类别**：`print(using:)` 是公开且
+**不抛错**的，没有错误通道，所以修法不能是 `require`，只能回绕并**记日志**——静默回绕
+会打出一个看起来正常的 `#0`，畸形符号不留任何痕迹。日志经 `DemanglingLogging` 协议
+（`@Loggable`）落到 `com.mx-iris.swift-demangling:Diagnostics`，带上是哪一种节点溢出的。
+
+**两道现有防线都看不见它**：源码扫描只读 `Demangler.swift`；行为 exit 测试只调
+`demangleAsNode`，从不打印。两处都已扩容。
+
+## 元教训：写对了特征，然后把它实现窄了
+
+第一轮已经诊断出「整数陷阱族反复露头，是因为每次只圈定表面特征」，并在
+`DefectRegressionTests` 的文档注释里写下了**正确**的排查特征：
+
+> 任何吃 `conditionalInt()`/`readInt()` 结果的算术
+
+这句话是对的。问题出在**从它构建出来的产物**——那份 `forbiddenSpellings` 列表：
+
+1. 只编码了**递增**方向（`+ 1` / `Int(`），没有任何减法；
+2. 只扫**一个文件**（`Demangler.swift`）。
+
+第五轮找到的东西正好落在这两个收窄的交集之外：五处减法（`demangleIndex() - 1` ×3、
+`index - 2`、`readScalar().value - '0'` ×2）不是递增形状，F16 不在 `Demangler.swift`。
+
+**教训不是「再补几个字面量」**——黑名单本质上挡不住变量中转和 `$0` 闭包（F16 的
+`.map { $0 + 1 }` 就是这么躲过去的）。真正的防线是**行为测试**：本轮把全部触发串做成
+了 exit 测试，扫描降级为廉价的辅助。扫描本身也已解除两处收窄，并加了一条「扫到的文件
+数必须等于预期」的自检——一个悄悄找不到输入的扫描会永远报「干净」。
+
+## 本轮修复落地
+
+| 条目 | 修法 |
+|---|---|
+| punycode 越界读 | `decodePunycode` 内层循环读取前加边界 guard；前进处冗余判断删除 |
+| F16 printer 溢出 | 六处经 `displayDiscriminator(_:of:)` 收敛，饱和时回绕并记 os_log |
+| 六处解析陷阱 | 先定界再算术；三处 builtin size 与两处 pass ID 各抽成一个 helper |
+| `$sA$` 死循环 | 恢复上游的 `if (RepeatCount < 0) return nullptr` 语义；同时把边界从 `maxRepeatCount` 放宽到 `Int.max`，还原上游在 `A<N>_` 路径上的行为 |
+| 恒真断言 ×2 | 删除（两个入口共享实现，结构上不可能单边失败），不可达分支改 `Issue.record` |
+| `RetainCountVerification` 的 `try?` | 读取失败改为退出，不再静默回退内置语料 |
+| `malloc_logger` 配对 | 加嵌套深度计数 + 保存槽改 `_Atomic` |
+| F14 `print` 遮蔽 | 新增 `runPrintWalk(using:)` 协议**要求**，`print(using:)` 转发过去；`NodeReference` 改为覆写钩子 |
+| `GrowableStoreBuffer` | 文档如实化；`append(contentsOf:)` 加非重叠 `precondition` |
+
+**验证**：每条修复红态先失败（未修时 SIGTRAP / 挂死 / 断言不成立），修后全绿；
+完整套件 532 tests / 36 suites 通过；83 万条 ASCII 穷举语料 + 32 万条数字边界定向语料
++ 1068 条非 ASCII 差分语料重扫，无残余 trap/hang；打印吞吐无可测变化（中位数 +0.19%，
+机器自身波动 9.4%）。
+
+**归属**：本轮全部缺陷在 `main` 上同样存在，无一由本 PR 引入。711 条问题输入在 `main`
+上复跑，无一幸免。
+
+---
+
+# 第三轮：交叉复核与防线重构（2026-08-14）
+
+第二轮的 15 条发现被交给另一个会话独立复核（它自建 PR head / main 两份 worktree，用
+消费者包逐 case 实测退出码）。那一轮的**四处崩溃全部被独立证实**，同时**推翻了本方的
+五条判断**。随后按复核结论落地修复，并重建了防线——重建当天就找出两处前六轮全漏的崩溃。
+
+## 落地的修复
+
+**A 组（`ffd6f87`）：四处从公开 API 可达的进程崩溃 + 一次横向排查**
+
+| 位置 | 缺陷 | 触发 |
+|---|---|---|
+| `Demangler.swift:315` | `repeatCount + 27` 溢出（上一轮只挡住了窄化，没挡加法） | `$sA9223372036854775807_` |
+| `Punycode.swift` 四处 | `&+`/`&*` 回绕致负数组下标 | `$s0022ab_bbZZZZZZZZZZZZZZZZa` |
+| `NodePrinter.swift:1514/2188` | `UInt8(index)` 窄化，而 `print(using:)` 不可抛错 | `Node.create(kind: .differentiableFunctionType, index: 300)` |
+| `Remangler.swift` 四处 | `UInt32(index)` 窄化，而 `mangleAsString` 是 typed-throws | index > UInt32.max |
+| `TypeDecoder.swift` 七处 | 同族窄化（横向排查，review 未点名） | — |
+
+修 punycode 的累加同时消掉了 `delta == -38` 的除零路径：`i` 从此单调不减，`delta` 不再为负。
+
+**B 组（`6b19334`）：九项顺手修**
+
+capacity-0 代的恒真 precondition、`NodeIndex` 依赖构建配置的 `Hashable`、静态
+`rawChildIndex` 的边界检查（收敛 N13）、`UnretainedNodeReference` 继承的挂起式
+`runPrintWalk`、Swift 3 恒假分支、`peek` 的下界守卫、采样器的重叠窗口、
+`textUTF8Span` 的双次 view 解析、以及一条描述错误机制的注释。
+
+## 防线重构：从「枚举坏拼写」换成「枚举输入空间」
+
+第二轮留下一个尖锐事实：新加的禁用写法扫描**对当轮修的四处崩溃一处都看不见**，而那四个
+文件里有四个全在它的 `scannedFileNames` 清单里，扫描照样全绿。原因是黑名单只能匹配字面
+子串，看不见经变量中转的操作数——而四处缺陷全是这种。
+
+三项改造：
+
+1. **扫描域改为遍历整个 `Sources`。** 原先的手工文件清单，其自检只在**已登记**文件被
+   改名时报警，永远发现不了「本该登记却没登记」——`TypeDecoder.swift` 和
+   `Extensions.swift` 因此永久不可见。
+2. **新增 wrapping 运算符审计扫描。** 全库 12 处 `&+`/`&-`/`&*` 全部合法（hash 混合、
+   开放寻址探测、负载因子、刻意与上游对齐的解析回绕），但它们和 punycode 那处出事的写法
+   **长得一模一样**。现在每处必须在相邻行写明为什么回绕是正确的，新增的一处不写就红。
+   *刻意没有*扩展到窄化转换：全库 136 处，绝大多数安全且乏味，逐个要求注释只会产生被
+   橡皮图章盖过去的噪声。
+3. **新增两个边界值矩阵**（真正的防线）：
+   - `everyKindSurvivesBoundaryIndicesThroughEveryConsumer`：枚举
+     `Node.Kind.allCases` × 11 个整数边界 × {`print` ×2 档、`mangleAsString`、
+     `canMangle`}，每个节点还额外裸测与包进 `.type`/`.functionType`/`.tuple` 各测一遍
+     （第二处可微分性 trap 只在 `.functionType` 里才可达）。**靠 `allCases` 自动枚举，
+     以后新增的 kind 当天就被覆盖，没有需要手工登记的清单。**
+   - `boundaryNumbersInMangledShapesNeverTrap`：把边界数字代进 10 种真实符号形状，
+     **demangle 成功后继续 print + remangle**——本轮四处缺陷有两处就在成功 demangle 的
+     下游，止步于「能不能 demangle」的矩阵会对它们报绿。
+
+## 矩阵当场找到的两处新缺陷（前六轮全漏）
+
+**其一：`printAutoDiffSubsetParametersThunk` 的负长度 `prefix`。**
+`lastIndex = children.count - 1`，节点无子节点时为 -1，`currentIndex = lastIndex - 4`
+即 -5，`children.prefix(-5)` 直接 trap
+（`Fatal error: Can't take a prefix of negative length`）。上游只从 demangler 构造的树
+进入这个打印器，那种树必然带齐四个尾部子节点；公开构造面没有这个保证。已改为
+`currentIndex > 0` 才走 prefix 分支。
+
+**其二：`Remangler` 用 `assert` 校验输入树形状。**
+`mangleDependentGenericParamValueMarker` 的三条 `assert` 在 Debug 下 trap、Release 下
+消失——而它们消失之后，下面的 `node[_child: 1]` 会越界读。`mangleAsString` 是公开
+typed-throws API，契约是把畸形树变成 `ManglingError`，`assert` 是错误的工具。已改为
+`guard` + `throw`。
+
+同族横向排查后区分两类：**校验输入树形状**的 assert（`assert(node.text != nil)` 三处、
+`assert(enumNode.kind == .enum)` 一处）全部移除——它们下方本来就有完整的 throw 路径或
+条件分支，assert 只是额外加了一个 Debug 期的 trap；**校验 remangler 自身内部不变量**的
+assert（substitution 合并的 buffer 状态等 11 处）保留不动，那是 assert 的正确用途。
+
+## 元教训：换工具类别，而不是把同一个工具做得更细
+
+前五轮每一次都在同一个工具上加东西——往黑名单加拼写、往文件清单加文件。第二轮的复核
+一针见血：这条防线**结构上**看不见「操作数经变量中转」这一整类，加多少条目都不改变这一点。
+
+这一轮换了类别：黑名单枚举的是**已知的坏写法**，只能钉住见过的；矩阵枚举的是**输入空间**，
+能找出没见过的。区别当场兑现——矩阵上线第一次运行就抓出两处崩溃，其中一处的机制
+（负长度 `prefix`）和前五轮追的整数窄化家族根本不是一回事，任何形式的拼写黑名单都不可能
+看见它。
+
+黑名单降级为「已修拼写的回归钉」保留，这是它唯一称职的角色。
+
+---
+
+# 第三轮（`max` 档全量复审，2026-08-16）
+
+## 元信息
+
+| 项 | 值 |
+|---|---|
+| 审查目标 | PR #7 `feature/node-store` @ `2624d14` |
+| 对比基线 | `next` @ `04c959b` |
+| 审查日期 | 2026-08-15 |
+| 复审 | 同仓库第二个 agent 会话独立复核（自建 head/base 只读 worktree、无执行证据条目自建 release 探针、上游 `swift-demangle` 对拍、git 考古） |
+| 结论 | 15 条主发现**无一误报**；复审推翻本轮 1 条重提、订正 2 条新旧定性、加强 1 条 |
+
+## 复审订正的三处（记录以免再犯）
+
+1. **两条的新旧定性反了**：`PhysicalFootprintSampler.swift` 与 `CMallocCounter.c`
+   在 `next` 上**不存在**（`git ls-tree` 为空），是 PR 新引入，初审记成了旧账。
+2. **`stripManglePrefix` 重提不成立**：见 [KnownIssues N14](KnownIssues.md) 的
+   2026-08-16 段。初审只读了 N14 第一段，漏了第二段已对该行为本身做过知情 won't-fix。
+3. **一处连带影响点名错**：`NodeStoreTests.storeBackedPrintingDoesNotPopulateTheGlobalCache`
+   自带防碰撞设计（唯一模块名探针、不断言 cache count），不受全局缓存被撑大的影响；
+   泛化结论仍成立但受害者不是它。量级也偏高：进缓存的只有叶子，实测唯一节点平铺
+   8.75 MB，对象化后是几十 MB 而非「几百 MB」。
+
+## 处置索引
+
+**已修（本批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| 1 | `Remangler.getChildOfType` 用 `assert` 校验输入树后无条件读 `children[0]`；release 下 assert 消失、下标 trap，从公共 `canMangle` 杀掉进程（exit 133） | `DefectRegressionTests.remanglingAChildlessTypeWrapperFailsInsteadOfTrapping` |
+| 2 | `printSpecializationPrefix` 的访问计数在 `if` 之外自增，而读 latch 的只有 `if` 内分支；`.default` 下计数照动，`printName` 的缓存写入守卫对该节点及全部祖先失败 | `DefectRegressionTests.aSpecializationNodeDoesNotDisableTheFragmentCache` |
+| 3 | 打印深度守卫 `>` 改写成 `<` 少一层（769 而非 770 帧截断），与上游及基线不一致 | `DefectRegressionTests.theDeepestFullyPrintedChainMatchesTheDocumentedBudget`（release-only，见 #4） |
+| 4 | `conditionalInt` 环绕累加把溢出数字串当合法值接受；上游对拍证伪「与上游对齐」的辩护 | `DefectRegressionTests.anOverflowingDigitRunIsRejectedRatherThanWrapped`；[KnownIssues #1](KnownIssues.md) 已更新 |
+| 5（一半） | `" in "` / `" of "` 分隔词继承外层 nominal 的 scope（归属颠倒） | `NodePrinterScopeTests.contextSeparatorsCarryNoTypeReferenceScope` |
+| 6 | `.otherNominalType` 走相同 `printEntity` 调用却不 push scope | `NodePrinterScopeTests.otherNominalTypeGetsTheSameScopeAsOtherNominals` |
+| 7 | 验收测试基线用 `internsSubtrees: false` 却仍把全语料叶子钉进 `NodeCache.shared`；改用 `demangleAsNodeTransient`（附带：该套件耗时 471s → 308s） | 无（行为修正，由既有套件覆盖） |
+| 8 | `Node.create` / `NodeCache.intern` 的 `text`+`children` 组合静默丢弃 contents，且 intern 键把不同 text 的请求合并成同一实例 | 编译期——不可能的重载已删除，非法组合无法拼写 |
+| 9 | 提案总验收里构造上恒真的断言（同族此前已删过两次，独漏这处）；改为 `Issue.record` | 无（断言本身即产物） |
+| 10 | 三处文档声称「公共 API 零破坏」，与三处刻意破坏矛盾 | 无（文档）；见 [NodeStoreArena.md](NodeStoreArena.md) 源码兼容性一节 |
+| 11 | `PhysicalFootprintSampler` 用 `Thread.start()`（失败静默）+ `stop()` 无限等信号量；四个调用点无 `defer` 配对 | 改用带检查的 `pthread_create`；调用点加 `defer` |
+| 12 | `CMallocCounter` 不平衡 `stop()` 的回滚使深度瞬时为负，并发 `start()` 误判嵌套 | `MallocCounterConcurrencyTests`（env-gated）；见下「无法测试的部分」 |
+| 13 | `reserveCapacity` 的 2^30 钳制注释不实（trap 只是换了地方） | 无（注释如实化）；真修法进 0012 |
+| 小 | 验收测试的墙钟比值断言放在非 `.serialized` 常开套件 | 改为打印提示 |
+| 小 | `internTree` 的 per-walk memo 漏了叶子分支 | 无（有界代价，一行） |
+| 小 | `hasChildren` 在 `Node` 上走 `!children.isEmpty`，每次调用重建 `Children` 并 retain | `DefectRegressionTests.hasChildrenAgreesWithTheChildCount` |
+
+**转入提案**：条目 5 的另一半（scope 与 printCache 不组合）、通用遍历 API 的视图钉扎、
+scope hook 从 kind 清单改为挂机制、`reserveCapacity` 按字节预算封顶、重复代码收敛
+（含 N13 的合格关闭）——全部进
+[`Evolutions/0012`](../Evolutions/0012-review-round-three-structural-followups.md)。
+
+**转入 KnownIssues**：N14 维持原判并补记（重提不成立）；N13 重开为「限期收敛」（上次
+关闭方式不满足其自订标准）；#1 的字符串级可达链已切断，条目降级不关闭。
+
+## 本轮的两个方法论产物
+
+**其一：把修复逐条回退，确认测试真的会红。** 四条修复回退后，四个新测试全部按预测
+失败，且失败值与预测一致（缓存那条：131072 次写 = 2^16 × 2，正是按路径计价的数）。
+写了测试不等于测住了——只有见过它红，才知道它盯的是什么。`getChildOfType` 那条是反
+例：回退后的行为是**进程 trap**，会杀掉测试进程而不是报失败，这恰恰是它必须改成
+throw 的理由。
+
+**其二：写测试的过程本身找出了一条新缺陷。** 为 `CMallocCounter` 写并发测试时，测试
+在**修复到位的情况下仍然失败**——查明原因不是修复没生效，而是深度计数器有一个更大的
+设计缺口：一个多余的 `stop()` 撞上别人正开着的窗口时（depth == 1），会走
+`previous_depth == 1` 分支**把别人的 hook 摘掉**，修复前后行为完全相同，因为深度计数
+器区分不了「谁的 stop」。关闭它需要窗口所有权（`start()` 发 token、`stop()` 出示），
+不是更好的计数器。当前 `ExclusiveMeasurementWindow` 用一把锁串行化所有窗口使其不可
+达，属对未来调用方的潜在风险，已记在 `MallocCounterConcurrencyTests` 的文件注释里。
+
+## 无法测试的部分（如实登记）
+
+- **finding 12 的竞态本身**：需要让 `start()` 停在不平衡 `stop()` 的两条指令之间，没有
+  这个 seam；采样深度也看不见这么窄的窗口。修复站在构造上（只减正值的 CAS 永不为负），
+  不站在复现上。
+- **finding 3 的深度边界**：debug 构建约 745 帧就爆栈（KnownIssues #4），768 的边界只能
+  在 release 测试构建里跑。测试用 `#if DEBUG` 跳过，`swift test -c release` 时生效。
+
+---
+
+# 第四轮（`max` 档全量复审，2026-08-16）
+
+## 元信息
+
+| 项 | 值 |
+|---|---|
+| 审查目标 | PR #7 `feature/node-store` @ `7eb903a` |
+| 对比基线 | `next` @ `04c959b` |
+| 审查日期 | 2026-08-16 |
+| 复审 | 同仓库第二个 agent 会话独立复核（双侧 `git show` 逐字节比对、上游 `swiftlang/swift` 源码对拍、两个下游仓库实现核查） |
+| 结论 | 15 条主发现无一误报；复审推翻 1 条定性、修正 1 条受害者、重写 1 条第四问 |
+
+## 前置：上一轮的探针跑在了旧代码上
+
+第三轮遗留的 `pr7head` 只读 worktree 停在 `2624d14`，而那正是第三轮的**审查目标**——
+其后的 11 个 commit（`680f8f9` … `7eb903a`）是第三轮的修复成果。本轮 review 读的是新代码
+（引用了 `badb778` / `eff0716` / `5116786` 的内容），**执行探针用的却是那个旧 worktree**。
+本轮全部 15 条已在 `7eb903a` 上逐条重新核对代码，并在 `7eb903a` 与 `04c959b` 各建 worktree +
+probe package 实跑取证。结论未变，但**复用上一轮的 worktree 跑新一轮的探针是个必须避免的坑**：
+它产生的证据看起来完全正常。
+
+## 复审订正的三处（记录以免再犯）
+
+1. **F4 的新旧定性两边都不对**。`UnicodeScalar(_: UInt32)` 是**失败初始化器**，对 surrogate
+   区（0xD800–0xDFFF）与 >0x10FFFF 返回 `nil`，所以 `next` 上 `if let scalar = UnicodeScalar(UInt32(index))`
+   在这些窗口**本来就静默丢标记**；只有 index > `UInt32.max` 才会被 `UInt32(index)` 的窄化 trap。
+   `ffd6f87` 做的是把 >`UInt32.max` 那个窗口从崩溃**并入既有的静默通道**——是扩大触发窗口，
+   既不是「本 PR 引入静默损坏」，也不是「与基线完全相同」。实测（HEAD）：index 取
+   `0xd800` / `0xdfff` / `0x110000` / `0x100000000` 一律得到 `"Yj"` 且 `canMangle` 为 `true`，
+   而正确输出是 `"Yjf"`。
+2. **F8 的受害者判反了**。原判为「下游 `SemanticString` 会打错」，实测相反：printer 对
+   `target.count` 的两处用法（`NodePrinter.swift:1961/1963`、`1990/2007`）都是**增量探针**
+   （`let currentPos = target.count … if target.count != currentPos`），从不做算术、不用绝对值，
+   所需契约仅为「非空写入必使 count 变化」。`SemanticString` 满足它（`SemanticString+Mutation.swift:42`
+   的 `appendAtomElement` 空串直接 `return`，非空必 append ≥1 atom）；**违反契约的是 `String`**：
+   buffer 已以 `.` 结尾时写入组合符 U+0301 会并入前一个字素簇，`String.count` 增量为 0，探针
+   遂跳过分隔符。三目标对拍同一棵以组合符命名的构造器树：
+   `String` → `"Mod.́init() -> Swift.Int"`（少一个 `.`），字节计数目标与 token 计数目标均为
+   `"Mod.́.init() -> Swift.Int"`。**但「构造不出触发场景」的反驳同样不成立**——分歧是实测出来的，
+   只是触发面窄（Swift 标识符不能以组合符开头，非 ASCII 标识符走 punycode 因而是 ASCII），
+   够不上合并阻断。
+   **定性随之改变，修法也要跟着改**：受害者既然是 `String`，这就是核心库自身在**默认 target**
+   上的缺陷——以组合符起首的 identifier 会吞掉限定名的分隔点——而不再只是「下游 rich target
+   的契约风险」。所以后续按「printer 自维护写入计数器」修时，回归测试应当建在本仓库的
+   `String` 路径上，不要等下游来发现。
+3. **F9 的第四问要重写**：死分支是**上游同款**，见 [KnownIssues #1](KnownIssues.md) 的
+   2026-08-16 补充段。连带否掉「五处 `return` 应为 `continue`」的子发现。
+
+## 处置索引
+
+**已修（本批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| F3 | 本轮**唯一的新回归**：0008 把 demangler 的标识符长度前缀改为按字节读，remangler 仍按字素簇写，`mangleAsString(_:usePunycode: false)` 产出本库自己 demangle 不回来的串 | `DefectRegressionTests.nonPunycodeManglingRoundTripsForNonASCIIIdentifiers` |
+| F1 | `mangleDependentGenericInverseConformanceRequirement` 用 `!` 读 child 1 的 index，从公开 `canMangle` 杀进程（exit 133）；`try?` 拦不住 trap | `DefectRegressionTests.inverseConformanceWithoutAnIndexThrowsInsteadOfTrapping` |
+| F1-附 | 同一函数：上游 `case -1` 以 `return ...; // substitution` 结束，本库漏了该 `return`，substitution 分支把 index mangle 了两遍（`3ModRI2_` 写成 `3ModRI2_2_`）。**预存缺陷，非 15 条之一**，对照上游时浮出 | `DefectRegressionTests.inverseConformanceSubstitutionBranchEmitsItsIndexOnce` |
+| F2 | `mangleDependentConformanceIndex` 的 `node.index! + 2` 无溢出守卫，近 `UInt64.max` 的 index 从 `mangleAsString` 与 `canMangle` 双双杀进程 | `DefectRegressionTests.conformanceIndexNearUInt64MaxThrowsInsteadOfTrapping` |
+| F5 | `Node.indexAsCharacter` 在公开**非抛出**访问器上用 trapping 的 `UInt32(_:)` 窄化 | `DefectRegressionTests.indexAsCharacterAboveUInt32MaxIsNilInsteadOfTrapping` |
+| F15 | 双路径 parity 套件无可用性守卫，在 macOS 26 以下整体退化为 legacy-vs-legacy 恒真通过，零信号 | `DualPathParityTests.dualPathParityCoversTheModernLeg` |
+
+**已修（第二批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| F6 | 五个公开工厂 + 两个 SPI + 两个内部 `createInterned` 仍能同传 contents 与 children，contents 被静默丢弃并经 intern key 合并不同请求 —— 而 `Node+Init.swift` 的注释已宣称该组合「无法拼写」 | `DefectRegressionTests.nodeFactoriesCannotSpellContentsWithChildren`（源码扫描，已验证能抓到违规） |
+| F10 | `hasChildren` 是扩展成员而非协议要求，`Node` 的 payload-tag 覆写在泛型上下文从不派发，整个优化空转 | `DefectRegressionTests.hasChildrenDispatchesThroughTheWitnessTable` |
+| F4 | 可微分标记的收窄无 `else`，产出缺载荷的合法前缀且 `canMangle` 报 `true` | `DefectRegressionTests.differentiabilityMarkersRejectUnrepresentableIndices` |
+| F8 | `NodePrinterTarget.count` 无契约，`String` 违反增量探针语义，组合符起首的 identifier 吞掉限定名分隔点 | `DefectRegressionTests.combiningMarkIdentifiersKeepTheirQualifiedNameSeparator` + `targetsWithDifferentUnitCountsPrintIdenticalText` |
+| F11 | async `runPrintWalk` 的 printer 声明在 `withUnsafePointer` 之外，`printCache` 的 key 指向已退出的栈槽 | 无（见「无法测试的部分」） |
+
+**已修（第三批）**：
+
+| 发现 | 一句话 | 回归测试 |
+|---|---|---|
+| F7 | `printGenericSignature` 的 marker 扫描窗口写成 `[n, n + firstRequirement)`，而 `firstRequirement` 是绝对索引，上游窗口是 `[numGenericParams, firstRequirement)`；requirement 之间的 marker 因此泄漏进参数列表 | `DefectRegressionTests.genericSignatureMarkerScanStopsAtTheFirstRequirement` + `…ValueMarkerScanStops…` |
+| F13 | `popTypeReferenceScope()` 保留 no-op 默认实现，实现了 push 却忘记 pop 的 target 静默继承它 | 无回归测试（编译期保证）；改成要求后库内当场暴露两个只写了 push 的测试 target |
+| F14 | `demangleAsNode` 的文档仍建议用 `internsSubtrees: false` 来「避免撑大缓存」，而该开关只跳过整树 hash-consing，叶子 interning 走另一个入口不暴露的开关 | 无（纯文档） |
+
+**F7 的窗口分析**（写下来是因为构造复现用例时不直观）：过宽的窗口多出的部分是
+`[firstRequirement, numGenericParams + firstRequirement)`。而 `children[firstRequirement]`
+按定义**不是** marker（正是它终止了前导扫描），所以**只有一个泛型参数深度时永远不会泄漏** ——
+复现用例必须有至少两个 `dependentGenericParamCount`。第一版 value-marker 用例就是因为只用了
+一个深度而红错了原因，改成两个深度后才真正打出泄漏的 `let B: Swift.Int`。
+
+**不作为缺陷修**：F9 → [KnownIssues #1](KnownIssues.md)；**F12 → [KnownIssues N18](KnownIssues.md)**。
+
+### F12 的重新裁决（原判为「F6 的同根」，不成立）
+
+F12 被归类为「contents/children 互斥问题经 demangler 到达」。查上游后两个前提都不成立：
+
+- **上游 `Demangle::Node` 的 payload 同样是互斥 union**，本库的 `Payload` 是忠实移植，
+  不是本库的发明，所以这不是「移植时引入的设计缺陷」。
+- **上游已经完全移除了 unique ID 的解析**（`demangleSpecAttributes(Node::Kind)` 没有
+  `demangleUniqueID` 参数，`Demangler.cpp` 里 `UniqueID` 零命中），而上游 Remangler 里对应的
+  重新发射分支**同样是死代码**（`addChild` 之后 `hasIndex()` 必为 false）。上游自身即不对称。
+
+删除本库的解析反而会改变消费的字节数，而实测本库与 `swift-demangle` 对 `Tf` 符号的接受/拒绝
+完全一致（含 pass ID 后跟数字的构造，两侧都拒绝）。因此只把「解析后丢弃」写成显式的
+`_ = try demangleNatural()` 并附理由，不改变行为。详见 KnownIssues N18。
+
+### F8 的修法：给探针一个有契约的成员
+
+`NodePrinterTarget.count` 换成 `writtenUnitCount`，契约写进文档：**非空 `write` 必须改变它**。
+printer 的四处探针随之改名，`String` 的 conformance 用 `utf8.count`。
+
+没有采用「printer 自维护写入计数器」那条路：它要改 334 个 `target.write` 调用点，而这条缺陷
+真实 Swift 符号触发不了（标识符不能以组合符开头，非 ASCII 走 punycode）。334 处机械替换的
+风险高于收益。换成协议成员只动了协议、`String` conformance、四处探针和四个测试 target —— 而且
+后者是编译错误暴露出来的，正是「删掉默认实现让遗漏变成编译错误」的既定取舍在起作用。
+
+新增 `targetsWithDifferentUnitCountsPrintIdenticalText`：一个 token 计数的 target（下游
+`SemanticString` 的形状）必须与 `String` 打印出逐字节相同的文本 —— 这正是契约存在的目的，
+而任何只在 `String` 上跑的测试都验证不到。
+
+## F3 的修法：buffer 整体字节化
+
+`Remangler.buffer` 由 `String` 改为 `[UInt8]`，与上游 `Mangler` 的 `SmallString` 语义对齐。
+这不是「把长度前缀改成字节数」能了结的局部改动——`mangleIdentifier` 的 `pos`、
+`SubstitutionWord.start`/`.length`、`WordReplacement.stringPos`、`SubstitutionMerging` 的
+`lastSubstPosition`/`lastSubstSize` 共用同一套位置语义，只改一处会留下字节/字素簇混用，
+把一个清楚的缺陷换成一个隐蔽的。同批新增 `UInt8` 版的 `isDigit` / `isUpperLetter` /
+`isWordStart` / `isWordEnd`：上游的扫描跑在 `char` 上，多字节标量对它就是几个互不相同的
+字符，且没有一个是数字、`_`、NUL 或大写字母——字节版在 `UInt8` 上重现了这一点
+（>= 0x80 的字节对每个范围判定都为假，与上游的负 `char` 一致）。
+
+**ASCII 输出逐字节不变**是这次改动的安全网：现有 552 个测试全部通过，加真实 dyld cache
+符号语料的 remangle / print parity sweep（`DEMANGLING_PRINT_PARITY=1`，release）。
+
+**顺带修掉一个基线上的角落**：`next` 上 remangler 写字素簇数、0008 之前的 demangler 读
+scalar 数，两者对 NFC 的 `café` 恰好相等（1 scalar = 1 字素簇），对 **NFD** 的 `café`
+（`e` + U+0301）则不等。所以「`next` 上能往返」只对 NFC 成立；本 PR 把错配从「非 NFC 才
+触发」扩大到「所有非 ASCII」。回归测试同时覆盖 NFC、NFD 与纯多字节标识符。
+
+## 元教训：横向排查扫的是「拼写」，不是「同一类问题」
+
+15 条里 6 条的第四问答案是「前次修复漏网或声称关闭实未关闭」，且集中在同一个动作上：
+
+- **F5** —— `ffd6f87`（"close the four public-API paths that trap on overflow"）改的正是
+  `UnicodeScalar(UInt32(index))` 这个**一模一样的表达式**，改了 Remangler ×4、TypeDecoder ×3、
+  NodePrinter ×2、Punycode，唯独漏了 `Node+Conversions.swift`。
+- **F1** —— `680f8f9` 修的是同一根因（校验后无条件读子节点），commit message 自述「An earlier
+  round removed the assert-then-read pattern elsewhere in this file」，扫的是 `assert`-then-read
+  这个**拼写**，`index!` 强解包的拼写没扫。
+- **F6** —— `eff0716` 的 commit message 正确描述了根因（"Every factory that accepted both"），
+  实际只删了 `text:+children:` / `index:+children:` 系列，主力的 `contents:+children:` 一个没删，
+  而 `Node+Init.swift` 的注释断言「the invalid combination cannot be spelled」。
+- **F10** —— `db3c604`（8/13）"route print(using:) through a real protocol requirement" 修的是
+  「extension 成员不是协议要求所以泛型上下文不派发」；`badb778`（8/16）在**同一个
+  `DemanglingNode` 协议**上又踩一次。三天内重犯。
+- **F4** —— 同一 commit 内修复方式不一致（两处 `guard...throw`、两处 `if let` 无 `else`）。
+- **F14** —— `5116786` 修了 README 与测试注释，漏了消费者实际会读的 API doc。
+
+本轮的横向排查按「失效模型」而非「写法」重扫，结果反而干净：节点载荷强解包全库只剩
+F1/F2 两处；未守护的索引算术只有 F2；trapping 窄化里作用于**解析产生的 `UInt64`** 的只有
+F5 一处（`Punycode.swift:30/87` 有 `if value < 0x80` 前置守卫；`TypeDecoder+Types.swift:329`
+的 `UInt32(count)` 是 builder 侧参数量，另一种失效模型；`Store/*` 的 `UInt32(nodes.count)`
+是 arena 4G 容量上限，同样另论）。后两类不并入本批，以免回归测试失去焦点。
+
+## 无法测试的部分（如实登记）
+
+- **F15 自身**：它防的是「在旧 OS 上空转通过」，而开发机是 macOS 26，无法直接演示先红。
+  改用两个模拟验证：把 `#available` 的版本临时改为 99.0 → 退出码 1 并 record issue；
+  设 `DEMANGLING_FORCE_LEGACY_PATH=1` → 退出码 0（该路径是有意的 CI 双跑，不应报错）。
+  验证后已还原版本号。
+- **F11（async walk 的 printer 生命周期）**：当前**没有**可观测的失败。`printCache` 的 key 是
+  POD，字典析构不解引用其中的指针，所以栈槽退出后也读不到坏数据。构造一个会真正读到已释放
+  栈的场景需要让 printer 在 `withUnsafePointer` 返回后再被使用，而修复恰恰是让它不可能被这样
+  使用。修复站在**构造**上（与同步版对齐、生命周期由词法作用域保证），不站在复现上 —— 与
+  第三轮 finding 12 的处理相同。
+- **F13（`popTypeReferenceScope` 失去默认实现）**：同样是编译期保证，没有运行时回归测试。
+  值得记的是它**当场就抓到了东西** —— 库内两个测试 target（`ContextRecordingTarget`、
+  `WriteCountingTarget`）都实现了 `push` 而没有 `pop`，一直静默继承 no-op。它们不记录
+  scope 所以无害，但正说明这个遗漏有多容易发生：上一轮保留默认实现的论证（「不带参数，
+  没有 near-miss witness 可吸收」）本身没错，只是没覆盖「配对要求」这一面。
+- **F14**：纯文档改动，无测试。
+- **F6 的编译期性质**：「无效组合无法拼写」是编译期保证，运行时测不到。守卫是源码扫描
+  （`nodeFactoriesCannotSpellContentsWithChildren`），且已实测：临时把 `contents:` 加回主力
+  重载后该测试退出码为 1 并点名违规行。扫描对「经中间层洗过的调用」失明，但这一类的入口
+  （`Node.init`）本就是 `mergedPayload` 存在的理由，不在守卫范围内 —— 与 N1 的
+  拼写守卫/行为守卫互补关系相同。
