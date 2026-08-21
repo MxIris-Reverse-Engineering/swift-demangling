@@ -13,13 +13,20 @@ import Testing
 struct LargeStackThreadPoolTests {
     static let cooperativeWorkerStackSize = 512 * 1024
 
-    static func runOnThread(stackSize: Int, _ body: @escaping @Sendable () -> Void) {
+    static func runOnThread(
+        stackSize: Int,
+        qualityOfService: QualityOfService? = nil,
+        _ body: @escaping @Sendable () -> Void
+    ) {
         let semaphore = DispatchSemaphore(value: 0)
         let thread = Thread {
             body()
             semaphore.signal()
         }
         thread.stackSize = stackSize
+        if let qualityOfService {
+            thread.qualityOfService = qualityOfService
+        }
         thread.start()
         semaphore.wait()
     }
@@ -201,6 +208,44 @@ struct LargeStackThreadPoolTests {
 
         #expect(box.bodyThread != box.callerThread, "a 512KB caller must hop")
         #expect(box.bodyStackSize >= StackSafeExecutor.largeStackThreadSize)
+    }
+
+    /// Work must run at the QOS class of the thread that submitted it.
+    ///
+    /// Neither wait in the hop can inherit priority — the submitter blocks on
+    /// a semaphore, which donates nothing, and the worker parks on a condition
+    /// variable, which cannot know its future signaller — so the pool keeps
+    /// the ranking right by construction: each submission carries
+    /// `qos_class_self()` and the worker (or dedicated fallback thread) adopts
+    /// it for the run. Before this, workers ran at a fixed user-initiated
+    /// class: a user-interactive caller waited on a lower-priority thread, and
+    /// the idle park outranked utility submitters — the priority inversion the
+    /// Thread Performance Checker reported at the condition wait.
+    ///
+    /// The two submissions run back to back so the second typically reuses
+    /// the first's worker, covering re-ranking in the raising direction.
+    @Test func workRunsAtTheSubmittersQualityOfServiceClass() {
+        final class ObservationBox: @unchecked Sendable {
+            var utilityRunClass = QOS_CLASS_UNSPECIFIED
+            var userInteractiveRunClass = QOS_CLASS_UNSPECIFIED
+        }
+        let box = ObservationBox()
+
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize, qualityOfService: .utility) {
+            _ = StackSafeExecutor.execute { () -> String in
+                box.utilityRunClass = qos_class_self()
+                return ""
+            }
+        }
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize, qualityOfService: .userInteractive) {
+            _ = StackSafeExecutor.execute { () -> String in
+                box.userInteractiveRunClass = qos_class_self()
+                return ""
+            }
+        }
+
+        #expect(box.utilityRunClass == QOS_CLASS_UTILITY)
+        #expect(box.userInteractiveRunClass == QOS_CLASS_USER_INTERACTIVE)
     }
 
     /// When the OS refuses to create any worker, no submitter may hang.

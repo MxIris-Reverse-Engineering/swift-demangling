@@ -222,7 +222,12 @@ public enum StackSafeExecutor {
         else {
             return false
         }
-        _ = pthread_attr_set_qos_class_np(&threadAttributes, QOS_CLASS_USER_INITIATED, 0)
+        // The thread exists to run one item for this caller — usually a caller
+        // that is about to block on it across a semaphore, which donates no
+        // priority — so it adopts the caller's QOS class rather than a fixed
+        // one: a fixed class below the caller's would be a priority inversion
+        // at the caller's wait.
+        _ = pthread_attr_set_qos_class_np(&threadAttributes, resolvedSubmitterQualityOfService(), 0)
 
         let context = Unmanaged.passRetained(DedicatedThreadContext(work: work)).toOpaque()
         var threadHandle: pthread_t?
@@ -245,6 +250,18 @@ public enum StackSafeExecutor {
 }
 
 #if canImport(Darwin)
+/// The calling thread's quality-of-service class, resolved to one the pthread
+/// QOS APIs accept.
+///
+/// `qos_class_self()` answers `QOS_CLASS_UNSPECIFIED` on threads outside the
+/// QOS system (opted-out legacy threads); the pthread APIs reject that value,
+/// so those callers fall back to user-initiated — the class every thread here
+/// was created with before submissions carried their own.
+private func resolvedSubmitterQualityOfService() -> qos_class_t {
+    let submitterClass = qos_class_self()
+    return submitterClass == QOS_CLASS_UNSPECIFIED ? QOS_CLASS_USER_INITIATED : submitterClass
+}
+
 /// A bounded pool of long-lived large-stack workers.
 ///
 /// Creating and joining a thread per call costs roughly 41µs measured on this
@@ -286,6 +303,16 @@ public enum StackSafeExecutor {
 ///   stack to need a hop gets a dedicated thread instead
 ///   (``StackSafeExecutor/runOnLargeStack(_:)``), because its wait could sit
 ///   behind the very item it is running.
+/// - **Work runs at its submitter's QOS class; idle workers park at
+///   background.** Neither wait involved can inherit priority — the
+///   submitter's semaphore donates nothing, and a condition variable cannot
+///   know its future signaller — so the pool keeps the ranking right by
+///   construction instead: each submission carries `qos_class_self()` and the
+///   worker adopts it for that item (a caller blocked on the item never waits
+///   on a lower-priority thread), and a worker with nothing to run drops to
+///   background before waiting (a parked worker never outranks whichever
+///   thread eventually signals it — the shape the Thread Performance Checker
+///   reports as a priority inversion at the condition wait).
 ///
 /// ### The overflow allowance
 ///
@@ -391,7 +418,21 @@ final class LargeStackThreadPool: @unchecked Sendable {
     }
 
     private let condition = NSCondition()
-    private var pendingWorkItems: [@Sendable () -> Void] = []
+
+    /// A queued closure paired with the QOS class of the thread that submitted
+    /// it. The worker that dequeues the item adopts that class for the run, so
+    /// a caller blocked on the item is never waiting on a lower-priority
+    /// thread.
+    private struct PendingWorkItem {
+        let work: @Sendable () -> Void
+        let submitterQualityOfService: qos_class_t
+
+        /// What a dequeued slot is overwritten with, so the queue drops its
+        /// reference to the executed closure (see the dequeue sites).
+        static let cleared = PendingWorkItem(work: {}, submitterQualityOfService: QOS_CLASS_DEFAULT)
+    }
+
+    private var pendingWorkItems: [PendingWorkItem] = []
     /// Index of the next item to run. Removing from the front of the array
     /// instead would memmove the whole queue while holding the lock.
     private var nextWorkItemIndex = 0
@@ -459,7 +500,9 @@ final class LargeStackThreadPool: @unchecked Sendable {
             condition.unlock()
             return false
         }
-        pendingWorkItems.append(workItem)
+        pendingWorkItems.append(
+            PendingWorkItem(work: workItem, submitterQualityOfService: resolvedSubmitterQualityOfService())
+        )
         condition.signal()
         condition.unlock()
         return true
@@ -476,15 +519,18 @@ final class LargeStackThreadPool: @unchecked Sendable {
     private func drainPendingWorkItemsWhileLocked() {
         while nextWorkItemIndex < pendingWorkItems.count {
             let workItem = pendingWorkItems[nextWorkItemIndex]
-            pendingWorkItems[nextWorkItemIndex] = {}
+            pendingWorkItems[nextWorkItemIndex] = .cleared
             nextWorkItemIndex += 1
             if nextWorkItemIndex == pendingWorkItems.count {
                 pendingWorkItems.removeAll(keepingCapacity: true)
                 nextWorkItemIndex = 0
             }
             condition.unlock()
+            // Deliberately at the drainer's own QOS class: this is a
+            // submitter's thread, not the pool's to re-rank, and the path only
+            // runs when thread creation has collapsed process-wide.
             autoreleasepool {
-                workItem()
+                workItem.work()
             }
             condition.lock()
         }
@@ -509,7 +555,10 @@ final class LargeStackThreadPool: @unchecked Sendable {
         else {
             return false
         }
-        _ = pthread_attr_set_qos_class_np(&threadAttributes, QOS_CLASS_USER_INITIATED, 0)
+        // Spawned from the submitter's thread, so this is the class of the
+        // work the new worker will most likely dequeue first; the worker loop
+        // re-ranks itself per dequeued item from then on.
+        _ = pthread_attr_set_qos_class_np(&threadAttributes, resolvedSubmitterQualityOfService(), 0)
 
         let context = Unmanaged.passRetained(self).toOpaque()
         var threadHandle: pthread_t?
@@ -532,6 +581,17 @@ final class LargeStackThreadPool: @unchecked Sendable {
         while true {
             condition.lock()
             idleWorkerCount += 1
+            if nextWorkItemIndex == pendingWorkItems.count {
+                // About to park. Drop to background first: `condition.wait()`
+                // cannot inherit priority (no condition variable can — the
+                // future signaller is unknown), so a worker parked above its
+                // eventual signaller's class is what the Thread Performance
+                // Checker reports as a priority inversion. Dequeuing work
+                // re-ranks to that item's class below. NSCondition's mutex
+                // does donate priority, so briefly holding it at background
+                // is not itself an inversion.
+                _ = pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0)
+            }
             while nextWorkItemIndex == pendingWorkItems.count {
                 condition.wait()
             }
@@ -542,7 +602,7 @@ final class LargeStackThreadPool: @unchecked Sendable {
             // sustained burst every already-executed item would otherwise stay
             // alive — each one retaining whatever its caller captured, which on
             // the print and remangle paths is a whole `Node` tree.
-            pendingWorkItems[nextWorkItemIndex] = {}
+            pendingWorkItems[nextWorkItemIndex] = .cleared
             nextWorkItemIndex += 1
             if nextWorkItemIndex == pendingWorkItems.count {
                 pendingWorkItems.removeAll(keepingCapacity: true)
@@ -550,13 +610,18 @@ final class LargeStackThreadPool: @unchecked Sendable {
             }
             condition.unlock()
 
+            // Run at the submitter's class: the submitter is typically blocked
+            // on this very item across a semaphore that donates nothing, and
+            // running below its class would be the real inversion.
+            _ = pthread_set_qos_class_self_np(workItem.submitterQualityOfService, 0)
+
             // The predecessor created a thread per call, and a thread drains
             // its own pool when it exits — so no explicit pool was needed. Long-
             // lived workers remove that drain point: without this, an
             // autoreleased object's release would move from "end of the call" to
             // "end of the process". The pool created the hazard; this closes it.
             autoreleasepool {
-                workItem()
+                workItem.work()
             }
         }
     }
