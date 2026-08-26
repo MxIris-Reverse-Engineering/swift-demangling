@@ -114,6 +114,18 @@ depth 计数器根本没机会涨。上游 C++ 有完全相同的洞，靠「调
 - **worker 上的嵌套调用**：栈还多（≥2MB）就内联跑（嵌套 demangle 的常态）；真的深到
   不足 2MB 时起一条一次性 8MB 线程，绝不向自己所在的池子回提交（那个等待可能排在它
   自己正在执行的条目后面）。
+- **QoS 随提交者传播，空闲 worker 停在 background**（2026-08，起因是 Thread
+  Performance Checker 在 worker 的 `condition.wait()` 处报优先级反转）：跳线程涉及的
+  两个等待都无法继承优先级——提交者阻塞的 semaphore 不传递优先级，worker 停车的条件
+  变量原理上不可能知道未来谁来 signal——所以改为构造上保证排序正确。每个入队项携带
+  提交时的 `qos_class_self()`，worker 取到后先把自己设到该项的 QoS 再执行（高 QoS
+  调用者绝不等在低优先级线程上）；无活可干的 worker 在 `condition.wait()` 之前降到
+  background（停车的 worker 绝不高于将来唤醒它的线程——此前 worker 固定
+  user-initiated，从 utility 队列一提交就触发检查器的报告）。一次性 fallback 线程和
+  新 worker 的创建 QoS 同样取自提交者线程；线程创建崩溃时的就地排空路径保持排空者
+  自己的 QoS（那是提交者的线程，不归池子调整）。回归测试
+  `workRunsAtTheSubmittersQualityOfServiceClass`（修复前它断言到的是固定的
+  user-initiated，两个方向都失败）。
 - **`withLargeStack {}`** 保留：批量场景包一次，作用域内全部内联，零往返。
 - **`async` 变体**：`demangleAsNode` / `mangleAsString` / `print(using:)` 都有 `async`
   重载，走 `executeAsync`——需要换线程时**挂起**当前 task 而不是阻塞一条协作线程池的
