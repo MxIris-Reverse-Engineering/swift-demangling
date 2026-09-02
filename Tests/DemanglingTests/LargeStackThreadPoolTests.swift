@@ -100,23 +100,38 @@ struct LargeStackThreadPoolTests {
     /// the item elsewhere it is still the submitter's class (in which case the
     /// lower bound below could miss; it never has).
     @Test func workerCountStaysBoundedUnderBurst() async {
-        final class ClassBox: @unchecked Sendable {
-            var observedClass = QOS_CLASS_UNSPECIFIED
+        /// Written by every item under a lock: 500 concurrent writers of the
+        /// same value would still be a data race in form, and one that a
+        /// thread-sanitizer run would report.
+        final class ClassRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var observedClass = QOS_CLASS_UNSPECIFIED
+            func record(_ qualityOfServiceClass: qos_class_t) {
+                lock.lock()
+                observedClass = qualityOfServiceClass
+                lock.unlock()
+            }
+            var current: qos_class_t {
+                lock.lock()
+                defer { lock.unlock() }
+                return observedClass
+            }
         }
-        let box = ClassBox()
+        let recorder = ClassRecorder()
 
         await withTaskGroup(of: Void.self) { group in
             for _ in 0 ..< 500 {
                 group.addTask {
                     await StackSafeExecutor.executeAsync {
-                        box.observedClass = qos_class_self()
+                        recorder.record(qos_class_self())
                         Thread.sleep(forTimeInterval: 0.002)
                     }
                 }
             }
         }
 
-        let burstClass = box.observedClass == QOS_CLASS_UNSPECIFIED ? QOS_CLASS_USER_INITIATED : box.observedClass
+        let observedClass = recorder.current
+        let burstClass = observedClass == QOS_CLASS_UNSPECIFIED ? QOS_CLASS_USER_INITIATED : observedClass
         let workerCount = LargeStackThreadPool.shared.currentWorkerCount(for: burstClass)
         let burstLimit = LargeStackThreadPool.shared.burstWorkerLimitForTesting
         #expect(workerCount <= burstLimit, "the class pool grew to \(workerCount) workers, ceiling is \(burstLimit)")
