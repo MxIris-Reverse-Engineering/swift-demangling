@@ -89,25 +89,38 @@ struct LargeStackThreadPoolTests {
     /// The ceiling asserted here is the burst limit rather than the
     /// steady-state one: the pool is a process-wide singleton whose workers
     /// never retire, and other suites submitting concurrently may legitimately
-    /// have taken it above its steady-state limit — from more than one QOS
-    /// class, each of which is its own bounded sub-pool, which is why the
-    /// ceiling is the per-class limit times the class count. What must hold
-    /// under any interleaving is that a bound exists at all.
+    /// have taken it above its steady-state limit. What must hold under any
+    /// interleaving is that a bound exists at all.
+    ///
+    /// Asserted on the one class this burst lands in: every task here shares
+    /// the group's priority, so all 500 items reach the same class pool, and
+    /// that pool's own ceiling is the bound — summing the other classes'
+    /// workers in would only loosen it. The class is read inside the block:
+    /// on a worker it is the pool's class, and on the rare refusal that runs
+    /// the item elsewhere it is still the submitter's class (in which case the
+    /// lower bound below could miss; it never has).
     @Test func workerCountStaysBoundedUnderBurst() async {
+        final class ClassBox: @unchecked Sendable {
+            var observedClass = QOS_CLASS_UNSPECIFIED
+        }
+        let box = ClassBox()
+
         await withTaskGroup(of: Void.self) { group in
             for _ in 0 ..< 500 {
                 group.addTask {
                     await StackSafeExecutor.executeAsync {
+                        box.observedClass = qos_class_self()
                         Thread.sleep(forTimeInterval: 0.002)
                     }
                 }
             }
         }
 
-        let workerCount = LargeStackThreadPool.shared.currentWorkerCount
+        let burstClass = box.observedClass == QOS_CLASS_UNSPECIFIED ? QOS_CLASS_USER_INITIATED : box.observedClass
+        let workerCount = LargeStackThreadPool.shared.currentWorkerCount(for: burstClass)
         let burstLimit = LargeStackThreadPool.shared.burstWorkerLimitForTesting
-        #expect(workerCount <= burstLimit, "pool grew to \(workerCount) workers, ceiling is \(burstLimit)")
-        #expect(workerCount > 0, "a 500-item burst should have created at least one worker")
+        #expect(workerCount <= burstLimit, "the class pool grew to \(workerCount) workers, ceiling is \(burstLimit)")
+        #expect(workerCount > 0, "a 500-item burst should have created at least one worker in its class")
     }
 
     /// Printing re-enters demangling for nested mangled names. A worker has
@@ -262,15 +275,17 @@ struct LargeStackThreadPoolTests {
     /// steady through the whole idle period. Pre-fix, the first sample after
     /// the item completes already reads background.
     ///
-    /// A private pool keeps other suites' submissions from re-occupying the
-    /// worker mid-sample. The class is read through `pthread_get_qos_class_np`
-    /// on the worker's own thread handle, which stays valid because workers
-    /// never retire.
+    /// Runs on the shared pool: a private pool would spawn a worker that never
+    /// retires and outlives the test. Another suite may re-occupy the sampled
+    /// worker mid-sample, which cannot disturb the assertion — a worker's
+    /// class never changes, whether it is running or parked. The class is
+    /// read through `pthread_get_qos_class_np` on the worker's own thread
+    /// handle, which stays valid because workers never retire.
     @Test func idleWorkerKeepsItsClassInsteadOfParkingAtBackground() {
         final class WorkerBox: @unchecked Sendable {
             var workerThread: pthread_t?
         }
-        let pool = LargeStackThreadPool()
+        let pool = LargeStackThreadPool.shared
         let box = WorkerBox()
         let itemFinished = DispatchSemaphore(value: 0)
 
@@ -301,6 +316,9 @@ struct LargeStackThreadPoolTests {
     /// Submissions of different classes are served by different workers, one
     /// per class — the partition itself. Pre-fix, one class-agnostic pool
     /// handed both items to the same worker and re-ranked it between them.
+    ///
+    /// On the shared pool for the same reason as the parking test; the
+    /// per-class counts are therefore lower bounds, not exact.
     @Test func submissionsOfDifferentClassesRunOnWorkersOfTheirOwnClass() {
         final class ObservationBox: @unchecked Sendable {
             var utilityWorker: mach_port_t = 0
@@ -308,7 +326,7 @@ struct LargeStackThreadPoolTests {
             var userInteractiveWorker: mach_port_t = 0
             var userInteractiveRunClass = QOS_CLASS_UNSPECIFIED
         }
-        let pool = LargeStackThreadPool()
+        let pool = LargeStackThreadPool.shared
         let box = ObservationBox()
 
         func submit(at qualityOfService: QualityOfService, record: @escaping @Sendable (mach_port_t, qos_class_t) -> Void) {
@@ -337,9 +355,36 @@ struct LargeStackThreadPoolTests {
         #expect(box.utilityWorker != box.userInteractiveWorker, "each class must be served by its own worker")
         #expect(box.utilityRunClass == QOS_CLASS_UTILITY)
         #expect(box.userInteractiveRunClass == QOS_CLASS_USER_INTERACTIVE)
-        #expect(pool.currentWorkerCount == 2)
-        #expect(pool.currentWorkerCount(for: QOS_CLASS_UTILITY) == 1)
-        #expect(pool.currentWorkerCount(for: QOS_CLASS_USER_INTERACTIVE) == 1)
+        #expect(pool.currentWorkerCount(for: QOS_CLASS_UTILITY) >= 1)
+        #expect(pool.currentWorkerCount(for: QOS_CLASS_USER_INTERACTIVE) >= 1)
+    }
+
+    /// A QOS class this build does not know is refused, never promoted.
+    ///
+    /// The pool is keyed on the five public classes. A submission carrying any
+    /// other value must be refused so the caller falls back to a dedicated
+    /// thread (`StackSafeExecutor.runOnLargeStack`), which does not promote it
+    /// either — the first partitioned version folded unknown classes into the
+    /// user-initiated pool, raising work of an unknown rank five levels and
+    /// letting a user-initiated park be signalled from below, the very shape
+    /// the partition exists to rule out.
+    ///
+    /// Forward-compatibility guard, not a reproducible defect: the public SDK
+    /// exposes exactly the five pooled classes plus unspecified, and no public
+    /// API creates a thread of any other class, so the value here is synthetic
+    /// (0x05 is the private maintenance class) and injected through the
+    /// class-explicit `trySubmit`. A refusal spawns nothing, so the private
+    /// pool leaks no worker.
+    @Test func unknownQualityOfServiceClassIsRefusedRatherThanPromoted() {
+        let pool = LargeStackThreadPool()
+        let unknownClass = qos_class_t(rawValue: 0x05)
+
+        let accepted = pool.trySubmit(allowingOverflow: true, submitterQualityOfService: unknownClass) {}
+
+        #expect(!accepted, "an unknown class must be refused so the caller falls back to a dedicated thread")
+        #expect(pool.currentWorkerCount == 0, "a refusal spawns nothing")
+        #expect(pool.currentWorkerCount(for: unknownClass) == 0)
+        #expect(pool.currentWorkerCount(for: QOS_CLASS_USER_INITIATED) == 0, "an unknown class must not be promoted into the user-initiated pool")
     }
 
     /// When the OS refuses to create any worker, no submitter may hang.

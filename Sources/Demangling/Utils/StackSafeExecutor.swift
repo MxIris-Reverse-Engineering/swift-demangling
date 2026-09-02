@@ -322,7 +322,18 @@ private func resolvedSubmitterQualityOfService() -> qos_class_t {
 ///   thousands of hops paid a background wake-up (efficiency-core scheduling,
 ///   throttling) plus two QOS syscalls. Partitioning removes both costs from
 ///   the hop; the price is up to one pool per class actually used by the
-///   process (five at most), each bounded like the single pool was.
+///   process (five at most), each bounded like the single pool was. The
+///   bound is deliberately per class, not a budget shared across classes:
+///   workers never retire, so under a shared budget the idle workers of one
+///   class would hold slots another class needs, forever — the never-retire
+///   property would be breached through the side door. Worst case with every
+///   class bursting at once: 5 × `max(32, 4 × cores)` workers, each an 8MB
+///   reservation of untouched address space (1.28GB on a 32-bit watchOS
+///   process with its 4GB address space, which takes 32 simultaneously
+///   blocked callers of *each* class to reach); steady state on a dual-core
+///   watch is 5 × 2 = 10 workers, 80MB of reservation. A class this build
+///   does not know is refused rather than promoted into a pool — the caller
+///   takes the dedicated-thread path, which does not promote it either.
 ///
 /// ### The overflow allowance
 ///
@@ -339,19 +350,17 @@ private func resolvedSubmitterQualityOfService() -> qos_class_t {
 /// Nesting deeper than ``burstWorkerLimit`` simultaneously blocked callers is
 /// still possible in principle; those submissions queue as before.
 ///
-/// Concurrency: this is the one type here that keeps `@unchecked Sendable`
-/// rather than moving its state into a `Mutex`, and the reason is the
-/// primitive, not the pattern. Workers park on `condition.wait()` until a
-/// submission signals them, so the pool needs a *condition variable*, and a
-/// mutex offers no way to wait on one — `NSCondition` is lock and condition in
-/// one object, so the state it guards has to live beside it rather than inside
-/// it. (`NodeCache` and `NodeBuilder` only ever needed mutual exclusion, which
-/// is why they did move.)
-final class LargeStackThreadPool: @unchecked Sendable {
+/// Concurrency: this type itself is plain `Sendable` — it holds only its
+/// immutable class pools. The mutable state lives in the nested
+/// ``QualityOfServiceClassPool``, the one type here that keeps
+/// `@unchecked Sendable` rather than moving its state into a `Mutex`; the
+/// reason is the primitive, not the pattern, and is recorded there.
+final class LargeStackThreadPool: Sendable {
     static let shared = LargeStackThreadPool()
 
-    /// The QOS classes a submitter can resolve to, one sub-pool each. Ordered
-    /// by rank only for readability; nothing depends on the order.
+    /// The QOS classes a submitter can resolve to, one sub-pool each, in
+    /// ``classPools`` order — ``poolIndex(for:)`` is the single source of that
+    /// order and the initializer asserts the two agree.
     ///
     /// `QOS_CLASS_UNSPECIFIED` is not a pool: ``resolvedSubmitterQualityOfService()``
     /// folds it into user-initiated before the lookup, so a legacy thread
@@ -364,12 +373,24 @@ final class LargeStackThreadPool: @unchecked Sendable {
         QOS_CLASS_USER_INTERACTIVE,
     ]
 
-    /// Index into ``classPools`` for a resolved submitter class. A raw value
-    /// this build does not know (a class added by a future OS) lands in the
-    /// user-initiated pool — the same fallback the unspecified class gets.
-    private static func poolIndex(for qualityOfServiceClass: qos_class_t) -> Int {
-        pooledQualityOfServiceClasses.firstIndex(of: qualityOfServiceClass)
-            ?? pooledQualityOfServiceClasses.firstIndex(of: QOS_CLASS_USER_INITIATED)!
+    /// Index into ``classPools`` for a resolved submitter class, or `nil` for
+    /// a raw value this build does not know (a class a future OS adds). An
+    /// unknown class is refused rather than filed under a known one: the first
+    /// partitioned version folded it into user-initiated, which raised work of
+    /// unknown rank five levels and let a user-initiated park be signalled
+    /// from below — the very shape the partition rules out. The refusal sends
+    /// the caller down the dedicated-thread path, which does not promote it
+    /// either (`pthread_attr_set_qos_class_np` rejects the value with `EINVAL`,
+    /// leaving the thread at `pthread_create`'s default).
+    private static func poolIndex(for qualityOfServiceClass: qos_class_t) -> Int? {
+        switch qualityOfServiceClass {
+        case QOS_CLASS_BACKGROUND: return 0
+        case QOS_CLASS_UTILITY: return 1
+        case QOS_CLASS_DEFAULT: return 2
+        case QOS_CLASS_USER_INITIATED: return 3
+        case QOS_CLASS_USER_INTERACTIVE: return 4
+        default: return nil
+        }
     }
 
     /// Thread-local marker key, or `nil` if the platform refused to allocate
@@ -404,41 +425,10 @@ final class LargeStackThreadPool: @unchecked Sendable {
         pthread_setspecific(workerMarkerKey, UnsafeMutableRawPointer(bitPattern: 1))
     }
 
-    /// Ceiling for demand-driven growth in steady state — per class, since
-    /// each class is its own pool.
-    private let steadyStateWorkerLimit: Int
-
-    /// Ceiling including the allowance for blocking submissions, per class.
-    ///
-    /// A fan-out inside a batch needs room for the outer items *and* the inner
-    /// ones they wait on; both are bounded by the caller's own concurrency,
-    /// which is in turn bounded by the core count. A few times the steady-state
-    /// limit covers the nesting depths that occur in practice. Each worker
-    /// reserves address space rather than memory, so the cost of the headroom
-    /// is a kernel thread structure per worker.
+    /// The per-class ceiling including the overflow allowance, kept here only
+    /// to report it to tests (``burstWorkerLimitForTesting``); the pools
+    /// enforce their own copy.
     private let burstWorkerLimit: Int
-
-    /// Test hook: makes every spawn attempt fail as if the OS refused to
-    /// create the thread, so the failure paths can be exercised on a private
-    /// pool instance. Never set on ``shared``.
-    ///
-    /// Immutable, and set only at construction. Every other mutable property
-    /// on this type is touched exclusively under a class pool's `condition`,
-    /// but `spawnWorker()` runs *after* the lock is released, so a settable
-    /// hook would be an unsynchronized read racing any writer — leaving the
-    /// type's `@unchecked Sendable` audit resting on call-site discipline
-    /// rather than on the lock it otherwise uses uniformly (and a torn read of
-    /// the 64-bit `TimeInterval` is representable on 32-bit armv7k). `let`
-    /// removes the race outright instead of moving it under the lock, which
-    /// would make the delay's `Thread.sleep` block every other submitter.
-    let simulatesSpawnFailureForTesting: Bool
-
-    /// Test hook: how long a simulated spawn failure takes to report. A real
-    /// `pthread_create` failure is not instantaneous either; the delay holds
-    /// concurrent submitters in the reserved-but-not-yet-failed state at the
-    /// same time, which is the interleaving the failure handling has to
-    /// survive.
-    let simulatedSpawnFailureDelayForTesting: TimeInterval
 
     /// One sub-pool per pooled class, in ``pooledQualityOfServiceClasses``
     /// order. Created eagerly — five small objects — so the submission path
@@ -447,17 +437,14 @@ final class LargeStackThreadPool: @unchecked Sendable {
     private let classPools: [QualityOfServiceClassPool]
 
     /// ``shared`` and every production path use the parameterless form; only
-    /// tests pass the hooks.
+    /// tests pass the hooks, which are handed straight to the class pools.
     init(
         simulatesSpawnFailureForTesting: Bool = false,
         simulatedSpawnFailureDelayForTesting: TimeInterval = 0
     ) {
         let steadyStateWorkerLimit = max(2, ProcessInfo.processInfo.activeProcessorCount)
         let burstWorkerLimit = max(32, 4 * steadyStateWorkerLimit)
-        self.steadyStateWorkerLimit = steadyStateWorkerLimit
         self.burstWorkerLimit = burstWorkerLimit
-        self.simulatesSpawnFailureForTesting = simulatesSpawnFailureForTesting
-        self.simulatedSpawnFailureDelayForTesting = simulatedSpawnFailureDelayForTesting
         self.classPools = Self.pooledQualityOfServiceClasses.map { qualityOfServiceClass in
             QualityOfServiceClassPool(
                 qualityOfServiceClass: qualityOfServiceClass,
@@ -467,27 +454,32 @@ final class LargeStackThreadPool: @unchecked Sendable {
                 simulatedSpawnFailureDelayForTesting: simulatedSpawnFailureDelayForTesting
             )
         }
+        for (index, qualityOfServiceClass) in Self.pooledQualityOfServiceClasses.enumerated() {
+            assert(Self.poolIndex(for: qualityOfServiceClass) == index, "pooledQualityOfServiceClasses must follow poolIndex(for:)")
+        }
     }
 
-    /// Number of workers this pool has created across every class. Exposed
-    /// for tests, which need to assert on the pool's own ceiling rather than
-    /// on a process-wide thread count that other suites also move.
+    /// Number of workers this pool has created across every class — a sum of
+    /// per-class snapshots taken one lock at a time, so the total may never
+    /// have held at any single instant. Fit for an upper-bound assertion or a
+    /// quiescent private pool, which is what the tests use it for; not for a
+    /// decision.
     var currentWorkerCount: Int {
         classPools.reduce(0) { $0 + $1.currentWorkerCount }
     }
 
-    /// Number of workers created for one class. Exposed for tests that pin
-    /// the partition itself.
+    /// Number of workers created for one class (zero for a class this build
+    /// does not pool). Exposed for tests that pin the partition itself.
     func currentWorkerCount(for qualityOfServiceClass: qos_class_t) -> Int {
-        classPools[Self.poolIndex(for: qualityOfServiceClass)].currentWorkerCount
+        guard let poolIndex = Self.poolIndex(for: qualityOfServiceClass) else { return 0 }
+        return classPools[poolIndex].currentWorkerCount
     }
 
-    /// The pool's hard ceiling: the per-class burst limit times the number of
-    /// classes. Tests assert against this rather than the steady-state limit:
-    /// the pool is a process-wide singleton whose workers never retire, so a
-    /// suite running concurrently may legitimately have taken it above steady
-    /// state — and from more than one class.
-    var burstWorkerLimitForTesting: Int { burstWorkerLimit * classPools.count }
+    /// One class pool's hard ceiling. Tests assert a single class's count
+    /// against this rather than the steady-state limit: the pool is a
+    /// process-wide singleton whose workers never retire, so a suite running
+    /// concurrently may legitimately have taken a class above steady state.
+    var burstWorkerLimitForTesting: Int { burstWorkerLimit }
 
     /// Queues `workItem` on the submitter's class pool, growing that pool if
     /// that is what it takes.
@@ -501,20 +493,73 @@ final class LargeStackThreadPool: @unchecked Sendable {
     ///   thread creation collapses process-wide — on the thread of whichever
     ///   submitter discovered the collapse.
     func trySubmit(allowingOverflow: Bool, _ workItem: @escaping @Sendable () -> Void) -> Bool {
-        guard Self.workerMarkerKey != nil else { return false }
-        let classPool = classPools[Self.poolIndex(for: resolvedSubmitterQualityOfService())]
-        return classPool.trySubmit(allowingOverflow: allowingOverflow, workItem)
+        trySubmit(allowingOverflow: allowingOverflow, submitterQualityOfService: resolvedSubmitterQualityOfService(), workItem)
+    }
+
+    /// The class-explicit form of ``trySubmit(allowingOverflow:_:)``. Production
+    /// always passes the calling thread's resolved class; tests pass classes no
+    /// thread of this process can carry.
+    func trySubmit(allowingOverflow: Bool, submitterQualityOfService: qos_class_t, _ workItem: @escaping @Sendable () -> Void) -> Bool {
+        guard Self.workerMarkerKey != nil, let poolIndex = Self.poolIndex(for: submitterQualityOfService) else { return false }
+        return classPools[poolIndex].trySubmit(allowingOverflow: allowingOverflow, workItem)
     }
 
     /// The workers of one QOS class: created at that class, never re-ranked,
     /// signalled only by submitters of that class. Everything the single
     /// pre-partition pool did — bounded growth, checked creation, drain on
     /// collapse, refusal — lives here unchanged, per class.
+    ///
+    /// Concurrency: this is the one type here that keeps `@unchecked Sendable`
+    /// rather than moving its state into a `Mutex`, and the reason is the
+    /// primitive, not the pattern. Workers park on `condition.wait()` until a
+    /// submission signals them, so the pool needs a *condition variable*, and
+    /// a mutex offers no way to wait on one — `NSCondition` is lock and
+    /// condition in one object, so the state it guards has to live beside it
+    /// rather than inside it. (`NodeCache` and `NodeBuilder` only ever needed
+    /// mutual exclusion, which is why they did move.)
     private final class QualityOfServiceClassPool: @unchecked Sendable {
         let qualityOfServiceClass: qos_class_t
+
+        /// Thread name for this pool's workers, class-suffixed so a spindump
+        /// shows which class's pool grew and whether an item landed in the
+        /// wrong one. `pthread_setname_np` caps names at 63 bytes; the longest
+        /// here is 51.
+        let workerThreadName: String
+
+        /// Ceiling for demand-driven growth in steady state.
         private let steadyStateWorkerLimit: Int
+
+        /// Ceiling including the allowance for blocking submissions.
+        ///
+        /// A fan-out inside a batch needs room for the outer items *and* the
+        /// inner ones they wait on; both are bounded by the caller's own
+        /// concurrency, which is in turn bounded by the core count. A few
+        /// times the steady-state limit covers the nesting depths that occur
+        /// in practice. Each worker reserves address space rather than memory,
+        /// so the cost of the headroom is a kernel thread structure per worker.
         private let burstWorkerLimit: Int
+
+        /// Test hook: makes every spawn attempt fail as if the OS refused to
+        /// create the thread, so the failure paths can be exercised on a
+        /// private pool instance. Never set on the shared pool.
+        ///
+        /// Immutable, and set only at construction. Every other mutable
+        /// property on this type is touched exclusively under `condition`,
+        /// but `spawnWorker()` runs *after* the lock is released, so a
+        /// settable hook would be an unsynchronized read racing any writer —
+        /// leaving the type's `@unchecked Sendable` audit resting on call-site
+        /// discipline rather than on the lock it otherwise uses uniformly (and
+        /// a torn read of the 64-bit `TimeInterval` is representable on 32-bit
+        /// armv7k). `let` removes the race outright instead of moving it under
+        /// the lock, which would make the delay's `Thread.sleep` block every
+        /// other submitter.
         private let simulatesSpawnFailureForTesting: Bool
+
+        /// Test hook: how long a simulated spawn failure takes to report. A
+        /// real `pthread_create` failure is not instantaneous either; the delay
+        /// holds concurrent submitters in the reserved-but-not-yet-failed state
+        /// at the same time, which is the interleaving the failure handling
+        /// has to survive.
         private let simulatedSpawnFailureDelayForTesting: TimeInterval
 
         init(
@@ -525,10 +570,22 @@ final class LargeStackThreadPool: @unchecked Sendable {
             simulatedSpawnFailureDelayForTesting: TimeInterval
         ) {
             self.qualityOfServiceClass = qualityOfServiceClass
+            self.workerThreadName = "swift-demangling.large-stack-worker." + Self.threadNameSuffix(for: qualityOfServiceClass)
             self.steadyStateWorkerLimit = steadyStateWorkerLimit
             self.burstWorkerLimit = burstWorkerLimit
             self.simulatesSpawnFailureForTesting = simulatesSpawnFailureForTesting
             self.simulatedSpawnFailureDelayForTesting = simulatedSpawnFailureDelayForTesting
+        }
+
+        private static func threadNameSuffix(for qualityOfServiceClass: qos_class_t) -> String {
+            switch qualityOfServiceClass {
+            case QOS_CLASS_BACKGROUND: return "background"
+            case QOS_CLASS_UTILITY: return "utility"
+            case QOS_CLASS_DEFAULT: return "default"
+            case QOS_CLASS_USER_INITIATED: return "user-initiated"
+            case QOS_CLASS_USER_INTERACTIVE: return "user-interactive"
+            default: return "unknown"
+            }
         }
 
         private let condition = NSCondition()
@@ -640,7 +697,7 @@ final class LargeStackThreadPool: @unchecked Sendable {
             var threadHandle: pthread_t?
             let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
                 let classPool = Unmanaged<QualityOfServiceClassPool>.fromOpaque(rawContext).takeRetainedValue()
-                pthread_setname_np("swift-demangling.large-stack-worker")
+                pthread_setname_np(classPool.workerThreadName)
                 classPool.runWorkerLoop()
                 return nil
             }, context)

@@ -128,13 +128,23 @@ depth 计数器根本没机会涨。上游 C++ 有完全相同的洞，靠「调
   QoS 系统调用；demangle / print / remangle 每次调用就是一跳，下游索引一个框架要跳几十万次，
   实测 MachOSwiftSection 的 SwiftUICore 普通 dump 从 50 s 变成 150–210 s、带布局注释的 dump
   从 80 s 变成 320–430 s（swift-demangling 0.6.0 → 0.6.1，其它依赖不变）。代价是进程真正
-  用到几个类就有几个子池（最多五个），每个子池的上限与原单池相同，所以
-  `burstWorkerLimitForTesting` 现在是「每类上限 × 类数」。一次性 fallback 线程的创建 QoS
-  仍取自提交者线程；线程创建崩溃时的就地排空路径跑在提交者线程上，按构造就是该子池的类。
-  回归测试：`workRunsAtTheSubmittersQualityOfServiceClass`（条目在提交者的类上运行）、
+  用到几个类就有几个子池（最多五个），每个子池的上限与原单池相同。**上限故意按类、不做跨类
+  全局预算**：worker 永不退休，全局预算会让某个类的空闲 worker 永久占着别的类需要的名额，
+  等价于从侧门打穿「never retire」那条性质。最坏情形（五个类同时突发）：5 × `max(32, 4 × 核数)`
+  条 worker，每条 8MB 未触碰的地址空间——32 位 watchOS 进程（4GB 地址空间）上是 1.28GB，
+  但要**每个类**都有 32 个调用者同时阻塞才能到；稳态双核手表是 5 × 2 = 10 条、80MB 预留。
+  本构建不认识的 QoS 类（未来 OS 新增）**拒绝入池而不是归到某个已知类**：第一版把它折进
+  user-initiated，等于把未知等级的活抬高五级、又让 user-initiated 的停车 worker 被更低的线程
+  唤醒；现在拒绝后调用方走一次性线程，那条路也不抬高（`pthread_attr_set_qos_class_np` 对
+  未知值返回 EINVAL，线程停在 `pthread_create` 的默认类）。一次性 fallback 线程的创建 QoS
+  取自提交者线程；线程创建崩溃时的就地排空路径跑在提交者线程上，按构造就是该子池的类。
+  worker 线程名带类后缀（`swift-demangling.large-stack-worker.user-initiated`），spindump 里
+  能看出哪个类的池涨了、活有没有落错池。回归测试：
+  `workRunsAtTheSubmittersQualityOfServiceClass`（条目在提交者的类上运行）、
   `idleWorkerKeepsItsClassInsteadOfParkingAtBackground`（停车不降级；前身第一个采样就是
   background）、`submissionsOfDifferentClassesRunOnWorkersOfTheirOwnClass`（分池本身；前身
-  两个类共用同一条 worker）。
+  两个类共用同一条 worker）、`unknownQualityOfServiceClassIsRefusedRatherThanPromoted`
+  （未知类拒绝；合成注入的前向兼容守卫，公开 API 造不出这种线程）。
 - **`withLargeStack {}`** 保留：批量场景包一次，作用域内全部内联，零往返。
 - **`async` 变体**：`demangleAsNode` / `mangleAsString` / `print(using:)` 都有 `async`
   重载，走 `executeAsync`——需要换线程时**挂起**当前 task 而不是阻塞一条协作线程池的
