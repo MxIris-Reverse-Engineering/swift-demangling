@@ -89,8 +89,10 @@ struct LargeStackThreadPoolTests {
     /// The ceiling asserted here is the burst limit rather than the
     /// steady-state one: the pool is a process-wide singleton whose workers
     /// never retire, and other suites submitting concurrently may legitimately
-    /// have taken it above its steady-state limit. What must hold under any
-    /// interleaving is that a bound exists at all.
+    /// have taken it above its steady-state limit — from more than one QOS
+    /// class, each of which is its own bounded sub-pool, which is why the
+    /// ceiling is the per-class limit times the class count. What must hold
+    /// under any interleaving is that a bound exists at all.
     @Test func workerCountStaysBoundedUnderBurst() async {
         await withTaskGroup(of: Void.self) { group in
             for _ in 0 ..< 500 {
@@ -215,15 +217,14 @@ struct LargeStackThreadPoolTests {
     /// Neither wait in the hop can inherit priority — the submitter blocks on
     /// a semaphore, which donates nothing, and the worker parks on a condition
     /// variable, which cannot know its future signaller — so the pool keeps
-    /// the ranking right by construction: each submission carries
-    /// `qos_class_self()` and the worker (or dedicated fallback thread) adopts
-    /// it for the run. Before this, workers ran at a fixed user-initiated
-    /// class: a user-interactive caller waited on a lower-priority thread, and
-    /// the idle park outranked utility submitters — the priority inversion the
-    /// Thread Performance Checker reported at the condition wait.
-    ///
-    /// The two submissions run back to back so the second typically reuses
-    /// the first's worker, covering re-ranking in the raising direction.
+    /// the ranking right by construction: workers are partitioned by class,
+    /// created at the submitter's class and never re-ranked, and a submission
+    /// only reaches workers of its own class (the dedicated fallback thread is
+    /// created at the caller's class too). Before this, workers ran at a fixed
+    /// user-initiated class: a user-interactive caller waited on a
+    /// lower-priority thread, and the idle park outranked utility submitters —
+    /// the priority inversion the Thread Performance Checker reported at the
+    /// condition wait.
     @Test func workRunsAtTheSubmittersQualityOfServiceClass() {
         final class ObservationBox: @unchecked Sendable {
             var utilityRunClass = QOS_CLASS_UNSPECIFIED
@@ -246,6 +247,99 @@ struct LargeStackThreadPoolTests {
 
         #expect(box.utilityRunClass == QOS_CLASS_UTILITY)
         #expect(box.userInteractiveRunClass == QOS_CLASS_USER_INTERACTIVE)
+    }
+
+    /// A parked worker keeps its class; it never drops to background.
+    ///
+    /// The class-agnostic design that preceded the partition parked every
+    /// idle worker at `QOS_CLASS_BACKGROUND` so the park could never outrank
+    /// a future signaller, and re-ranked on dequeue. Correct, and three to
+    /// four times slower on every demangle-heavy path: each hop then woke a
+    /// *background* thread (efficiency-core scheduling, throttling) and paid
+    /// two QOS syscalls, hundreds of thousands of times per indexed
+    /// framework. With one pool per class the park needs no demotion — a
+    /// worker's signallers are all of its own class — so the class must hold
+    /// steady through the whole idle period. Pre-fix, the first sample after
+    /// the item completes already reads background.
+    ///
+    /// A private pool keeps other suites' submissions from re-occupying the
+    /// worker mid-sample. The class is read through `pthread_get_qos_class_np`
+    /// on the worker's own thread handle, which stays valid because workers
+    /// never retire.
+    @Test func idleWorkerKeepsItsClassInsteadOfParkingAtBackground() {
+        final class WorkerBox: @unchecked Sendable {
+            var workerThread: pthread_t?
+        }
+        let pool = LargeStackThreadPool()
+        let box = WorkerBox()
+        let itemFinished = DispatchSemaphore(value: 0)
+
+        Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize, qualityOfService: .userInitiated) {
+            let accepted = pool.trySubmit(allowingOverflow: true) {
+                box.workerThread = pthread_self()
+                itemFinished.signal()
+            }
+            #expect(accepted)
+            #expect(itemFinished.wait(timeout: .now() + 10) == .success)
+        }
+
+        guard let workerThread = box.workerThread else {
+            Issue.record("the item never ran on a pool worker")
+            return
+        }
+        var observedClasses: [qos_class_t] = []
+        for _ in 0 ..< 40 {
+            var observedClass = QOS_CLASS_UNSPECIFIED
+            _ = pthread_get_qos_class_np(workerThread, &observedClass, nil)
+            observedClasses.append(observedClass)
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        #expect(!observedClasses.contains(QOS_CLASS_BACKGROUND), "an idle worker must not park at background; observed \(observedClasses.map(\.rawValue))")
+        #expect(observedClasses.last == QOS_CLASS_USER_INITIATED, "an idle worker keeps its submitters' class")
+    }
+
+    /// Submissions of different classes are served by different workers, one
+    /// per class — the partition itself. Pre-fix, one class-agnostic pool
+    /// handed both items to the same worker and re-ranked it between them.
+    @Test func submissionsOfDifferentClassesRunOnWorkersOfTheirOwnClass() {
+        final class ObservationBox: @unchecked Sendable {
+            var utilityWorker: mach_port_t = 0
+            var utilityRunClass = QOS_CLASS_UNSPECIFIED
+            var userInteractiveWorker: mach_port_t = 0
+            var userInteractiveRunClass = QOS_CLASS_UNSPECIFIED
+        }
+        let pool = LargeStackThreadPool()
+        let box = ObservationBox()
+
+        func submit(at qualityOfService: QualityOfService, record: @escaping @Sendable (mach_port_t, qos_class_t) -> Void) {
+            Self.runOnThread(stackSize: Self.cooperativeWorkerStackSize, qualityOfService: qualityOfService) {
+                let itemFinished = DispatchSemaphore(value: 0)
+                let accepted = pool.trySubmit(allowingOverflow: true) {
+                    record(pthread_mach_thread_np(pthread_self()), qos_class_self())
+                    itemFinished.signal()
+                }
+                #expect(accepted)
+                #expect(itemFinished.wait(timeout: .now() + 10) == .success)
+            }
+        }
+
+        submit(at: .utility) { thread, runClass in
+            box.utilityWorker = thread
+            box.utilityRunClass = runClass
+        }
+        submit(at: .userInteractive) { thread, runClass in
+            box.userInteractiveWorker = thread
+            box.userInteractiveRunClass = runClass
+        }
+
+        #expect(box.utilityWorker != 0)
+        #expect(box.userInteractiveWorker != 0)
+        #expect(box.utilityWorker != box.userInteractiveWorker, "each class must be served by its own worker")
+        #expect(box.utilityRunClass == QOS_CLASS_UTILITY)
+        #expect(box.userInteractiveRunClass == QOS_CLASS_USER_INTERACTIVE)
+        #expect(pool.currentWorkerCount == 2)
+        #expect(pool.currentWorkerCount(for: QOS_CLASS_UTILITY) == 1)
+        #expect(pool.currentWorkerCount(for: QOS_CLASS_USER_INTERACTIVE) == 1)
     }
 
     /// When the OS refuses to create any worker, no submitter may hang.
