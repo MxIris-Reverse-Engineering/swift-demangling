@@ -54,6 +54,7 @@
 | [0011](0011-public-transient-demangle-entry.md) | transient demangle 入口转正为 public + remangle 等价契约测试固化 | Implemented |
 | [0012](0012-review-round-three-structural-followups.md) | PR #7 第三轮 review 的四条结构性遗留：遍历族视图钉扎、scope 与片段缓存的组合语义、scope hook 挂载点、`reserveCapacity` 字节预算 | Draft |
 | [0013](0013-punycode-upstream-parity-and-review-round-four-fixes.md) | Punycode 解码补齐三处上游守卫（数字域上界、分隔符前的非 basic code point、无效标量不再用 `.` 顶替）+ PR #8 review 的其余修复 | Implemented |
+| [0014](0014-large-stack-task-executor.md) | 大栈 TaskExecutor：Swift Concurrency 任务整体跑在 16 MB 线程上，任务内 demangle / print / remangle 探测直接通过、零跳转；与阻塞跳转池分池共码，`@_spi(Internals)`，macOS 15 起 | Implemented |
 
 ## 流程
 

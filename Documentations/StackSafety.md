@@ -1,9 +1,10 @@
 # 栈安全：与上游同构的「8MB 大栈 + 固定深度上限」模型
 
 日期：2026-07-29（首版 2026-07-28 采用按剩余栈字节的 `StackBudget` 方案，后按 review
-结论撤回，见「曾经的方案与撤回原因」；2026-08-02 三个深度上限回退为上游值）
+结论撤回，见「曾经的方案与撤回原因」；2026-08-02 三个深度上限回退为上游值；2026-09-03
+加第八节「任务执行器」）
 
-对应提案：`Evolutions/0002-stack-safety.md`
+对应提案：`Evolutions/0002-stack-safety.md`；第八节对应 `Evolutions/0014-large-stack-task-executor.md`
 概念背景：[Concepts/RecursionAndStack.md](Concepts/RecursionAndStack.md)（栈为什么会爆、线程栈
 大小、trap 与 SIGSEGV 的区别）。词条速查见 [Glossary.md](Glossary.md)。
 
@@ -15,7 +16,10 @@ Swift 编译器相同**；`StackSafeExecutor` 在调用线程剩余栈不足 2 M
 析构、remangler 的替换哈希等）一律改成**迭代**，不依赖任何护栏。
 
 这与 Swift 上游的模型同构。但有一个**尚未解决**的缺口：debug 构建下栈帧大一个数量级，
-深度上限来不及生效栈就先崩了（见 `KnownIssues.md` 第 4 条）。
+深度上限来不及生效栈就先崩了（见 `KnownIssues.md` 第 4 条）。async 管线包不进同步的
+`withLargeStack`，为它们另有一个 16 MB 线程的 `TaskExecutor`（`StackSafeExecutor.taskExecutor`，
+第八节）：任务整体住在大栈上，任务内每次调用探针直接通过；那条路径上打印器与 remangler
+的缺口已关。
 
 ## 动机
 
@@ -197,6 +201,51 @@ depth 计数器根本没机会涨。上游 C++ 有完全相同的洞，靠「调
 实例级 `printRoot` 是公开的，富文本消费方直驱它就绕开了大栈切换，同一棵树的截断点
 取决于调用者当时用掉多少栈。下游（MachOSwiftSection）已迁移。
 
+### 八、任务执行器：让整个 task 住在 16MB 线程上（2026-09-03，提案 0014）
+
+- **问题**：探针按调用线程的剩余栈判断，协作线程的 512KB 永远不过；async 打印循环包不进同步的
+  `withLargeStack`，于是每次 print 付一次线程往返（下游 MachOSwiftSection 实测 release 下 8–21 µs）。
+- **做法**：`LargeStackTaskExecutor`（`@_spi(Internals)`，经 `StackSafeExecutor.taskExecutor` 取用，
+  macOS 15 / iOS 18 / tvOS 18 / watchOS 11 / visionOS 2 起）是一个 `TaskExecutor`，线程 16MB。
+  `withTaskExecutorPreference(StackSafeExecutor.taskExecutor) { … }` 里的任务、子任务与默认 actor 全在
+  这些线程上跑，任务内每个入口的探针直接通过、原地执行——`withLargeStack` 的效果扩展到整个 task，
+  同步被调方一并受益。非结构化 `Task {}` 不继承偏好（SE-0417）。
+- **分池共码**：执行器持有自己的一个 `LargeStackThreadPool` 实例（`init(stackSize:workerThreadNamePrefix:)`，
+  线程名 `swift-demangling.task-executor.<qos>`），与 `shared` 不共享 worker，其余全部复用（建线程、
+  QoS 分区、排队、失败排空）。理由：跳转条目毫秒级、提交者阻塞等待；执行器的 job 是整段 task，一次
+  `printRoot` 可占线程上百秒——几个长 job 就把同类的稳态额度吃光，同步跳转被挤进突发额度乃至每次新建
+  临时线程，而跳转是下游索引一个框架要走几十万次的路径。
+- **QoS**：job 的类就是它的 priority——`JobPriority` 的原始值与 Darwin QoS 类数值相同（运行时的全局
+  执行器 `DispatchGlobalExecutor.cpp` 直接强转后交给 `dispatch_get_global_queue`），`unspecified`（0）归
+  default（dispatch 对 `QOS_CLASS_UNSPECIFIED` 的处理），未知值池子照旧拒绝而不抬升。分区规则不变：
+  worker 建在 job 的类上、终身不改，零 QoS 系统调用。
+- **额度**：提交用稳态额度（`max(2, 核数)`），不用突发额度——突发额度是给互相等待的阻塞提交者破环
+  用的，enqueue 一方从不阻塞。每类宽度等于协作线程池。最坏五个类各 `max(2, 核数)` 条 16MB 线程的
+  地址预留（双核手表 5 × 2 × 16MB = 160MB）。
+- **回退**：池拒绝（建不出线程）→ 一次性 16MB 专用线程（按 **job 的类**创建，不是 enqueue 线程的类：
+  enqueue 的线程是恢复这个 job 的任意线程）→ `DispatchQueue.global(qos:)`（job 照跑、探针照跳）。
+  `enqueue` 绝不就地跑 job——它在运行时的调度路径里被调用，就地跑会递归回去。
+- **16MB 关掉了什么**（2026-09-03 实测，debug，arm64，嵌套 `Optional` 形状：打印器每层 2 个深度单位、
+  remangler 4 个）：8MB 线程上打印器 380 层（≈760 单位）、remangler 200 层（≈800 单位）都先于计数器
+  SIGBUS——这正是 `KnownIssues.md` #4 的窗口；16MB 上 380 层完整打印、383 层起 `<<too complex>>`，
+  remangler 240 层往返、260 层起 `.tooComplex`，1000 层两者都干净退化。因此 #4 的两个窗口在**执行器
+  路径**上对打印器与 remangler 关闭；TypeDecoder（每单位约 30KB，1024 单位需约 30MB，且它本就不经
+  执行器）在执行器上仍会先爆栈；阻塞跳转池 8MB 照旧登记。#4 当年从 `StackSafetyTests` 移除的「超限
+  退化而非崩溃」断言在执行器路径上恢复（`printingOnTheExecutorDegradesPastTheDepthLimitInsteadOfCrashing`、
+  `remanglingOnTheExecutorDegradesPastTheDepthLimitInsteadOfCrashing`）。
+- **有意保留的限制**：不是 `SerialExecutor`，actor 不能隔离到它；job 阻塞线程等同类的另一个 job 会耗尽
+  该类 worker（与协作线程池同一契约）；enqueue 线程可能低于 job 的类，停车的 worker 因而可能被更低的
+  线程 signal——Thread Performance Checker 可能报，但没有人等在那条 worker 上，且这是任何「job 由任意
+  线程恢复」的执行器都有的形状；优先级提升（escalation）不处理，job 已在某类线程上就不再改类。
+- **回归测试**：`LargeStackTaskExecutorTests`——`callsInsideATaskOnTheExecutorRunInline`（执行器上
+  `execute` / `executeAsync` 都不跳）、`executorThreadsCarryTheExecutorStackAndName`、
+  `aJobRunsAtTheClassOfItsPriority`（四个优先级各落各的类）、
+  `priorityMapsToTheQualityOfServiceClassOfTheSameRawValue`（含 unspecified → default、未知值被拒）、
+  `jobsOnTheExecutorDoNotOccupyTheHopPool`（占满执行器某类全部稳态 worker，同类同步跳转仍落在 8MB
+  跳转池 worker 上、跳转池不增长——分池与共池的判别性断言）、
+  `aJobThePoolCannotTakeStillRunsOnALargeStackThread`（池建不出线程时 job 落在 16MB 专用线程）、
+  以及上面四条深度测试。
+
 ## 曾经的方案与撤回原因
 
 首版（2026-07-28）用 `StackBudget` 按**剩余栈字节**做每层探针，并把「不足 64MB 一律
@@ -255,7 +304,8 @@ node tree 不一致 0、remangle 不一致 0。
 - **debug 构建下深度上限来不及生效**（`KnownIssues.md` 第 4 条）：768 层打印最坏约需
   8.9 MB 栈，超过 worker 本身的 8 MB。这是回退上限如实付出的代价，要当作栈安全问题
   解决（提高探针阈值、或按实际剩余栈折算本次生效的上限），不能靠静默截断 release
-  构建能正常渲染的输出来换。
+  构建能正常渲染的输出来换。2026-09-03 起**执行器路径**上打印器与 remangler 的窗口已关
+  （第八节，16MB 线程）；阻塞跳转池路径与 TypeDecoder 仍开着。
 - **`Demangler` 的 `setParentForOpaqueReturnTypeNodesImpl` / `demangleBoundGenericArgs`
   仍是无保护递归**——与上游一致（上游解析器同样无深度限制），主循环迭代、这两处现实
   深度浅。失败模式是崩溃而非报错；要抬高预期深度得先加保护。
