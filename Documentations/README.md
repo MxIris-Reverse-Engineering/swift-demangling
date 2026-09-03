@@ -73,6 +73,7 @@
   | `0011-public-transient-demangle-entry.md` | `demangleAsNodeTransient` 撤 `@_spi(Internals)` 转正为 public（一次性 demangle 是下游常态，两仓库五处在用），并以 `TransientRemangleParityTests` 锁死「transient 树与 canonical 树 remangle 输出逐字节一致」——下游生产路径依赖、此前无守卫的隐式契约。 |
   | `0012-review-round-three-structural-followups.md` | PR #7 第三轮 review 的四条结构性遗留（改几行定不下来的那些）：通用遍历 API 没享受到视图钉扎、scope 归属与片段缓存不组合、scope hook 挂在手挑的 kind 清单上、`reserveCapacity` 的钳制只防住了转换 trap。状态 `Draft`。 |
   | `0013-punycode-upstream-parity-and-review-round-four-fixes.md` | punycode 解码合并上游两层时，两层各自的守卫都漏了：数字域缺上界（`K`-`Z` 被当成数字）、分隔符前不拒非 basic code point、无效标量用 `.` 顶替而非拒绝——本库因此接受工具链拒绝的符号并编造标识符文本。同批修掉 `TypeDecoder` 窄化族漏下的第 6 处、`StackSafeExecutor` 的假注释与无锁测试 hook，并把 README 示例固化成可编译的测试。 |
+  | `0014-large-stack-task-executor.md` | 下游 async 打印管线跑在 512 KB 协作线程上，每次 print 都付一次线程往返（8–21 µs）且 async 循环包不进 `withLargeStack`；新增 `TaskExecutor` 让任务整体住在 16 MB 线程上，探测直接通过。与阻塞池分池共码、`@_spi(Internals)`、`@available(macOS 15…)`；顺手关掉 `KnownIssues` #4 在执行器路径上打印器与 remangler 的两个窗口（实测 16 MB 关不掉 TypeDecoder 的，如实登记）。状态 `Implemented`，随 0.6.3 发布。 |
 
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」

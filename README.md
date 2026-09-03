@@ -315,6 +315,19 @@ let results = StackSafeExecutor.withLargeStack {
 
 `withLargeStack` requires `@_spi(Internals) import Demangling`. If you drive the demangler from threads you create yourself, setting `stackSize` to 8MB or more has the same effect — the library detects the headroom and never hops.
 
+An `async` pipeline has no synchronous batch to wrap. Run the task on the library's large-stack task executor instead (macOS 15, iOS 18, tvOS 18, watchOS 11, visionOS 2 and later): every demangle, print and remangle inside it — in synchronous callees too — then finds a 16MB stack and runs inline.
+
+```swift
+try await withTaskExecutorPreference(StackSafeExecutor.taskExecutor) {
+    for symbol in symbols {
+        let node = try demangleAsNode(symbol)
+        results.append(node.print(using: .default))
+    }
+}
+```
+
+The executor's threads are its own — separate from the pool that serves the per-call hops — and child tasks inherit the preference while unstructured `Task {}` does not. Like `withLargeStack`, it is `@_spi(Internals)`.
+
 `TypeDecoder` is the deliberate exception: its `TypeBuilder` callbacks are your code and may be tied to an actor or a thread, so decoding always runs on the calling thread. Wrap deep batches in `withLargeStack` yourself.
 
 ### Bulk Demangling with NodeStore

@@ -208,26 +208,38 @@ public enum StackSafeExecutor {
         }
     }
 
-    /// Starts a one-off detached thread with a ``largeStackThreadSize`` stack,
-    /// reporting whether the OS actually made it.
+    /// Starts a one-off detached thread with a large stack, reporting whether
+    /// the OS actually made it.
     ///
     /// `Thread`/`NSThread` is deliberately not used: `start()` returns `Void`
     /// and swallows exactly the failure this reports.
-    static func spawnDedicatedLargeStackThread(_ work: @escaping @Sendable () -> Void) -> Bool {
+    ///
+    /// - Parameters:
+    ///   - stackSize: the thread's stack; ``largeStackThreadSize`` for the
+    ///     blocking hops, ``LargeStackTaskExecutor/threadStackSize`` when the
+    ///     task executor's pool refused a job.
+    ///   - qualityOfServiceClass: the class to create the thread at, or `nil`
+    ///     for the calling thread's own class. The thread usually exists to run
+    ///     one item for a caller that is about to block on it across a
+    ///     semaphore, which donates no priority — so it adopts the caller's
+    ///     class rather than a fixed one: a fixed class below the caller's
+    ///     would be a priority inversion at the caller's wait. The task
+    ///     executor passes the job's class instead, because the thread that
+    ///     enqueues a job is whichever thread resumed it, not the job's own.
+    static func spawnDedicatedLargeStackThread(
+        stackSize: Int = largeStackThreadSize,
+        qualityOfServiceClass: qos_class_t? = nil,
+        _ work: @escaping @Sendable () -> Void
+    ) -> Bool {
         var threadAttributes = pthread_attr_t()
         guard pthread_attr_init(&threadAttributes) == 0 else { return false }
         defer { pthread_attr_destroy(&threadAttributes) }
-        guard pthread_attr_setstacksize(&threadAttributes, largeStackThreadSize) == 0,
+        guard pthread_attr_setstacksize(&threadAttributes, stackSize) == 0,
               pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
         else {
             return false
         }
-        // The thread exists to run one item for this caller — usually a caller
-        // that is about to block on it across a semaphore, which donates no
-        // priority — so it adopts the caller's QOS class rather than a fixed
-        // one: a fixed class below the caller's would be a priority inversion
-        // at the caller's wait.
-        _ = pthread_attr_set_qos_class_np(&threadAttributes, resolvedSubmitterQualityOfService(), 0)
+        _ = pthread_attr_set_qos_class_np(&threadAttributes, qualityOfServiceClass ?? resolvedSubmitterQualityOfService(), 0)
 
         let context = Unmanaged.passRetained(DedicatedThreadContext(work: work)).toOpaque()
         var threadHandle: pthread_t?
@@ -350,13 +362,28 @@ private func resolvedSubmitterQualityOfService() -> qos_class_t {
 /// Nesting deeper than ``burstWorkerLimit`` simultaneously blocked callers is
 /// still possible in principle; those submissions queue as before.
 ///
+/// ### Two instances, one per kind of work
+///
+/// ``shared`` serves the blocking hops: items are one demangle, print or
+/// remangle, milliseconds long, and the submitter waits for them.
+/// ``LargeStackTaskExecutor`` owns a second instance with bigger stacks for
+/// Swift Concurrency jobs, which are whole task segments — a batch print can
+/// hold a thread for minutes. The two never share workers: a few long jobs
+/// in a shared steady-state budget would push every synchronous hop into the
+/// overflow allowance and then onto one-off threads, and the hop is the path
+/// that runs hundreds of thousands of times per indexed framework.
+///
 /// Concurrency: this type itself is plain `Sendable` — it holds only its
 /// immutable class pools. The mutable state lives in the nested
 /// ``QualityOfServiceClassPool``, the one type here that keeps
 /// `@unchecked Sendable` rather than moving its state into a `Mutex`; the
 /// reason is the primitive, not the pattern, and is recorded there.
 final class LargeStackThreadPool: Sendable {
+    /// The pool behind ``StackSafeExecutor``'s blocking hops.
     static let shared = LargeStackThreadPool()
+
+    /// Name prefix of ``shared``'s workers; the class suffix follows.
+    static let hopWorkerThreadNamePrefix = "swift-demangling.large-stack-worker."
 
     /// The QOS classes a submitter can resolve to, one sub-pool each, in
     /// ``classPools`` order — ``poolIndex(for:)`` is the single source of that
@@ -425,9 +452,10 @@ final class LargeStackThreadPool: Sendable {
         pthread_setspecific(workerMarkerKey, UnsafeMutableRawPointer(bitPattern: 1))
     }
 
-    /// The per-class ceiling including the overflow allowance, kept here only
-    /// to report it to tests (``burstWorkerLimitForTesting``); the pools
-    /// enforce their own copy.
+    /// The per-class ceilings, kept here only to report them to tests
+    /// (``steadyStateWorkerLimitForTesting``, ``burstWorkerLimitForTesting``);
+    /// the pools enforce their own copies.
+    private let steadyStateWorkerLimit: Int
     private let burstWorkerLimit: Int
 
     /// One sub-pool per pooled class, in ``pooledQualityOfServiceClasses``
@@ -436,18 +464,24 @@ final class LargeStackThreadPool: Sendable {
     /// spawns a thread.
     private let classPools: [QualityOfServiceClassPool]
 
-    /// ``shared`` and every production path use the parameterless form; only
-    /// tests pass the hooks, which are handed straight to the class pools.
+    /// ``shared`` uses the parameterless form; ``LargeStackTaskExecutor``
+    /// passes its own stack size and thread-name prefix. Only tests pass the
+    /// hooks, which are handed straight to the class pools.
     init(
+        stackSize: Int = StackSafeExecutor.largeStackThreadSize,
+        workerThreadNamePrefix: String = LargeStackThreadPool.hopWorkerThreadNamePrefix,
         simulatesSpawnFailureForTesting: Bool = false,
         simulatedSpawnFailureDelayForTesting: TimeInterval = 0
     ) {
         let steadyStateWorkerLimit = max(2, ProcessInfo.processInfo.activeProcessorCount)
         let burstWorkerLimit = max(32, 4 * steadyStateWorkerLimit)
+        self.steadyStateWorkerLimit = steadyStateWorkerLimit
         self.burstWorkerLimit = burstWorkerLimit
         self.classPools = Self.pooledQualityOfServiceClasses.map { qualityOfServiceClass in
             QualityOfServiceClassPool(
                 qualityOfServiceClass: qualityOfServiceClass,
+                workerStackSize: stackSize,
+                workerThreadNamePrefix: workerThreadNamePrefix,
                 steadyStateWorkerLimit: steadyStateWorkerLimit,
                 burstWorkerLimit: burstWorkerLimit,
                 simulatesSpawnFailureForTesting: simulatesSpawnFailureForTesting,
@@ -474,6 +508,10 @@ final class LargeStackThreadPool: Sendable {
         guard let poolIndex = Self.poolIndex(for: qualityOfServiceClass) else { return 0 }
         return classPools[poolIndex].currentWorkerCount
     }
+
+    /// One class pool's steady-state ceiling — what a non-blocking submission
+    /// (an async hop, a task executor job) can grow a class to.
+    var steadyStateWorkerLimitForTesting: Int { steadyStateWorkerLimit }
 
     /// One class pool's hard ceiling. Tests assert a single class's count
     /// against this rather than the steady-state limit: the pool is a
@@ -523,8 +561,11 @@ final class LargeStackThreadPool: Sendable {
         /// Thread name for this pool's workers, class-suffixed so a spindump
         /// shows which class's pool grew and whether an item landed in the
         /// wrong one. `pthread_setname_np` caps names at 63 bytes; the longest
-        /// here is 51.
+        /// here is 51 (`swift-demangling.large-stack-worker.user-interactive`).
         let workerThreadName: String
+
+        /// Stack size of this pool's workers.
+        private let workerStackSize: Int
 
         /// Ceiling for demand-driven growth in steady state.
         private let steadyStateWorkerLimit: Int
@@ -564,13 +605,16 @@ final class LargeStackThreadPool: Sendable {
 
         init(
             qualityOfServiceClass: qos_class_t,
+            workerStackSize: Int,
+            workerThreadNamePrefix: String,
             steadyStateWorkerLimit: Int,
             burstWorkerLimit: Int,
             simulatesSpawnFailureForTesting: Bool,
             simulatedSpawnFailureDelayForTesting: TimeInterval
         ) {
             self.qualityOfServiceClass = qualityOfServiceClass
-            self.workerThreadName = "swift-demangling.large-stack-worker." + Self.threadNameSuffix(for: qualityOfServiceClass)
+            self.workerThreadName = workerThreadNamePrefix + Self.threadNameSuffix(for: qualityOfServiceClass)
+            self.workerStackSize = workerStackSize
             self.steadyStateWorkerLimit = steadyStateWorkerLimit
             self.burstWorkerLimit = burstWorkerLimit
             self.simulatesSpawnFailureForTesting = simulatesSpawnFailureForTesting
@@ -683,7 +727,7 @@ final class LargeStackThreadPool: Sendable {
             var threadAttributes = pthread_attr_t()
             guard pthread_attr_init(&threadAttributes) == 0 else { return false }
             defer { pthread_attr_destroy(&threadAttributes) }
-            guard pthread_attr_setstacksize(&threadAttributes, StackSafeExecutor.largeStackThreadSize) == 0,
+            guard pthread_attr_setstacksize(&threadAttributes, workerStackSize) == 0,
                   pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
             else {
                 return false

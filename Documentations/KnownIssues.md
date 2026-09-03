@@ -259,6 +259,18 @@ inverse requirement 的 index 走 `Ri<十进制>_` 语法同理可达；`.depend
 > 在 512 下报 `<<too complex>>`，校准所依据的「真实符号最深 41 层」被证伪），
 > 因此本条的量级随之扩大，重写如下。**这是三个上限回退后如实记录的代价。**
 
+> **2026-09-03 部分关闭（提案 0014）**：新增的大栈 `TaskExecutor`（`StackSafeExecutor.taskExecutor`，
+> `@_spi(Internals)`，macOS 15 起）线程 16 MB。实测（debug，arm64，嵌套 `Optional` 形状，每层占打印器
+> 2 个深度单位、remangler 4 个）：8 MB 线程上打印器 380 层（≈760 单位）、remangler 200 层（≈800 单位）
+> 都先于计数器 SIGBUS；16 MB 执行器线程上同深度完整完成，计数器先于栈死亡触发（打印器 383 层起
+> `<<too complex>>`，remangler 260 层起 `.tooComplex`，1000 层两者干净退化）。因此**跑在执行器上的
+> 路径**，下面两个窗口对打印器与 remangler 关闭；TypeDecoder（每单位约 30 KB，1024 单位需约 30 MB，
+> 且它本就不经执行器）在执行器上仍会先爆栈；**阻塞跳转池（8 MB）路径照旧**，本条继续开放。下表移除的
+> 断言中，「超限退化而非崩溃」两条已在执行器路径上恢复
+> （`LargeStackTaskExecutorTests.printingOnTheExecutorDegradesPastTheDepthLimitInsteadOfCrashing` /
+> `remanglingOnTheExecutorDegradesPastTheDepthLimitInsteadOfCrashing`）；`StackSafetyTests` 里的原断言
+> 仍不可恢复，它们跑在 8 MB 上。
+
 `StackSafeExecutor` 在调用线程剩余栈 ≥ 2MB 时原地执行，否则跳到 8MB 的池线程。而
 `maxPrintDepth = 768`，unoptimized 下每层 `printName` 实测约 11.6KB，最坏 ≈ 8.9MB —— 
 **超过池线程本身的 8MB**。实测：725 层能存活于 8MB 线程，745 层溢出。
@@ -297,6 +309,7 @@ release 构建帧小一个数量级，窗口大幅收窄。下游报告的 `<<to
 1. 入口按**实际剩余栈**折算本次生效的上限：栈少就早点 `<<too complex>>`，栈多就走满
    768。既堵住两个窗口，又不牺牲 release 构建的能力，贴合上游的形模型。
 2. 把池线程栈提到 ≥ 16MB，并把探针阈值提到 ≥ 9MB（代价：跳线程更频繁、每线程内存翻倍）。
+   ——执行器线程已是 16MB（2026-09-03，见上），跳转池与探针阈值未动。
 3. 仅在 unoptimized 构建下降低上限——**已否决**，同一棵树在 debug 与 release 下产出
    不同输出比现状更糟。
 
