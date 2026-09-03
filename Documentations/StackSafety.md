@@ -114,18 +114,37 @@ depth 计数器根本没机会涨。上游 C++ 有完全相同的洞，靠「调
 - **worker 上的嵌套调用**：栈还多（≥2MB）就内联跑（嵌套 demangle 的常态）；真的深到
   不足 2MB 时起一条一次性 8MB 线程，绝不向自己所在的池子回提交（那个等待可能排在它
   自己正在执行的条目后面）。
-- **QoS 随提交者传播，空闲 worker 停在 background**（2026-08，起因是 Thread
-  Performance Checker 在 worker 的 `condition.wait()` 处报优先级反转）：跳线程涉及的
-  两个等待都无法继承优先级——提交者阻塞的 semaphore 不传递优先级，worker 停车的条件
-  变量原理上不可能知道未来谁来 signal——所以改为构造上保证排序正确。每个入队项携带
-  提交时的 `qos_class_self()`，worker 取到后先把自己设到该项的 QoS 再执行（高 QoS
-  调用者绝不等在低优先级线程上）；无活可干的 worker 在 `condition.wait()` 之前降到
-  background（停车的 worker 绝不高于将来唤醒它的线程——此前 worker 固定
-  user-initiated，从 utility 队列一提交就触发检查器的报告）。一次性 fallback 线程和
-  新 worker 的创建 QoS 同样取自提交者线程；线程创建崩溃时的就地排空路径保持排空者
-  自己的 QoS（那是提交者的线程，不归池子调整）。回归测试
-  `workRunsAtTheSubmittersQualityOfServiceClass`（修复前它断言到的是固定的
-  user-initiated，两个方向都失败）。
+- **worker 按 QoS 类分池，提交只触及自己的类**（2026-09-02；前身是 2026-08 的「每跳
+  重排 QoS、空闲 worker 停在 background」，起因是 Thread Performance Checker 在 worker
+  的 `condition.wait()` 处报优先级反转）：跳线程涉及的两个等待都无法继承优先级——提交者
+  阻塞的 semaphore 不传递优先级，worker 停车的条件变量原理上不可能知道未来谁来
+  signal——所以只能在构造上保证排序正确。现行做法：worker 在被某个提交者创建时就取该
+  提交者的 QoS 类（`qos_class_self()`，`UNSPECIFIED` 折算为 user-initiated），**终身不改**；
+  每个类各有一个子池（队列、空闲计数、稳态 / 突发上限都按类），提交只会 signal 或创建
+  同类的 worker。于是高 QoS 调用者绝不等在低优先级线程上，停车的 worker 也绝不被比它低
+  的线程唤醒——两条性质与前身相同，但热路径上零 QoS 系统调用。
+  前身之所以要换：它让每次出队 `pthread_set_qos_class_self_np` 到条目的类、停车前降到
+  background，结果**每一跳唤醒的都是一条 background 线程**（能效核调度 + 节流）外加两次
+  QoS 系统调用；demangle / print / remangle 每次调用就是一跳，下游索引一个框架要跳几十万次，
+  实测 MachOSwiftSection 的 SwiftUICore 普通 dump 从 50 s 变成 150–210 s、带布局注释的 dump
+  从 80 s 变成 320–430 s（swift-demangling 0.6.0 → 0.6.1，其它依赖不变）。代价是进程真正
+  用到几个类就有几个子池（最多五个），每个子池的上限与原单池相同。**上限故意按类、不做跨类
+  全局预算**：worker 永不退休，全局预算会让某个类的空闲 worker 永久占着别的类需要的名额，
+  等价于从侧门打穿「never retire」那条性质。最坏情形（五个类同时突发）：5 × `max(32, 4 × 核数)`
+  条 worker，每条 8MB 未触碰的地址空间——32 位 watchOS 进程（4GB 地址空间）上是 1.28GB，
+  但要**每个类**都有 32 个调用者同时阻塞才能到；稳态双核手表是 5 × 2 = 10 条、80MB 预留。
+  本构建不认识的 QoS 类（未来 OS 新增）**拒绝入池而不是归到某个已知类**：第一版把它折进
+  user-initiated，等于把未知等级的活抬高五级、又让 user-initiated 的停车 worker 被更低的线程
+  唤醒；现在拒绝后调用方走一次性线程，那条路也不抬高（`pthread_attr_set_qos_class_np` 对
+  未知值返回 EINVAL，线程停在 `pthread_create` 的默认类）。一次性 fallback 线程的创建 QoS
+  取自提交者线程；线程创建崩溃时的就地排空路径跑在提交者线程上，按构造就是该子池的类。
+  worker 线程名带类后缀（`swift-demangling.large-stack-worker.user-initiated`），spindump 里
+  能看出哪个类的池涨了、活有没有落错池。回归测试：
+  `workRunsAtTheSubmittersQualityOfServiceClass`（条目在提交者的类上运行）、
+  `idleWorkerKeepsItsClassInsteadOfParkingAtBackground`（停车不降级；前身第一个采样就是
+  background）、`submissionsOfDifferentClassesRunOnWorkersOfTheirOwnClass`（分池本身；前身
+  两个类共用同一条 worker）、`unknownQualityOfServiceClassIsRefusedRatherThanPromoted`
+  （未知类拒绝；合成注入的前向兼容守卫，公开 API 造不出这种线程）。
 - **`withLargeStack {}`** 保留：批量场景包一次，作用域内全部内联，零往返。
 - **`async` 变体**：`demangleAsNode` / `mangleAsString` / `print(using:)` 都有 `async`
   重载，走 `executeAsync`——需要换线程时**挂起**当前 task 而不是阻塞一条协作线程池的

@@ -303,16 +303,37 @@ private func resolvedSubmitterQualityOfService() -> qos_class_t {
 ///   stack to need a hop gets a dedicated thread instead
 ///   (``StackSafeExecutor/runOnLargeStack(_:)``), because its wait could sit
 ///   behind the very item it is running.
-/// - **Work runs at its submitter's QOS class; idle workers park at
-///   background.** Neither wait involved can inherit priority — the
+/// - **Workers are partitioned by QOS class, and a submission only ever
+///   touches its own class.** Neither wait involved can inherit priority — the
 ///   submitter's semaphore donates nothing, and a condition variable cannot
-///   know its future signaller — so the pool keeps the ranking right by
-///   construction instead: each submission carries `qos_class_self()` and the
-///   worker adopts it for that item (a caller blocked on the item never waits
-///   on a lower-priority thread), and a worker with nothing to run drops to
-///   background before waiting (a parked worker never outranks whichever
-///   thread eventually signals it — the shape the Thread Performance Checker
-///   reports as a priority inversion at the condition wait).
+///   know its future signaller — so the ranking has to be right by
+///   construction: a worker is created at the class of the submitter that
+///   needed it and keeps that class for life, and a submission signals or
+///   creates only workers of the submitter's class. A caller blocked on its
+///   item therefore never waits on a lower-priority thread, and a parked
+///   worker is never signalled by a thread below its own class (the shape the
+///   Thread Performance Checker reports as a priority inversion at the
+///   condition wait). The previous design kept one class-agnostic pool and
+///   re-ranked per hop — every dequeue `pthread_set_qos_class_self_np` to the
+///   item's class, every park a drop to background — which was correct but
+///   cost three to four times the throughput of every demangle-heavy path
+///   (SwiftUICore dump in the downstream indexer: 50 s → 150–210 s): a
+///   parked worker was a *background* thread, so each of the hundreds of
+///   thousands of hops paid a background wake-up (efficiency-core scheduling,
+///   throttling) plus two QOS syscalls. Partitioning removes both costs from
+///   the hop; the price is up to one pool per class actually used by the
+///   process (five at most), each bounded like the single pool was. The
+///   bound is deliberately per class, not a budget shared across classes:
+///   workers never retire, so under a shared budget the idle workers of one
+///   class would hold slots another class needs, forever — the never-retire
+///   property would be breached through the side door. Worst case with every
+///   class bursting at once: 5 × `max(32, 4 × cores)` workers, each an 8MB
+///   reservation of untouched address space (1.28GB on a 32-bit watchOS
+///   process with its 4GB address space, which takes 32 simultaneously
+///   blocked callers of *each* class to reach); steady state on a dual-core
+///   watch is 5 × 2 = 10 workers, 80MB of reservation. A class this build
+///   does not know is refused rather than promoted into a pool — the caller
+///   takes the dedicated-thread path, which does not promote it either.
 ///
 /// ### The overflow allowance
 ///
@@ -329,16 +350,48 @@ private func resolvedSubmitterQualityOfService() -> qos_class_t {
 /// Nesting deeper than ``burstWorkerLimit`` simultaneously blocked callers is
 /// still possible in principle; those submissions queue as before.
 ///
-/// Concurrency: this is the one type here that keeps `@unchecked Sendable`
-/// rather than moving its state into a `Mutex`, and the reason is the
-/// primitive, not the pattern. Workers park on `condition.wait()` until a
-/// submission signals them, so the pool needs a *condition variable*, and a
-/// mutex offers no way to wait on one — `NSCondition` is lock and condition in
-/// one object, so the state it guards has to live beside it rather than inside
-/// it. (`NodeCache` and `NodeBuilder` only ever needed mutual exclusion, which
-/// is why they did move.)
-final class LargeStackThreadPool: @unchecked Sendable {
+/// Concurrency: this type itself is plain `Sendable` — it holds only its
+/// immutable class pools. The mutable state lives in the nested
+/// ``QualityOfServiceClassPool``, the one type here that keeps
+/// `@unchecked Sendable` rather than moving its state into a `Mutex`; the
+/// reason is the primitive, not the pattern, and is recorded there.
+final class LargeStackThreadPool: Sendable {
     static let shared = LargeStackThreadPool()
+
+    /// The QOS classes a submitter can resolve to, one sub-pool each, in
+    /// ``classPools`` order — ``poolIndex(for:)`` is the single source of that
+    /// order and the initializer asserts the two agree.
+    ///
+    /// `QOS_CLASS_UNSPECIFIED` is not a pool: ``resolvedSubmitterQualityOfService()``
+    /// folds it into user-initiated before the lookup, so a legacy thread
+    /// outside the QOS system shares the user-initiated pool.
+    private static let pooledQualityOfServiceClasses: [qos_class_t] = [
+        QOS_CLASS_BACKGROUND,
+        QOS_CLASS_UTILITY,
+        QOS_CLASS_DEFAULT,
+        QOS_CLASS_USER_INITIATED,
+        QOS_CLASS_USER_INTERACTIVE,
+    ]
+
+    /// Index into ``classPools`` for a resolved submitter class, or `nil` for
+    /// a raw value this build does not know (a class a future OS adds). An
+    /// unknown class is refused rather than filed under a known one: the first
+    /// partitioned version folded it into user-initiated, which raised work of
+    /// unknown rank five levels and let a user-initiated park be signalled
+    /// from below — the very shape the partition rules out. The refusal sends
+    /// the caller down the dedicated-thread path, which does not promote it
+    /// either (`pthread_attr_set_qos_class_np` rejects the value with `EINVAL`,
+    /// leaving the thread at `pthread_create`'s default).
+    private static func poolIndex(for qualityOfServiceClass: qos_class_t) -> Int? {
+        switch qualityOfServiceClass {
+        case QOS_CLASS_BACKGROUND: return 0
+        case QOS_CLASS_UTILITY: return 1
+        case QOS_CLASS_DEFAULT: return 2
+        case QOS_CLASS_USER_INITIATED: return 3
+        case QOS_CLASS_USER_INTERACTIVE: return 4
+        default: return nil
+        }
+    }
 
     /// Thread-local marker key, or `nil` if the platform refused to allocate
     /// one.
@@ -372,256 +425,321 @@ final class LargeStackThreadPool: @unchecked Sendable {
         pthread_setspecific(workerMarkerKey, UnsafeMutableRawPointer(bitPattern: 1))
     }
 
-    /// Ceiling for demand-driven growth in steady state.
-    private let steadyStateWorkerLimit = max(2, ProcessInfo.processInfo.activeProcessorCount)
+    /// The per-class ceiling including the overflow allowance, kept here only
+    /// to report it to tests (``burstWorkerLimitForTesting``); the pools
+    /// enforce their own copy.
+    private let burstWorkerLimit: Int
 
-    /// Ceiling including the allowance for blocking submissions.
-    ///
-    /// A fan-out inside a batch needs room for the outer items *and* the inner
-    /// ones they wait on; both are bounded by the caller's own concurrency,
-    /// which is in turn bounded by the core count. A few times the steady-state
-    /// limit covers the nesting depths that occur in practice. Each worker
-    /// reserves address space rather than memory, so the cost of the headroom
-    /// is a kernel thread structure per worker.
-    private let burstWorkerLimit = max(32, 4 * max(2, ProcessInfo.processInfo.activeProcessorCount))
-
-    /// Test hook: makes every spawn attempt fail as if the OS refused to
-    /// create the thread, so the failure paths can be exercised on a private
-    /// pool instance. Never set on ``shared``.
-    ///
-    /// Immutable, and set only at construction. Every other mutable property
-    /// on this type is touched exclusively under ``condition``, but
-    /// ``spawnWorker()`` runs *after* the lock is released, so a settable hook
-    /// would be an unsynchronized read racing any writer — leaving the type's
-    /// `@unchecked Sendable` audit resting on call-site discipline rather than
-    /// on the lock it otherwise uses uniformly (and a torn read of the
-    /// 64-bit `TimeInterval` is representable on 32-bit armv7k). `let` removes
-    /// the race outright instead of moving it under the lock, which would make
-    /// the delay's `Thread.sleep` block every other submitter.
-    let simulatesSpawnFailureForTesting: Bool
-
-    /// Test hook: how long a simulated spawn failure takes to report. A real
-    /// `pthread_create` failure is not instantaneous either; the delay holds
-    /// concurrent submitters in the reserved-but-not-yet-failed state at the
-    /// same time, which is the interleaving the failure handling has to
-    /// survive.
-    let simulatedSpawnFailureDelayForTesting: TimeInterval
+    /// One sub-pool per pooled class, in ``pooledQualityOfServiceClasses``
+    /// order. Created eagerly — five small objects — so the submission path
+    /// is a plain array read; a class that never receives a submission never
+    /// spawns a thread.
+    private let classPools: [QualityOfServiceClassPool]
 
     /// ``shared`` and every production path use the parameterless form; only
-    /// tests pass the hooks.
+    /// tests pass the hooks, which are handed straight to the class pools.
     init(
         simulatesSpawnFailureForTesting: Bool = false,
         simulatedSpawnFailureDelayForTesting: TimeInterval = 0
     ) {
-        self.simulatesSpawnFailureForTesting = simulatesSpawnFailureForTesting
-        self.simulatedSpawnFailureDelayForTesting = simulatedSpawnFailureDelayForTesting
+        let steadyStateWorkerLimit = max(2, ProcessInfo.processInfo.activeProcessorCount)
+        let burstWorkerLimit = max(32, 4 * steadyStateWorkerLimit)
+        self.burstWorkerLimit = burstWorkerLimit
+        self.classPools = Self.pooledQualityOfServiceClasses.map { qualityOfServiceClass in
+            QualityOfServiceClassPool(
+                qualityOfServiceClass: qualityOfServiceClass,
+                steadyStateWorkerLimit: steadyStateWorkerLimit,
+                burstWorkerLimit: burstWorkerLimit,
+                simulatesSpawnFailureForTesting: simulatesSpawnFailureForTesting,
+                simulatedSpawnFailureDelayForTesting: simulatedSpawnFailureDelayForTesting
+            )
+        }
+        for (index, qualityOfServiceClass) in Self.pooledQualityOfServiceClasses.enumerated() {
+            assert(Self.poolIndex(for: qualityOfServiceClass) == index, "pooledQualityOfServiceClasses must follow poolIndex(for:)")
+        }
     }
 
-    private let condition = NSCondition()
-
-    /// A queued closure paired with the QOS class of the thread that submitted
-    /// it. The worker that dequeues the item adopts that class for the run, so
-    /// a caller blocked on the item is never waiting on a lower-priority
-    /// thread.
-    private struct PendingWorkItem {
-        let work: @Sendable () -> Void
-        let submitterQualityOfService: qos_class_t
-
-        /// What a dequeued slot is overwritten with, so the queue drops its
-        /// reference to the executed closure (see the dequeue sites).
-        static let cleared = PendingWorkItem(work: {}, submitterQualityOfService: QOS_CLASS_DEFAULT)
-    }
-
-    private var pendingWorkItems: [PendingWorkItem] = []
-    /// Index of the next item to run. Removing from the front of the array
-    /// instead would memmove the whole queue while holding the lock.
-    private var nextWorkItemIndex = 0
-    private var idleWorkerCount = 0
-    private var workerCount = 0
-
-    /// Number of workers this pool has created. Exposed for tests, which need
-    /// to assert on the pool's own ceiling rather than on a process-wide thread
-    /// count that other suites also move.
+    /// Number of workers this pool has created across every class — a sum of
+    /// per-class snapshots taken one lock at a time, so the total may never
+    /// have held at any single instant. Fit for an upper-bound assertion or a
+    /// quiescent private pool, which is what the tests use it for; not for a
+    /// decision.
     var currentWorkerCount: Int {
-        condition.lock()
-        defer { condition.unlock() }
-        return workerCount
+        classPools.reduce(0) { $0 + $1.currentWorkerCount }
     }
 
-    /// The pool's hard ceiling. Tests assert against this rather than the
-    /// steady-state limit: the pool is a process-wide singleton whose workers
-    /// never retire, so a suite running concurrently may legitimately have
-    /// taken it above steady state.
+    /// Number of workers created for one class (zero for a class this build
+    /// does not pool). Exposed for tests that pin the partition itself.
+    func currentWorkerCount(for qualityOfServiceClass: qos_class_t) -> Int {
+        guard let poolIndex = Self.poolIndex(for: qualityOfServiceClass) else { return 0 }
+        return classPools[poolIndex].currentWorkerCount
+    }
+
+    /// One class pool's hard ceiling. Tests assert a single class's count
+    /// against this rather than the steady-state limit: the pool is a
+    /// process-wide singleton whose workers never retire, so a suite running
+    /// concurrently may legitimately have taken a class above steady state.
     var burstWorkerLimitForTesting: Int { burstWorkerLimit }
 
-    /// Queues `workItem`, growing the pool if that is what it takes.
+    /// Queues `workItem` on the submitter's class pool, growing that pool if
+    /// that is what it takes.
     ///
     /// - Parameter allowingOverflow: whether the caller will block until the
     ///   item runs. Blocking callers may grow the pool past its steady-state
     ///   limit; see the type's discussion.
     /// - Returns: `false` if the pool cannot run the item, in which case the
     ///   caller must run it elsewhere. When this returns `true` the item is
-    ///   guaranteed to run: by a worker, or — if thread creation collapses
-    ///   process-wide — on the thread of whichever submitter discovered the
-    ///   collapse.
+    ///   guaranteed to run: by a worker of the submitter's class, or — if
+    ///   thread creation collapses process-wide — on the thread of whichever
+    ///   submitter discovered the collapse.
     func trySubmit(allowingOverflow: Bool, _ workItem: @escaping @Sendable () -> Void) -> Bool {
-        guard Self.workerMarkerKey != nil else { return false }
+        trySubmit(allowingOverflow: allowingOverflow, submitterQualityOfService: resolvedSubmitterQualityOfService(), workItem)
+    }
 
-        condition.lock()
-        let queuedCount = pendingWorkItems.count - nextWorkItemIndex
-        let workerLimit = allowingOverflow ? burstWorkerLimit : steadyStateWorkerLimit
-        let needsAdditionalWorker = queuedCount + 1 > idleWorkerCount && workerCount < workerLimit
-        if needsAdditionalWorker {
-            workerCount += 1
+    /// The class-explicit form of ``trySubmit(allowingOverflow:_:)``. Production
+    /// always passes the calling thread's resolved class; tests pass classes no
+    /// thread of this process can carry.
+    func trySubmit(allowingOverflow: Bool, submitterQualityOfService: qos_class_t, _ workItem: @escaping @Sendable () -> Void) -> Bool {
+        guard Self.workerMarkerKey != nil, let poolIndex = Self.poolIndex(for: submitterQualityOfService) else { return false }
+        return classPools[poolIndex].trySubmit(allowingOverflow: allowingOverflow, workItem)
+    }
+
+    /// The workers of one QOS class: created at that class, never re-ranked,
+    /// signalled only by submitters of that class. Everything the single
+    /// pre-partition pool did — bounded growth, checked creation, drain on
+    /// collapse, refusal — lives here unchanged, per class.
+    ///
+    /// Concurrency: this is the one type here that keeps `@unchecked Sendable`
+    /// rather than moving its state into a `Mutex`, and the reason is the
+    /// primitive, not the pattern. Workers park on `condition.wait()` until a
+    /// submission signals them, so the pool needs a *condition variable*, and
+    /// a mutex offers no way to wait on one — `NSCondition` is lock and
+    /// condition in one object, so the state it guards has to live beside it
+    /// rather than inside it. (`NodeCache` and `NodeBuilder` only ever needed
+    /// mutual exclusion, which is why they did move.)
+    private final class QualityOfServiceClassPool: @unchecked Sendable {
+        let qualityOfServiceClass: qos_class_t
+
+        /// Thread name for this pool's workers, class-suffixed so a spindump
+        /// shows which class's pool grew and whether an item landed in the
+        /// wrong one. `pthread_setname_np` caps names at 63 bytes; the longest
+        /// here is 51.
+        let workerThreadName: String
+
+        /// Ceiling for demand-driven growth in steady state.
+        private let steadyStateWorkerLimit: Int
+
+        /// Ceiling including the allowance for blocking submissions.
+        ///
+        /// A fan-out inside a batch needs room for the outer items *and* the
+        /// inner ones they wait on; both are bounded by the caller's own
+        /// concurrency, which is in turn bounded by the core count. A few
+        /// times the steady-state limit covers the nesting depths that occur
+        /// in practice. Each worker reserves address space rather than memory,
+        /// so the cost of the headroom is a kernel thread structure per worker.
+        private let burstWorkerLimit: Int
+
+        /// Test hook: makes every spawn attempt fail as if the OS refused to
+        /// create the thread, so the failure paths can be exercised on a
+        /// private pool instance. Never set on the shared pool.
+        ///
+        /// Immutable, and set only at construction. Every other mutable
+        /// property on this type is touched exclusively under `condition`,
+        /// but `spawnWorker()` runs *after* the lock is released, so a
+        /// settable hook would be an unsynchronized read racing any writer —
+        /// leaving the type's `@unchecked Sendable` audit resting on call-site
+        /// discipline rather than on the lock it otherwise uses uniformly (and
+        /// a torn read of the 64-bit `TimeInterval` is representable on 32-bit
+        /// armv7k). `let` removes the race outright instead of moving it under
+        /// the lock, which would make the delay's `Thread.sleep` block every
+        /// other submitter.
+        private let simulatesSpawnFailureForTesting: Bool
+
+        /// Test hook: how long a simulated spawn failure takes to report. A
+        /// real `pthread_create` failure is not instantaneous either; the delay
+        /// holds concurrent submitters in the reserved-but-not-yet-failed state
+        /// at the same time, which is the interleaving the failure handling
+        /// has to survive.
+        private let simulatedSpawnFailureDelayForTesting: TimeInterval
+
+        init(
+            qualityOfServiceClass: qos_class_t,
+            steadyStateWorkerLimit: Int,
+            burstWorkerLimit: Int,
+            simulatesSpawnFailureForTesting: Bool,
+            simulatedSpawnFailureDelayForTesting: TimeInterval
+        ) {
+            self.qualityOfServiceClass = qualityOfServiceClass
+            self.workerThreadName = "swift-demangling.large-stack-worker." + Self.threadNameSuffix(for: qualityOfServiceClass)
+            self.steadyStateWorkerLimit = steadyStateWorkerLimit
+            self.burstWorkerLimit = burstWorkerLimit
+            self.simulatesSpawnFailureForTesting = simulatesSpawnFailureForTesting
+            self.simulatedSpawnFailureDelayForTesting = simulatedSpawnFailureDelayForTesting
         }
-        condition.unlock()
 
-        if needsAdditionalWorker, !spawnWorker() {
+        private static func threadNameSuffix(for qualityOfServiceClass: qos_class_t) -> String {
+            switch qualityOfServiceClass {
+            case QOS_CLASS_BACKGROUND: return "background"
+            case QOS_CLASS_UTILITY: return "utility"
+            case QOS_CLASS_DEFAULT: return "default"
+            case QOS_CLASS_USER_INITIATED: return "user-initiated"
+            case QOS_CLASS_USER_INTERACTIVE: return "user-interactive"
+            default: return "unknown"
+            }
+        }
+
+        private let condition = NSCondition()
+        private var pendingWorkItems: [@Sendable () -> Void] = []
+        /// Index of the next item to run. Removing from the front of the array
+        /// instead would memmove the whole queue while holding the lock.
+        private var nextWorkItemIndex = 0
+        private var idleWorkerCount = 0
+        private var workerCount = 0
+
+        var currentWorkerCount: Int {
             condition.lock()
-            workerCount -= 1
-            if workerCount == 0 {
-                // Workers never retire, so a zero count here means no worker
-                // thread exists at all — and a concurrent submitter that saw
-                // this thread's reservation may have queued an item and
-                // blocked on it. Run everything still queued right here so
-                // nobody waits on a pool that cannot act, then refuse.
-                drainPendingWorkItemsWhileLocked()
+            defer { condition.unlock() }
+            return workerCount
+        }
+
+        func trySubmit(allowingOverflow: Bool, _ workItem: @escaping @Sendable () -> Void) -> Bool {
+            condition.lock()
+            let queuedCount = pendingWorkItems.count - nextWorkItemIndex
+            let workerLimit = allowingOverflow ? burstWorkerLimit : steadyStateWorkerLimit
+            let needsAdditionalWorker = queuedCount + 1 > idleWorkerCount && workerCount < workerLimit
+            if needsAdditionalWorker {
+                workerCount += 1
+            }
+            condition.unlock()
+
+            if needsAdditionalWorker, !spawnWorker() {
+                condition.lock()
+                workerCount -= 1
+                if workerCount == 0 {
+                    // Workers never retire, so a zero count here means no worker
+                    // thread exists at all — and a concurrent submitter that saw
+                    // this thread's reservation may have queued an item and
+                    // blocked on it. Run everything still queued right here so
+                    // nobody waits on a pool that cannot act, then refuse.
+                    drainPendingWorkItemsWhileLocked()
+                    condition.unlock()
+                    return false
+                }
+                condition.unlock()
+            }
+
+            condition.lock()
+            guard workerCount > 0 else {
+                // Every counted worker turned out to be a failed reservation and
+                // the last roll-back already ran its drain. Queueing now would
+                // strand the item: refuse instead.
                 condition.unlock()
                 return false
             }
+            pendingWorkItems.append(workItem)
+            condition.signal()
             condition.unlock()
+            return true
         }
 
-        condition.lock()
-        guard workerCount > 0 else {
-            // Every counted worker turned out to be a failed reservation and
-            // the last roll-back already ran its drain. Queueing now would
-            // strand the item: refuse instead.
-            condition.unlock()
-            return false
+        /// Runs every queued item on the calling thread. Entered with the lock
+        /// held and `workerCount == 0`; leaves the lock held.
+        ///
+        /// The lock is released around each item — items block on semaphores of
+        /// their own and may take arbitrarily long. New items queued meanwhile are
+        /// picked up on the next pass; they can only come from submitters racing
+        /// the same collapse, and running them here is what unblocks those
+        /// submitters. Runs at the drainer's own class, which is this pool's
+        /// class by construction.
+        private func drainPendingWorkItemsWhileLocked() {
+            while nextWorkItemIndex < pendingWorkItems.count {
+                let workItem = pendingWorkItems[nextWorkItemIndex]
+                pendingWorkItems[nextWorkItemIndex] = {}
+                nextWorkItemIndex += 1
+                if nextWorkItemIndex == pendingWorkItems.count {
+                    pendingWorkItems.removeAll(keepingCapacity: true)
+                    nextWorkItemIndex = 0
+                }
+                condition.unlock()
+                autoreleasepool {
+                    workItem()
+                }
+                condition.lock()
+            }
         }
-        pendingWorkItems.append(
-            PendingWorkItem(work: workItem, submitterQualityOfService: resolvedSubmitterQualityOfService())
-        )
-        condition.signal()
-        condition.unlock()
-        return true
-    }
 
-    /// Runs every queued item on the calling thread. Entered with the lock
-    /// held and `workerCount == 0`; leaves the lock held.
-    ///
-    /// The lock is released around each item — items block on semaphores of
-    /// their own and may take arbitrarily long. New items queued meanwhile are
-    /// picked up on the next pass; they can only come from submitters racing
-    /// the same collapse, and running them here is what unblocks those
-    /// submitters.
-    private func drainPendingWorkItemsWhileLocked() {
-        while nextWorkItemIndex < pendingWorkItems.count {
-            let workItem = pendingWorkItems[nextWorkItemIndex]
-            pendingWorkItems[nextWorkItemIndex] = .cleared
-            nextWorkItemIndex += 1
-            if nextWorkItemIndex == pendingWorkItems.count {
-                pendingWorkItems.removeAll(keepingCapacity: true)
-                nextWorkItemIndex = 0
+        /// Starts one worker at this pool's class, reporting whether the OS
+        /// actually made the thread.
+        ///
+        /// `Thread`/`NSThread` is deliberately not used here: `start()` returns
+        /// `Void` and swallows the failure this whole path exists to detect.
+        private func spawnWorker() -> Bool {
+            if simulatesSpawnFailureForTesting {
+                if simulatedSpawnFailureDelayForTesting > 0 {
+                    Thread.sleep(forTimeInterval: simulatedSpawnFailureDelayForTesting)
+                }
+                return false
             }
-            condition.unlock()
-            // Deliberately at the drainer's own QOS class: this is a
-            // submitter's thread, not the pool's to re-rank, and the path only
-            // runs when thread creation has collapsed process-wide.
-            autoreleasepool {
-                workItem.work()
+            var threadAttributes = pthread_attr_t()
+            guard pthread_attr_init(&threadAttributes) == 0 else { return false }
+            defer { pthread_attr_destroy(&threadAttributes) }
+            guard pthread_attr_setstacksize(&threadAttributes, StackSafeExecutor.largeStackThreadSize) == 0,
+                  pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
+            else {
+                return false
             }
-            condition.lock()
+            // The worker's class for life: every item it will ever run was
+            // submitted from a thread of this class, so the hop never needs a
+            // re-rank and the idle park never outranks its signaller.
+            _ = pthread_attr_set_qos_class_np(&threadAttributes, qualityOfServiceClass, 0)
+
+            let context = Unmanaged.passRetained(self).toOpaque()
+            var threadHandle: pthread_t?
+            let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
+                let classPool = Unmanaged<QualityOfServiceClassPool>.fromOpaque(rawContext).takeRetainedValue()
+                pthread_setname_np(classPool.workerThreadName)
+                classPool.runWorkerLoop()
+                return nil
+            }, context)
+            guard creationResult == 0 else {
+                Unmanaged<QualityOfServiceClassPool>.fromOpaque(context).release()
+                return false
+            }
+            return true
         }
-    }
 
-    /// Starts one worker, reporting whether the OS actually made the thread.
-    ///
-    /// `Thread`/`NSThread` is deliberately not used here: `start()` returns
-    /// `Void` and swallows the failure this whole path exists to detect.
-    private func spawnWorker() -> Bool {
-        if simulatesSpawnFailureForTesting {
-            if simulatedSpawnFailureDelayForTesting > 0 {
-                Thread.sleep(forTimeInterval: simulatedSpawnFailureDelayForTesting)
-            }
-            return false
-        }
-        var threadAttributes = pthread_attr_t()
-        guard pthread_attr_init(&threadAttributes) == 0 else { return false }
-        defer { pthread_attr_destroy(&threadAttributes) }
-        guard pthread_attr_setstacksize(&threadAttributes, StackSafeExecutor.largeStackThreadSize) == 0,
-              pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
-        else {
-            return false
-        }
-        // Spawned from the submitter's thread, so this is the class of the
-        // work the new worker will most likely dequeue first; the worker loop
-        // re-ranks itself per dequeued item from then on.
-        _ = pthread_attr_set_qos_class_np(&threadAttributes, resolvedSubmitterQualityOfService(), 0)
+        private func runWorkerLoop() {
+            LargeStackThreadPool.markCurrentThreadAsPoolWorker()
 
-        let context = Unmanaged.passRetained(self).toOpaque()
-        var threadHandle: pthread_t?
-        let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
-            let pool = Unmanaged<LargeStackThreadPool>.fromOpaque(rawContext).takeRetainedValue()
-            pthread_setname_np("swift-demangling.large-stack-worker")
-            pool.runWorkerLoop()
-            return nil
-        }, context)
-        guard creationResult == 0 else {
-            Unmanaged<LargeStackThreadPool>.fromOpaque(context).release()
-            return false
-        }
-        return true
-    }
+            while true {
+                condition.lock()
+                idleWorkerCount += 1
+                while nextWorkItemIndex == pendingWorkItems.count {
+                    condition.wait()
+                }
+                idleWorkerCount -= 1
+                let workItem = pendingWorkItems[nextWorkItemIndex]
+                // Drop the queue's reference to the closure. `removeAll` below only
+                // runs when the queue happens to drain completely, so under a
+                // sustained burst every already-executed item would otherwise stay
+                // alive — each one retaining whatever its caller captured, which on
+                // the print and remangle paths is a whole `Node` tree.
+                pendingWorkItems[nextWorkItemIndex] = {}
+                nextWorkItemIndex += 1
+                if nextWorkItemIndex == pendingWorkItems.count {
+                    pendingWorkItems.removeAll(keepingCapacity: true)
+                    nextWorkItemIndex = 0
+                }
+                condition.unlock()
 
-    private func runWorkerLoop() {
-        Self.markCurrentThreadAsPoolWorker()
-
-        while true {
-            condition.lock()
-            idleWorkerCount += 1
-            if nextWorkItemIndex == pendingWorkItems.count {
-                // About to park. Drop to background first: `condition.wait()`
-                // cannot inherit priority (no condition variable can — the
-                // future signaller is unknown), so a worker parked above its
-                // eventual signaller's class is what the Thread Performance
-                // Checker reports as a priority inversion. Dequeuing work
-                // re-ranks to that item's class below. NSCondition's mutex
-                // does donate priority, so briefly holding it at background
-                // is not itself an inversion.
-                _ = pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0)
-            }
-            while nextWorkItemIndex == pendingWorkItems.count {
-                condition.wait()
-            }
-            idleWorkerCount -= 1
-            let workItem = pendingWorkItems[nextWorkItemIndex]
-            // Drop the queue's reference to the closure. `removeAll` below only
-            // runs when the queue happens to drain completely, so under a
-            // sustained burst every already-executed item would otherwise stay
-            // alive — each one retaining whatever its caller captured, which on
-            // the print and remangle paths is a whole `Node` tree.
-            pendingWorkItems[nextWorkItemIndex] = .cleared
-            nextWorkItemIndex += 1
-            if nextWorkItemIndex == pendingWorkItems.count {
-                pendingWorkItems.removeAll(keepingCapacity: true)
-                nextWorkItemIndex = 0
-            }
-            condition.unlock()
-
-            // Run at the submitter's class: the submitter is typically blocked
-            // on this very item across a semaphore that donates nothing, and
-            // running below its class would be the real inversion.
-            _ = pthread_set_qos_class_self_np(workItem.submitterQualityOfService, 0)
-
-            // The predecessor created a thread per call, and a thread drains
-            // its own pool when it exits — so no explicit pool was needed. Long-
-            // lived workers remove that drain point: without this, an
-            // autoreleased object's release would move from "end of the call" to
-            // "end of the process". The pool created the hazard; this closes it.
-            autoreleasepool {
-                workItem.work()
+                // The predecessor created a thread per call, and a thread drains
+                // its own pool when it exits — so no explicit pool was needed. Long-
+                // lived workers remove that drain point: without this, an
+                // autoreleased object's release would move from "end of the call" to
+                // "end of the process". The pool created the hazard; this closes it.
+                autoreleasepool {
+                    workItem()
+                }
             }
         }
     }
