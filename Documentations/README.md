@@ -34,6 +34,8 @@
 3. [SpanBorrowedViews.md](SpanBorrowedViews.md) — 第三步：读路径。扫描器字节化、
    借用视图、打印 walk 去 ARC，以及为此引入的双路径门控结构。
 4. [StackSafety.md](StackSafety.md) — 与内存方向正交，处理的是递归深度和线程栈。
+   接着看 [LargeStackTaskExecutor.md](LargeStackTaskExecutor.md)：async 管线怎么把「每次
+   调用跳一次线程」变成「整个任务零跳转」。
 5. [KnownIssues.md](KnownIssues.md) — 已知问题与 review 裁决记录，随时查。正在处理
    PR #7 的 review 发现时，配套看 [ReviewFindingsPR7.md](ReviewFindingsPR7.md)（未裁决的
    本轮发现清单，闭环后清空）。
@@ -48,6 +50,7 @@
 | [NodeStoreArena.md](NodeStoreArena.md) | `NodeStore` arena 式紧凑存储。节点平铺进连续缓冲，每节点 12 字节、无对象头、无引用计数；printer 与 TypeDecoder 泛型化后可零物化直读。 | 做整个二进制的批量索引、或要动 `Store/` 下的代码时。 | [ArenaStorage](Concepts/ArenaStorage.md) |
 | [SpanBorrowedViews.md](SpanBorrowedViews.md) | 0008 的实现说明：扫描器改为 `Span<UInt8>` 字节扫描（demangle +21.7%）、免二次校验的文本物化、store 打印 walk 去 ARC（吞吐翻倍，walk 期间 store ARC 恰 1 对）。重点是随之引入的**双轴门控结构**（OS 版本 / 编译器能力）、四条纪律、维护契约，以及「`unowned(unsafe)` 为什么不够」这类只有量了才知道的坑。 | 要动 `Demangler` 扫描器、`Store/` 读路径、或任何 `#available(macOS 26)` / `hasFeature(Lifetimes)` 门控代码时。**新增文本物化点前必读**。 | [ArenaStorage](Concepts/ArenaStorage.md) |
 | [StackSafety.md](StackSafety.md) | 栈安全模型：与上游同构的「8MB 大栈 + 固定深度上限」，加上引擎之外全部整树遍历的迭代化（含 `Node` 的迭代式析构）。也记录了曾短暂采用、后因调试器挂死 / 优先级反转 / 工作量不受限而撤回的 `StackBudget` 方案。 | 新增递归、调整深度上限、或排查深符号崩溃时。**动上限前必读**。 | [RecursionAndStack](Concepts/RecursionAndStack.md) |
+| [LargeStackTaskExecutor.md](LargeStackTaskExecutor.md) | 大栈任务执行器（0.6.3，提案 0014）。async 管线跑在 512 KB 协作线程上，每次 print 都跳一次线程（8–21 µs）且 `withLargeStack` 包不住 `await`；解法是把任务整体放到本库自建的 16 MB 线程上，探针（看剩余栈、不看线程身份）对每次调用直接放行，引擎零改动。从零讲起：跳转是什么、为什么贵、SE-0417 的执行器机制、为什么要分池、job 优先级怎么变成 QoS 类、16 MB 实测关掉了哪些崩溃窗口。 | 下游要接入执行器、或想搞清楚「为什么任务放到大栈线程上就不用跳了」时。 | [RecursionAndStack](Concepts/RecursionAndStack.md) |
 | [KnownIssues.md](KnownIssues.md) | code-review 的**裁决记录**，两部分：① 已确认真实存在但暂缓修复的条目（含复现方式与修法方向）——第 1 条已于 2026-08-16 全部修完并关闭，其余 5 条仍在暂缓；② 判定为误报或刻意设计的 22 条（N1–N22）。**修复后登记与发现后登记同样是硬要求**：第 1 条正是因为修完 5 处没登记，让第 6 处顶着「已裁决」标签躲过了一整轮 review。 | 每次 code-review 之前——已裁决且理由仍成立的发现直接跳过，不必重新推导。 | [TraversalCost](Concepts/TraversalCost.md) |
 | [MeasurementToolbox.md](MeasurementToolbox.md) | **测量工具箱**：性能/内存结论背后的计量工具（malloc 事件计数 + 大分配阈值、footprint 峰值采样、retain/release interpose 计数）、三级语料、环境开关速查，以及「量错了还不自知」的坑——事件数看不见拷贝成本、同进程第二遍量不到 footprint 尖峰、机器不空闲计时作废（每条都真实踩过）。 | 要给任何改动做性能/内存验收、或复跑历史基准数字时。**跑基准前必读**。 | — |
 | [AlignmentGaps.md](AlignmentGaps.md) | 与上游 Swift 编译器 `Demangling` 源码的对齐缺口追踪（基准 `swift-6.3.2-RELEASE`，审计日期 2026-06-20，对照的是 `main`）。 | 跟进上游新增 kind、或排查与官方 demangler 行为不一致时。 | — |
