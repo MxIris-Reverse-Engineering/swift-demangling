@@ -148,6 +148,22 @@ extension Node {
         }
     }
 
+    /// Whether this node is a generic parameter type, looking through `.type`
+    /// wrappers (upstream `isGenericParamType`, Swift 6.4). Same bounded loop
+    /// as `isProtocol`, for the same reason.
+    public var isGenericParamType: Bool {
+        var currentNode = self
+        var unwrapDepth = 0
+        while currentNode.kind == .type {
+            unwrapDepth += 1
+            guard unwrapDepth <= Self.maxTypeWrapperUnwrapDepth,
+                  let onlyChild = currentNode.children.first
+            else { return false }
+            currentNode = onlyChild
+        }
+        return currentNode.kind == .dependentGenericParamType
+    }
+
     // `isSimpleType`, `needSpaceBeforeType`, `isIdentifier(desired:)`, and
     // `isSwiftModule` live in the `DemanglingNode` protocol extension
     // (DemanglingNode.swift) as the single implementation for both `Node`

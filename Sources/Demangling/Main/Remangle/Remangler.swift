@@ -1053,6 +1053,8 @@ struct Remangler {
             try mangleIVarInitializer(node, depth: depth)
         case .implErasedIsolation:
             try mangleImplErasedIsolation(node, depth: depth)
+        case .implNonisolatedNonsendingIsolation:
+            try mangleImplNonisolatedNonsendingIsolation(node, depth: depth)
         case .implParameterImplicitLeading:
             try mangleImplParameterImplicitLeading(node, depth: depth)
         case .implFunctionConventionName:
@@ -1069,10 +1071,10 @@ struct Remangler {
             try mangleUnknownIndex(node, depth: depth)
         case .initAccessor:
             try mangleInitAccessor(node, depth: depth)
-        case .modify2Accessor:
-            try mangleModify2Accessor(node, depth: depth)
-        case .read2Accessor:
-            try mangleRead2Accessor(node, depth: depth)
+        case .yieldingMutateAccessor:
+            try mangleYieldingMutateAccessor(node, depth: depth)
+        case .yieldingBorrowAccessor:
+            try mangleYieldingBorrowAccessor(node, depth: depth)
         case .borrowAccessor:
             try mangleBorrowAccessor(node, depth: depth)
         case .mutateAccessor:
@@ -3229,6 +3231,8 @@ extension Remangler {
                 append("e")
             case .implErasedIsolation:
                 append("A")
+            case .implNonisolatedNonsendingIsolation:
+                append("N")
             case .implSendingResult:
                 append("T")
             case .implConvention:
@@ -3788,13 +3792,21 @@ extension Remangler {
     // discriminator (child 3) LAST. The MangledChar values come from MacroRoles.def
     // (Accessor='a', MemberAttribute='r', Member='m', Peer='p', Conformance='c',
     // Extension='e', Body='b').
+    /// Upstream `mangleAttachedMacro` (Swift 6.4): an attached macro expansion
+    /// has three or four children — the attached name is absent when the
+    /// expansion is itself the context of another expansion — and the
+    /// discriminator is always the last child, mangled after the operator.
     private mutating func mangleAttachedMacroExpansion(_ node: Node, roleChar: String, depth: Int) throws(ManglingError) {
-        try mangleChildNode(node, at: 0, depth: depth + 1)
-        try mangleChildNode(node, at: 1, depth: depth + 1)
-        try mangleChildNode(node, at: 2, depth: depth + 1)
+        guard node.numberOfChildren >= 1 else {
+            throw .invalidNodeStructure(node, message: "AttachedMacroExpansion needs at least 1 child")
+        }
+        let discriminatorIndex = node.numberOfChildren - 1
+        for childIndex in 0 ..< discriminatorIndex {
+            try mangleChildNode(node, at: childIndex, depth: depth + 1)
+        }
         append("fM")
         append(roleChar)
-        try mangleChildNode(node, at: 3, depth: depth + 1)
+        try mangleChildNode(node, at: discriminatorIndex, depth: depth + 1)
     }
 
     private mutating func mangleAccessorAttachedMacroExpansion(_ node: Node, depth: Int) throws(ManglingError) {
@@ -3888,6 +3900,10 @@ extension Remangler {
 
     private mutating func mangleImplErasedIsolation(_ node: Node, depth: Int) throws(ManglingError) {
         append("A")
+    }
+
+    private mutating func mangleImplNonisolatedNonsendingIsolation(_ node: Node, depth: Int) throws(ManglingError) {
+        append("N")
     }
 
     private mutating func mangleIsSerialized(_ node: Node, depth: Int) throws(ManglingError) {
@@ -4059,9 +4075,9 @@ extension Remangler {
         try mangleAbstractStorage(node._firstChild, accessorCode: "m", depth: depth + 1)
     }
 
-    private mutating func mangleModify2Accessor(_ node: Node, depth: Int) throws(ManglingError) {
+    private mutating func mangleYieldingMutateAccessor(_ node: Node, depth: Int) throws(ManglingError) {
         guard node.children.count >= 1 else {
-            throw .invalidNodeStructure(node, message: "Modify2Accessor needs at least 1 child")
+            throw .invalidNodeStructure(node, message: "YieldingMutateAccessor needs at least 1 child")
         }
         try mangleAbstractStorage(node._firstChild, accessorCode: "x", depth: depth + 1)
     }
@@ -4108,9 +4124,9 @@ extension Remangler {
         try mangleAbstractStorage(node._firstChild, accessorCode: "aO", depth: depth + 1)
     }
 
-    private mutating func mangleRead2Accessor(_ node: Node, depth: Int) throws(ManglingError) {
+    private mutating func mangleYieldingBorrowAccessor(_ node: Node, depth: Int) throws(ManglingError) {
         guard node.children.count >= 1 else {
-            throw .invalidNodeStructure(node, message: "Read2Accessor needs at least 1 child")
+            throw .invalidNodeStructure(node, message: "YieldingBorrowAccessor needs at least 1 child")
         }
         try mangleAbstractStorage(node._firstChild, accessorCode: "y", depth: depth + 1)
     }
@@ -5184,6 +5200,8 @@ extension Remangler {
                 constPropPrefix = ""
             case .closureProp:
                 append("c")
+            case .escapingClosureProp:
+                append("E")
             case .closurePropPreviousArg:
                 guard idx < end, let prevIdx = node.children[idx].index else {
                     throw .invalidNodeStructure(node, message: "ClosurePropPreviousArg missing index")

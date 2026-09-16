@@ -203,6 +203,8 @@ depth 计数器根本没机会涨。上游 C++ 有完全相同的洞，靠「调
 
 ### 八、任务执行器：让整个 task 住在 16MB 线程上（2026-09-03，提案 0014）
 
+> 本节是浓缩版；从零讲起的完整版见 [LargeStackTaskExecutor.md](LargeStackTaskExecutor.md)。
+
 - **问题**：探针按调用线程的剩余栈判断，协作线程的 512KB 永远不过；async 打印循环包不进同步的
   `withLargeStack`，于是每次 print 付一次线程往返（下游 MachOSwiftSection 实测 release 下 8–21 µs）。
 - **做法**：`LargeStackTaskExecutor`（`@_spi(Internals)`，经 `StackSafeExecutor.taskExecutor` 取用，

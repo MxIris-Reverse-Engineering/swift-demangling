@@ -331,6 +331,15 @@ public struct FunctionTypeFlags: OptionSet {
     }
 }
 
+/// Isolation of a SIL impl function type (upstream `ImplFunctionIsolation`,
+/// Swift 6.4). One field replaces the former erased-isolation bit because
+/// `@isolated(any)` (`A`) and `nonisolated(nonsending)` (`N`) are exclusive.
+public enum ImplFunctionIsolation: Sendable {
+    case unknown
+    case nonisolatedNonsending
+    case erased
+}
+
 /// Implementation function type flags
 public struct ImplFunctionTypeFlags {
     private var rep: UInt8 = 0
@@ -338,7 +347,7 @@ public struct ImplFunctionTypeFlags {
     private var escaping: Bool = false
     private var concurrent: Bool = false
     private var async: Bool = false
-    private var erasedIsolation: Bool = false
+    private var isolation: ImplFunctionIsolation = .unknown
     private var differentiabilityKind: UInt8 = 0
     private var sendingResult: Bool = false
 
@@ -354,12 +363,34 @@ public struct ImplFunctionTypeFlags {
         diffKind: ImplFunctionDifferentiabilityKind,
         hasSendingResult: Bool
     ) {
+        self.init(
+            rep: rep,
+            pseudogeneric: pseudogeneric,
+            noescape: noescape,
+            concurrent: concurrent,
+            async: async,
+            isolation: erasedIsolation ? .erased : .unknown,
+            diffKind: diffKind,
+            hasSendingResult: hasSendingResult
+        )
+    }
+
+    public init(
+        rep: ImplFunctionRepresentation,
+        pseudogeneric: Bool,
+        noescape: Bool,
+        concurrent: Bool,
+        async: Bool,
+        isolation: ImplFunctionIsolation,
+        diffKind: ImplFunctionDifferentiabilityKind,
+        hasSendingResult: Bool
+    ) {
         self.rep = repToUInt8(rep)
         self.pseudogeneric = pseudogeneric
         self.escaping = noescape
         self.concurrent = concurrent
         self.async = async
-        self.erasedIsolation = erasedIsolation
+        self.isolation = isolation
         self.differentiabilityKind = diffKindToUInt8(diffKind)
         self.sendingResult = hasSendingResult
     }
@@ -422,7 +453,9 @@ public struct ImplFunctionTypeFlags {
     public func isEscaping() -> Bool { escaping }
     public func isSendable() -> Bool { concurrent }
     public func isPseudogeneric() -> Bool { pseudogeneric }
-    public func hasErasedIsolation() -> Bool { erasedIsolation }
+    public func getIsolation() -> ImplFunctionIsolation { isolation }
+    public func hasErasedIsolation() -> Bool { isolation == .erased }
+    public func hasNonisolatedNonsendingIsolation() -> Bool { isolation == .nonisolatedNonsending }
     public func hasSendingResult() -> Bool { sendingResult }
     public func isDifferentiable() -> Bool {
         return getDifferentiabilityKind() != .nonDifferentiable
@@ -454,7 +487,13 @@ public struct ImplFunctionTypeFlags {
 
     public func withErasedIsolation() -> ImplFunctionTypeFlags {
         var copy = self
-        copy.erasedIsolation = true
+        copy.isolation = .erased
+        return copy
+    }
+
+    public func withNonisolatedNonsendingIsolation() -> ImplFunctionTypeFlags {
+        var copy = self
+        copy.isolation = .nonisolatedNonsending
         return copy
     }
 

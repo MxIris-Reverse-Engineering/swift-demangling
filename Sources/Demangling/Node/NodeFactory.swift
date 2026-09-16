@@ -458,6 +458,7 @@ public final class NodeCache: Sendable {
             NodeFactory.accessibleFunctionRecord,
             NodeFactory.implEscaping,
             NodeFactory.implErasedIsolation,
+            NodeFactory.implNonisolatedNonsendingIsolation,
             NodeFactory.implSendingResult,
             NodeFactory.isSerialized,
             NodeFactory.asyncRemoved,
@@ -567,6 +568,7 @@ public enum NodeFactory {
     // Impl function markers
     public static let implEscaping = Node(kind: .implEscaping)
     public static let implErasedIsolation = Node(kind: .implErasedIsolation)
+    public static let implNonisolatedNonsendingIsolation = Node(kind: .implNonisolatedNonsendingIsolation)
     public static let implSendingResult = Node(kind: .implSendingResult)
 
     // Serialization/async markers

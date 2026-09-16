@@ -7,7 +7,7 @@
 - **所属愿景**: `Evolutions/README.md` 愿景第 3 条（计价纪律与健壮性：深符号在 512 KB 协作线程栈上爆栈是真实事故形态）与第 4 条（API 演进：实验期 API 圈在 `@_spi(Internals)`，OS 版本用 `#available` 双路径）
 - **关联提案**: [0002](0002-stack-safety.md)（`StackSafeExecutor` 与 8 MB 大栈的由来）、[0013](0013-punycode-upstream-parity-and-review-round-four-fixes.md)（`StackSafeExecutor` 的 QoS 分池是 0.6.2 的内容，本提案在其上加一组执行器线程）；下游 MachOSwiftSection 提案 `draft-large-stack-executor-and-cross-version-parallelism`（接入方）
 - **实现分支 / PR**: `next`，与本提案同批次提交；目标版本 0.6.3（合入 `main` 后打 tag——仓库没有 CHANGELOG 文件，发版就是 tag）
-- **配套文档**: `Documentations/StackSafety.md` 第八节「任务执行器」；`KnownIssues.md` #4 已更新；`README.md`「Deep Generic Nesting and Thread Stacks」一节；`AGENTS.md` 栈安全段
+- **配套文档**: `Documentations/LargeStackTaskExecutor.md`（面向任何开发者的完整讲解：怎么优化、为什么成立、细节与实测）；`Documentations/StackSafety.md` 第八节「任务执行器」；`KnownIssues.md` #4 已更新；`README.md`「Deep Generic Nesting and Thread Stacks」一节；`AGENTS.md` 栈安全段
 
 ## 摘要
 

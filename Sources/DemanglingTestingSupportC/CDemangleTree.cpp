@@ -49,7 +49,16 @@ static bool           sLoadOk   = false;
 static std::once_flag sLoadFlag;
 
 static void loadOnce() {
-    // Try well-known Xcode toolchain path, then fall back to DYLD search.
+    // DEVELOPER_DIR selects the toolchain, the same way xcrun resolves it, so
+    // the oracle follows whatever Xcode the test run was pointed at
+    // (evolution 0015: Swift 6.4 lives in Xcode 27, not the default Xcode).
+    if (const char *developerDir = getenv("DEVELOPER_DIR")) {
+        std::string developerDirLibrary = std::string(developerDir) +
+            "/Toolchains/XcodeDefault.xctoolchain/usr/lib/libswiftDemangle.dylib";
+        sLib = dlopen(developerDirLibrary.c_str(), RTLD_LAZY);
+    }
+
+    // Otherwise try the well-known Xcode toolchain path, then DYLD search.
     static const char *paths[] = {
         "/Applications/Xcode.app/Contents/Developer/Toolchains/"
         "XcodeDefault.xctoolchain/usr/lib/libswiftDemangle.dylib",
@@ -57,9 +66,8 @@ static void loadOnce() {
         nullptr
     };
 
-    for (int i = 0; paths[i]; ++i) {
+    for (int i = 0; !sLib && paths[i]; ++i) {
         sLib = dlopen(paths[i], RTLD_LAZY);
-        if (sLib) break;
     }
     if (!sLib) return;
 

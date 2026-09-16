@@ -2849,7 +2849,7 @@ struct DemangleSwiftProjectDerivedTests {
 
     @Test func _$s2hi1SV1iSivx() {
         let input = "$s2hi1SV1iSivx"
-        let output = "hi.S.i.modify2 : Swift.Int"
+        let output = "hi.S.i.yielding_mutate : Swift.Int"
         do {
             let parsed = try demangleAsNode(input)
             let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
@@ -2861,7 +2861,7 @@ struct DemangleSwiftProjectDerivedTests {
 
     @Test func _$s2hi1SV1iSivy() {
         let input = "$s2hi1SV1iSivy"
-        let output = "hi.S.i.read2 : Swift.Int"
+        let output = "hi.S.i.yielding_borrow : Swift.Int"
         do {
             let parsed = try demangleAsNode(input)
             let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
@@ -2966,6 +2966,189 @@ struct DemangleSwiftProjectDerivedTests {
     @Test func _$s16sending_mangling16NonSendableKlassCACIegTiTr_A2CIegTxTo_TR() {
         let input = "$s16sending_mangling16NonSendableKlassCACIegTiTr_A2CIegTxTo_TR"
         let output = "reabstraction thunk helper from @escaping @callee_guaranteed (@in sending sending_mangling.NonSendableKlass) -> sending (@out sending_mangling.NonSendableKlass) to @escaping @callee_guaranteed (@owned sending sending_mangling.NonSendableKlass) -> sending (@owned sending_mangling.NonSendableKlass)"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    // MARK: - Added to upstream test/Demangle/Inputs/manglings.txt between
+    // swift-6.3.2-RELEASE and swift-6.4.0-RELEASE (evolution 0015).
+
+    @Test func _$s3foo7closureSSTf1EC0_n() {
+        let input = "$s3foo7closureSSTf1EC0_n"
+        let output = "function signature specialization <Arg[0] = [Escaping Closure Propagated : closure, Argument Types : [Swift.String], Arg[1] = [Same As Argument 0]> of foo"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s4mini3SeqPxAA06BorrowB0TN() {
+        let input = "$s4mini3SeqPxAA06BorrowB0TN"
+        let output = "default associated conformance accessor for mini.Seq.A: mini.BorrowSeq"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s4mini3SeqPxAA06BorrowB0Tn() {
+        let input = "$s4mini3SeqPxAA06BorrowB0Tn"
+        let output = "associated conformance descriptor for mini.Seq.A: mini.BorrowSeq"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5assoc9ncElementyyxAA1PRz0C0Rj_zlF() {
+        let input = "$s5assoc9ncElementyyxAA1PRz0C0Rj_zlF"
+        let output = "assoc.ncElement<A where A: assoc.P, A.Element: ~Swift.Copyable>(A) -> ()"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5assoc6ncIteryyxAA1PRzlF() {
+        let input = "$s5assoc6ncIteryyxAA1PRzlF"
+        let output = "assoc.ncIter<A where A: assoc.P>(A) -> ()"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5assoc6ncBothyyxAA1PRz7ElementRj_zlF() {
+        let input = "$s5assoc6ncBothyyxAA1PRz7ElementRj_zlF"
+        let output = "assoc.ncBoth<A where A: assoc.P, A.Element: ~Swift.Copyable>(A) -> ()"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5assoc12bothCopyableyyxAA1PRzs0C08IteratorRpzlF() {
+        let input = "$s5assoc12bothCopyableyyxAA1PRzs0C08IteratorRpzlF"
+        let output = "assoc.bothCopyable<A where A: assoc.P, A.Iterator: Swift.Copyable>(A) -> ()"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5assoc6HolderVAARi_z7ElementRj_zrlE02ncC0yyqd__AA1PRd__ADRj_d__lF() {
+        let input = "$s5assoc6HolderVAARi_z7ElementRj_zrlE02ncC0yyqd__AA1PRd__ADRj_d__lF"
+        let output = "(extension in assoc):assoc.Holder< where A: ~Swift.Copyable, A.Element: ~Swift.Copyable>.ncElement<A where A1: assoc.P, A1.Element: ~Swift.Copyable>(A1) -> ()"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5assoc6HolderVAA7ElementRj_zrlE19forceIntoInterface5yyF() {
+        let input = "$s5assoc6HolderVAA7ElementRj_zrlE19forceIntoInterface5yyF"
+        let output = "(extension in assoc):assoc.Holder< where A.Element: ~Swift.Copyable>.forceIntoInterface5() -> ()"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5assoc6HolderVAARi_z7ElementRj_zrlE12copyableIteryyqd__AA1PRd__s8Copyable8IteratorRpd__lF() {
+        let input = "$s5assoc6HolderVAARi_z7ElementRj_zrlE12copyableIteryyqd__AA1PRd__s8Copyable8IteratorRpd__lF"
+        let output = "(extension in assoc):assoc.Holder< where A: ~Swift.Copyable, A.Element: ~Swift.Copyable>.copyableIter<A where A1: assoc.P, A1.Iterator: Swift.Copyable>(A1) -> ()"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s5thing1PP1sAA1SVvxTwc() {
+        let input = "$s5thing1PP1sAA1SVvxTwc"
+        let output = "coro function pointer to thing.P.s.yielding_mutate : thing.S"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s7Library1BC1iSivxTwd() {
+        let input = "$s7Library1BC1iSivxTwd"
+        let output = "default override of Library.B.i.yielding_mutate : Swift.Int"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$s7Library1BC1iSivxTwdTwc() {
+        let input = "$s7Library1BC1iSivxTwdTwc"
+        let output = "coro function pointer to default override of Library.B.i.yielding_mutate : Swift.Int"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$sSiBW() {
+        let input = "$sSiBW"
+        let output = "Builtin.Borrow<Swift.Int>"
+        do {
+            let parsed = try demangleAsNode(input)
+            let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))
+            #expect(result == output, "Failed to demangle \(input).\nGot\n    \(result)\nexpected\n    \(output)")
+        } catch {
+            Issue.record("Failed to demangle \(input). Got \(error), expected \(output)")
+        }
+    }
+
+    @Test func _$sBAIeNghHgIL_BAytIeNghHgILr_TR() {
+        let input = "$sBAIeNghHgIL_BAytIeNghHgILr_TR"
+        let output = "reabstraction thunk helper from @escaping @caller_isolated @callee_guaranteed @Sendable @async (@guaranteed Builtin.ImplicitActor) -> () to @escaping @caller_isolated @callee_guaranteed @Sendable @async (@guaranteed Builtin.ImplicitActor) -> (@out ())"
         do {
             let parsed = try demangleAsNode(input)
             let result = parsed.print(using: .default.union(.synthesizeSugarOnTypes))

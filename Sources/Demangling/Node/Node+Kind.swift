@@ -151,6 +151,7 @@ extension Node {
         case implErrorResult
         case implEscaping
         case implErasedIsolation
+        case implNonisolatedNonsendingIsolation
         case implSendingResult
         case implParameterResultDifferentiability
         case implParameterSending
@@ -206,7 +207,7 @@ extension Node {
         case methodDescriptor
         case methodLookupFunction
         case modifyAccessor
-        case modify2Accessor
+        case yieldingMutateAccessor
         case module
         case mutateAccessor
         case moduleDescriptor
@@ -307,7 +308,7 @@ extension Node {
         case reabstractionThunkHelperWithGlobalActor
         case reabstractionThunkHelperWithSelf
         case readAccessor
-        case read2Accessor
+        case yieldingBorrowAccessor
         case representationChanged
         case reflectionMetadataAssocTypeDescriptor
         case reflectionMetadataBuiltinDescriptor
@@ -427,7 +428,7 @@ extension Node.Kind {
              .isolatedDeallocator,
              .materializeForSet,
              .modifyAccessor,
-             .modify2Accessor,
+             .yieldingMutateAccessor,
              .mutateAccessor: fallthrough
         case .module,
              .nativeOwningAddressor: fallthrough
@@ -444,7 +445,7 @@ extension Node.Kind {
              .protocol,
              .protocolSymbolicReference,
              .readAccessor: fallthrough
-        case .read2Accessor,
+        case .yieldingBorrowAccessor,
              .setter,
              .static: fallthrough
         case .structure,
@@ -585,5 +586,36 @@ extension Sequence where Element == Node.Kind {
             .dependentGenericConformanceRequirement,
             .dependentGenericInverseConformanceRequirement,
         ]
+    }
+}
+
+// MARK: - Swift 6.4 renames (evolution 0015)
+
+extension Node.Kind {
+    /// Swift 6.4 renamed `Read2Accessor` to `YieldingBorrowAccessor` (SE-0474);
+    /// the mangling character `y` and the tree shape are unchanged.
+    @available(*, deprecated, renamed: "yieldingBorrowAccessor", message: "Swift 6.4 renamed Read2Accessor to YieldingBorrowAccessor (SE-0474).")
+    public static var read2Accessor: Node.Kind { .yieldingBorrowAccessor }
+
+    /// Swift 6.4 renamed `Modify2Accessor` to `YieldingMutateAccessor` (SE-0474);
+    /// the mangling character `x` and the tree shape are unchanged.
+    @available(*, deprecated, renamed: "yieldingMutateAccessor", message: "Swift 6.4 renamed Modify2Accessor to YieldingMutateAccessor (SE-0474).")
+    public static var modify2Accessor: Node.Kind { .yieldingMutateAccessor }
+
+    /// Raw values retired by a rename. `init(from:)` still accepts them so a
+    /// kind encoded before the rename decodes to the renamed case.
+    static let retiredRawValues: [String: Node.Kind] = [
+        "read2Accessor": .yieldingBorrowAccessor,
+        "modify2Accessor": .yieldingMutateAccessor,
+    ]
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+        if let kind = Node.Kind(rawValue: rawValue) ?? Node.Kind.retiredRawValues[rawValue] {
+            self = kind
+            return
+        }
+        throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unknown Node.Kind raw value \"\(rawValue)\"")
     }
 }

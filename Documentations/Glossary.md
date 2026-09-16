@@ -55,6 +55,8 @@
 | **debug vs release 帧大小** | 未优化构建的栈帧大一个数量级（printer 每层约 11.6 KB），这是本库与上游环境的唯一本质差别。 |
 | **trap vs SIGSEGV** | trap 是**可预期的主动中止**（`precondition`、整数转换越界）；SIGSEGV 是失控（多半是栈耗尽）。 |
 | **`StackSafeExecutor`** | 调用线程剩余栈 ≥ 2 MB 就地跑，否则搬到 8 MB 栈的常驻 worker；批量场景用 `withLargeStack {}` 包一次。 |
+| **跳转（hop）** | `StackSafeExecutor` 把一次调用搬到大栈 worker 上跑并等结果。worker 常驻，所以贵的不是建线程而是每次的排队、唤醒与信号量等待（release 下 8–21 µs）。 |
+| **任务执行器 / `StackSafeExecutor.taskExecutor`** | 本库自建的 16 MB 线程组成的 `TaskExecutor`（macOS 15 起，`@_spi(Internals)`）。任务整体放上去后，任务内每次调用探针直接放行、零跳转——`withLargeStack` 包不住 `await`，这是 async 管线的对应物。详见 [LargeStackTaskExecutor.md](LargeStackTaskExecutor.md)。 |
 
 ---
 
