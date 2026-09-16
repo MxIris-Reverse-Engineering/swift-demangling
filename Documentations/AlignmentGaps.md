@@ -5,11 +5,16 @@
 
 ## 对齐基准
 
-- **上游版本**：`swift-6.3.2-RELEASE`（`/Volumes/SwiftProjects/swift-project/swift`）。
-- **关键事实**：上游 `swift-6.3-RELEASE` → `6.3.1` → `6.3.2` 之间，`lib/Demangling/` 与
-  `include/swift/Demangling/` **0 次提交**，三个 tag 的 demangling 源码逐字节相同。"跟进 6.3.2"
-  等价于"全面对齐到 6.3 系列"。
-- **审计日期**：2026-06-20。标 ✓ 的条目已逐行复核上游原文 / 当前 main 代码。
+- **上游版本**：`swift-6.4.0-RELEASE`（`/Volumes/SwiftProjects/swift-project/swift`，commit `b8189d766d8`）。
+  6.3.2 → 6.4.0 的增量审计见文末「6.3.2 → 6.4.0 增量」一节（2026-09-16，对照 `next`，evolution 0015）；
+  下面 Part A / Part B 是 2026-06-20 对 `swift-6.3.2-RELEASE` 的审计，作为历史记录原样保留。
+- **Ground truth 是 Apple 工具链**：本机 `Xcode-27.0.app` 是 Apple Swift 6.4（`swiftlang-6.4.0.34.1`），
+  语料 oracle 与 `AppleAlignmentTests` 的 6.4 期望均以它的 `swift-demangle` / `libswiftDemangle.dylib` 为准。
+  `Xcode.app`（26.6）是 Apple Swift 6.3.3，对 6.4 的每一种新 mangling 都拒绝、dump 仍写 `Read2Accessor`——
+  用它跑 oracle 会在所有带 `vy` / `vx` accessor 的符号上 mismatch。
+- **关键事实（6.3 系列）**：上游 `swift-6.3-RELEASE` → `6.3.1` → `6.3.2` 之间，`lib/Demangling/` 与
+  `include/swift/Demangling/` **0 次提交**，三个 tag 的 demangling 源码逐字节相同。
+- **6.3.2 审计日期**：2026-06-20。标 ✓ 的条目已逐行复核上游原文 / 当时的 main 代码。
 
 ---
 
@@ -246,3 +251,68 @@ StandardTypes 替换表（含 `TaskExecutor`/`UnownedJob`/`MainActor`/`Cancellat
 2. **对齐检查要看接受集，不只看输出**：`main` 与工具链在这 2582 个符号上输出没有任何差
    异——因为工具链**根本不输出**，它拒绝。只比对「双方都成功时的输出」的审计方法对这
    一整类缺口结构性失明；需要的是差分 fuzz（构造语料 → 比对 accept/reject 两侧）。
+
+---
+
+## 6.3.2 → 6.4.0 增量（2026-09-16，evolution 0015）
+
+依据 `git diff swift-6.3.2-RELEASE swift-6.4.0-RELEASE -- include/swift/Demangling lib/Demangling
+docs/ABI/Mangling.rst` 的**内容比对**（不是 commit 列表——`git log 6.3.2..6.4.0` 会把 main 上的
+cherry-pick 源也列进来）。每一项都用 Xcode 27.0 的 `swift-demangle` 逐条确认过期望值。
+
+| 上游改动 | 状态 | 本仓库落点 |
+|---|---|---|
+| `DemangleNodes.def` 新增 `BuiltinBorrow` | ✅ 早已有（B-L3 关闭，见下） | `Demangler.swift` `case "W"`、`NodePrinter`、`Remangler`、`TypeDecoder`（本批补 `createBuiltinBorrowType`） |
+| `DemangleNodes.def` 新增 `ImplNonisolatedNonsendingIsolation` | ✅ 本批 | `Node.Kind` 新 case、`NodeFactory` 单例、`Demangler` 在 `A` 之后 `N`、`NodePrinter` `@caller_isolated`、`Remangler` `N`、`TypeDecoder` `withNonisolatedNonsendingIsolation()` |
+| `Read2Accessor` → `YieldingBorrowAccessor`、`Modify2Accessor` → `YieldingMutateAccessor`（SE-0474；字符 `y` / `x` 不变） | ✅ 本批 | `Node.Kind` 改名，旧名保留为 deprecated 静态别名，`init(from:)` 接受旧 rawValue；打印 `yielding_borrow` / `yielding_mutate` |
+| `FunctionSigSpecializationParamKind::EscapingClosureProp = 12`，ARG-SPEC-KIND `E` | ✅ 本批 | enum case + 描述 "Escaping Closure Propagated"；demangler / printer 与 `closureProp` 同分支；remangler 写 `E` |
+| `demangleGenericRequirement` 新 case `j`（Inverse, Assoc）/ `J`（Inverse, CompoundAssoc） | ✅ 本批 | 同。`Rj` / `RJ` 在 6.3.2 的 Mangling.rst 里就已文档化（1079–1080 行），是 demangler 补实现 |
+| `popAssociatedConformanceWitnessAccessorSubject`：`Tn` / `TN` 的 subject 可以是泛型参数（`type type protocol 'Tn'`） | ✅ 本批 | 同名方法 + `Node.isGenericParamType`（与 `isProtocol` 同款有界循环） |
+| `Remangler::mangleAttachedMacro`：attached macro 3 或 4 个子节点，discriminator 永远最后且在操作符之后（4542ea9904f） | ✅ 本批 | `mangleAttachedMacroExpansion` 改为可变子节点。3 子节点形状是「peer 展开自身作为另一次展开的 context」；Apple 6.4 的 printer 对它会崩溃，本仓库 printer 用 `.at()` 安全索引不崩，但输出不可信，只固化 remangle 往返 |
+| `TypeDecoder.h`：`ImplFunctionIsolation` 三值枚举替换 erased 位，删 `hasErasedIsolation()` | ✅ 本批（保留兼容面） | `ImplFunctionTypeFlags` 内部改存 `ImplFunctionIsolation`；`hasErasedIsolation()`、Bool 版 init 保留，新增 `getIsolation()` / `hasNonisolatedNonsendingIsolation()` / `withNonisolatedNonsendingIsolation()` / isolation 版 init |
+| `TypeDecoder.h`：`Builder.createBuiltinBorrowType` | ✅ 本批 | `TypeBuilder.createBuiltinBorrowType(referent:)` 协议要求，**无默认实现**（下游 MachOSwiftSection 要求：不要返回假 metadata 的静默默认） |
+| `TypeDecoder.h`：值泛型加固——`allowValue`、`decodeMangledGenericArgument`、`isConcreteIntegerValue` + `Builder.isValueGenericParameter`，拒绝把整数绑到非值泛型参数（`Optional<99>`） | ⏸ **推迟**（C-1） | 见下 |
+| `DemangleInitRAII` 保存 / 恢复 `Words[MaxNumWords]`（嵌套 demangle 的 use-after-free，e3ae0756a1c） | ➖ 不适用 | 本仓库的 `symbolicReferenceResolver` 是纯闭包，拿不到 Demangler；`Demangler` 是每次调用新建的 `~Escapable` 结构体，新 mangling 路径上没有同实例嵌套。唯一的同实例「入口再入」在 `_T` 旧 mangling 里，是另一个 bug（C-2） |
+| `OldRemangler` 三处 | ➖ 不适用 | 本仓库无 OldRemangler（B-L6） |
+| `Errors.cpp` 改名 `DemanglingErrorHandling.cpp`、删 `Punycode.h` include、`StringSwitch.Cases({...})` | ➖ 纯上游工程 | — |
+| 2abf087e71f（checked ObjC async completion handler 的 `TZ`） | ✅ 早已有 | 该 commit 早于 6.3.2，两个 tag 都是 `CheckedObjCAsyncCompletionHandlerImpl`；本仓库已有对应 kind 与 `TZ` 子节点顺序（0、1、[3]、`TZ`、2）。remangler 函数仍叫 `manglePredefinedObjCAsyncCompletionHandlerImpl`，纯命名遗留 |
+
+### B-L3 关闭：`builtinBorrow`（`BW`）从「port 自创」变成上游节点
+
+2026-06-21 逆向 Apple 6.3.2 `swift-demangle` 时 `demangleBuiltinType` 无 `'W'`，本项被记为 port 多余项。
+上游 bc166d5a8c8 在 6.4.0 加入了完全相同的形状（pop 一个 Type 作 referent，`createType` 包裹），
+Apple 6.4 的 dump 为 `Global → BuiltinBorrow → Type → Structure(Swift.Int)`，与本仓库一致；
+`$sSiBW` 在 Apple 6.4 打印 `Builtin.Borrow<Swift.Int>`，在 Apple 6.3.3 原样返回。
+下游实测：swift-section 0.19.0（依赖本库 0.6.3）dump macOS 27.0 cache 的 libswiftCore，`Swift.Ref` 打出
+`let builtin: Builtin.Borrow<A>`。
+
+### Mangling.rst 的一处上游文档自相矛盾（勿「修正」本仓库）
+
+6.4.0 的 Mangling.rst 把 ACCESSOR `'y'` 注释改为 `'yielding borrow' (formerly read)`、`'z'` 改为
+`'yielding modify' (formerly mutate)`，但 `DemangleNodes.def` / `Demangler.cpp` 实际改名的是 `'y'`
+（Read2 → YieldingBorrow）与 `'x'`（Modify2 → YieldingMutate）；`'z'` 仍是 `MutateAccessor`、打印
+`mutate`，`'b'` 仍是 `BorrowAccessor`。以代码与 Apple 工具链输出为准。
+
+### 新登记
+
+- **C-1 TypeDecoder 值泛型加固（推迟）**：上游 `TypeDecoder.h` 在 `decodeMangledType` 加 `allowValue`
+  （根层默认允许、递归默认拒绝），`Integer` / `NegativeInteger` 出现在「必须是类型」的位置时报错
+  `integer value where a type is required`；泛型实参位置改走 `decodeMangledGenericArgument`；
+  `BoundGeneric*` 分支用 `isConcreteIntegerValue` + `Builder.isValueGenericParameter(typeDecl, i)` 拒绝
+  `Optional<99>`。动机是 runtime 把整数当 metadata 指针解引用崩溃。它改变本库 `TypeDecoder` 的接受集，
+  与 6.4 新 kind 无关，单独审。需要新增 `TypeBuilder.isValueGenericParameter(typeDecl:index:) -> Bool?`
+  （可给返回 `nil` 的默认实现——下游已确认可接受）。
+- **C-2 `_T` 旧 mangling 的 `XB` 分支再入 package 入口（Low）**：`Demangler.swift` 的 Swift 3 SILBox-with-layout
+  分支（`case "X"` → `"B"`）对每个 field / generic arg 调用的是会 `reset()` 整个扫描器与栈的 package 入口
+  `demangleType()`，而不是 `demangleSwift3Type()`，是移植笔误（上游 `OldDemangler` 调用的是它自己的
+  `demangleType`）。`_T` 前缀已基本绝迹（CLAUDE.md 记录决定不移植 `OldDemangler` 的 `MaxDepth`），
+  不在 0015 批次内修。
+
+### 验收：语料 oracle（2026-09-16，Xcode 27.0 的 `libswiftDemangle.dylib`，`DEVELOPER_DIR` 指向它）
+
+| 语料 | 符号总数 | Passed | Known issues（`Md`/`MD`） | Demangle 失败 | NodeTree mismatch | Remangle mismatch |
+|---|---|---|---|---|---|---|
+| 本机 macOS 26.6 cache（`.current`） | 4,530,817 | 4,530,817 | 32,804 | 0 | 0 | 0 |
+| macOS 27.0 cache（`DEMANGLING_DYLD_CACHE=macOS_27_0`，Swift 6.4 编译） | 5,774,625 | 5,774,625 | 43,238 | 0 | 0 | 0 |
+
+同一次运行的全套单测：615 条 / 40 个 suite 全绿（`swift test` 原始退出码 0）。

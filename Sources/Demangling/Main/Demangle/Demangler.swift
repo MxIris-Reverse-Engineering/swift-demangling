@@ -723,6 +723,21 @@ extension Demangler {
         return createNode(kind: .assocTypePath, children: assocTypePath.reversed())
     }
 
+    /// Upstream `popAssociatedConformanceWitnessAccessorSubject` (Swift 6.4):
+    /// the subject of `Tn` / `TN` is either an associated type path or, since
+    /// 6.4, a bare generic parameter type (`type type protocol 'Tn'`). A popped
+    /// type that is not a generic parameter goes back on the stack so the
+    /// associated type path pops it again as its protocol.
+    private mutating func popAssociatedConformanceWitnessAccessorSubject() throws(DemanglingError) -> Node {
+        if let type = pop(kind: .type) {
+            if type.isGenericParamType {
+                return type
+            }
+            nameStack.append(type)
+        }
+        return try popAssociatedTypePath()
+    }
+
     private mutating func popProtocolConformance() throws(DemanglingError) -> Node {
         let genSig = pop(kind: .dependentGenericSignature)
         let module = try require(popModule())
@@ -1396,6 +1411,10 @@ extension Demangler {
             typeChildren.append(NodeFactory.implErasedIsolation)
         }
 
+        if scanner.conditional(scalar: "N") {
+            typeChildren.append(NodeFactory.implNonisolatedNonsendingIsolation)
+        }
+
         if let peek = scanner.peek(), let differentiability = Differentiability(rawValue: peek) {
             try scanner.skip()
             typeChildren.append(createNode(kind: .implDifferentiabilityKind, contents: .index(UInt64(differentiability.rawValue))))
@@ -1820,14 +1839,14 @@ extension Demangler {
         case "M": return try createNode(kind: .defaultAssociatedTypeMetadataAccessor, child: require(popAssociatedTypeName()))
         case "n":
             let requirement = try popProtocol()
-            let associatedTypePath = try popAssociatedTypePath()
+            let subject = try popAssociatedConformanceWitnessAccessorSubject()
             let protocolType = try require(pop(kind: .type))
-            return createNode(kind: .associatedConformanceDescriptor, children: [protocolType, associatedTypePath, requirement])
+            return createNode(kind: .associatedConformanceDescriptor, children: [protocolType, subject, requirement])
         case "N":
             let requirement = try popProtocol()
-            let associatedTypePath = try popAssociatedTypePath()
+            let subject = try popAssociatedConformanceWitnessAccessorSubject()
             let protocolType = try require(pop(kind: .type))
-            return createNode(kind: .defaultAssociatedConformanceAccessor, children: [protocolType, associatedTypePath, requirement])
+            return createNode(kind: .defaultAssociatedConformanceAccessor, children: [protocolType, subject, requirement])
         case "b":
             let requirement = try popProtocol()
             let protocolType = try require(pop(kind: .type))
@@ -2077,7 +2096,7 @@ extension Demangler {
                       case .index(let kindValue) = kindNode.contents else { continue }
                 let paramKind = FunctionSigSpecializationParamKind(rawValue: kindValue)
                 switch paramKind {
-                case .closureProp:
+                case .closureProp, .escapingClosureProp:
                     while let typeNode = pop(kind: .type) {
                         param = param.addingChild(typeNode)
                     }
@@ -2108,6 +2127,10 @@ extension Demangler {
         case "c":
             // Consumes an identifier and multiple type parameters. Added later.
             children.append(createNode(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.closureProp.rawValue)))
+        case "E":
+            // Like "c", but for escaping closures (Swift 6.4). Consumes an
+            // identifier and multiple type parameters. Added later.
+            children.append(createNode(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.escapingClosureProp.rawValue)))
         case "C":
             // ClosurePropPreviousArg: consumes an index
             children.append(createNode(kind: .functionSignatureSpecializationParamKind, contents: .index(FunctionSigSpecializationParamKind.closurePropPreviousArg.rawValue)))
@@ -2530,9 +2553,9 @@ extension Demangler {
         case "w": kind = .willSet
         case "W": kind = .didSet
         case "r": kind = .readAccessor
-        case "y": kind = .read2Accessor
+        case "y": kind = .yieldingBorrowAccessor
         case "M": kind = .modifyAccessor
-        case "x": kind = .modify2Accessor
+        case "x": kind = .yieldingMutateAccessor
         case "i": kind = .initAccessor
         case "b": kind = .borrowAccessor
         case "z": kind = .mutateAccessor
@@ -2731,6 +2754,12 @@ extension Demangler {
             inverseKind = try demangleIndexAsName()
         case "I":
             constraintAndTypeKinds = (.inverse, .substitution)
+            inverseKind = try demangleIndexAsName()
+        case "j":
+            constraintAndTypeKinds = (.inverse, .assoc)
+            inverseKind = try demangleIndexAsName()
+        case "J":
+            constraintAndTypeKinds = (.inverse, .compoundAssoc)
             inverseKind = try demangleIndexAsName()
         default:
             constraintAndTypeKinds = (.protocol, .generic)

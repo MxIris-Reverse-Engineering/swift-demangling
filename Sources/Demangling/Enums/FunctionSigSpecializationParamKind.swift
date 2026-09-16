@@ -11,6 +11,8 @@ enum FunctionSigSpecializationParamKind: UInt64, CaseIterable, Sendable {
     case constantPropKeyPath = 9
     case constantPropStruct = 10
     case closurePropPreviousArg = 11
+    /// Like `closureProp`, but for escaping closures (Swift 6.4, `E`).
+    case escapingClosureProp = 12
 
     case dead = 64
     case ownedToGuaranteed = 128
@@ -33,6 +35,7 @@ extension FunctionSigSpecializationParamKind {
         case .closurePropPreviousArg: return "Same As Argument"
         case .constantPropString: return "Constant Propagated String"
         case .closureProp: return "Closure Propagated"
+        case .escapingClosureProp: return "Escaping Closure Propagated"
         case .existentialToGeneric: return "Existential To Protocol Constrained Generic"
         case .dead: return "Dead"
         case .inOutToOut: return "InOut Converted to Out"

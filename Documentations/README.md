@@ -53,7 +53,7 @@
 | [LargeStackTaskExecutor.md](LargeStackTaskExecutor.md) | 大栈任务执行器（0.6.3，提案 0014）。async 管线跑在 512 KB 协作线程上，每次 print 都跳一次线程（8–21 µs）且 `withLargeStack` 包不住 `await`；解法是把任务整体放到本库自建的 16 MB 线程上，探针（看剩余栈、不看线程身份）对每次调用直接放行，引擎零改动。从零讲起：跳转是什么、为什么贵、SE-0417 的执行器机制、为什么要分池、job 优先级怎么变成 QoS 类、16 MB 实测关掉了哪些崩溃窗口。 | 下游要接入执行器、或想搞清楚「为什么任务放到大栈线程上就不用跳了」时。 | [RecursionAndStack](Concepts/RecursionAndStack.md) |
 | [KnownIssues.md](KnownIssues.md) | code-review 的**裁决记录**，两部分：① 已确认真实存在但暂缓修复的条目（含复现方式与修法方向）——第 1 条已于 2026-08-16 全部修完并关闭，其余 5 条仍在暂缓；② 判定为误报或刻意设计的 22 条（N1–N22）。**修复后登记与发现后登记同样是硬要求**：第 1 条正是因为修完 5 处没登记，让第 6 处顶着「已裁决」标签躲过了一整轮 review。 | 每次 code-review 之前——已裁决且理由仍成立的发现直接跳过，不必重新推导。 | [TraversalCost](Concepts/TraversalCost.md) |
 | [MeasurementToolbox.md](MeasurementToolbox.md) | **测量工具箱**：性能/内存结论背后的计量工具（malloc 事件计数 + 大分配阈值、footprint 峰值采样、retain/release interpose 计数）、三级语料、环境开关速查，以及「量错了还不自知」的坑——事件数看不见拷贝成本、同进程第二遍量不到 footprint 尖峰、机器不空闲计时作废（每条都真实踩过）。 | 要给任何改动做性能/内存验收、或复跑历史基准数字时。**跑基准前必读**。 | — |
-| [AlignmentGaps.md](AlignmentGaps.md) | 与上游 Swift 编译器 `Demangling` 源码的对齐缺口追踪（基准 `swift-6.3.2-RELEASE`，审计日期 2026-06-20，对照的是 `main`）。 | 跟进上游新增 kind、或排查与官方 demangler 行为不一致时。 | — |
+| [AlignmentGaps.md](AlignmentGaps.md) | 与上游 Swift 编译器 `Demangling` 源码的对齐缺口追踪（基准 `swift-6.4.0-RELEASE`；6.3.2 审计 2026-06-20 对照 `main`，6.4.0 增量 2026-09-16 对照 `next`，见文末）。 | 跟进上游新增 kind、或排查与官方 demangler 行为不一致时。 | — |
 | [ReviewFindingsPR7.md](ReviewFindingsPR7.md) | **临时文件**：PR #7（`feature/node-store`）一轮 `max` 档 review 的 15 条发现，每条带四问答案与修法方向，外加 9 条未验证的补充发现和一份移交清单。开篇的「元模式」一节总结了 6 条发现共有的根因——验证方法对某一类问题结构性失明。 | 接手修 PR #7 的发现时；或想知道「为什么 520 个测试全绿却仍有回归」。**条目闭环后从本文件移除，清空即删档。** | [KnownIssues.md](KnownIssues.md) |
 
 ## 其他位置的文档
@@ -77,6 +77,7 @@
   | `0012-review-round-three-structural-followups.md` | PR #7 第三轮 review 的四条结构性遗留（改几行定不下来的那些）：通用遍历 API 没享受到视图钉扎、scope 归属与片段缓存不组合、scope hook 挂在手挑的 kind 清单上、`reserveCapacity` 的钳制只防住了转换 trap。状态 `Draft`。 |
   | `0013-punycode-upstream-parity-and-review-round-four-fixes.md` | punycode 解码合并上游两层时，两层各自的守卫都漏了：数字域缺上界（`K`-`Z` 被当成数字）、分隔符前不拒非 basic code point、无效标量用 `.` 顶替而非拒绝——本库因此接受工具链拒绝的符号并编造标识符文本。同批修掉 `TypeDecoder` 窄化族漏下的第 6 处、`StackSafeExecutor` 的假注释与无锁测试 hook，并把 README 示例固化成可编译的测试。 |
   | `0014-large-stack-task-executor.md` | 下游 async 打印管线跑在 512 KB 协作线程上，每次 print 都付一次线程往返（8–21 µs）且 async 循环包不进 `withLargeStack`；新增 `TaskExecutor` 让任务整体住在 16 MB 线程上，探测直接通过。与阻塞池分池共码、`@_spi(Internals)`、`@available(macOS 15…)`；顺手关掉 `KnownIssues` #4 在执行器路径上打印器与 remangler 的两个窗口（实测 16 MB 关不掉 TypeDecoder 的，如实登记）。状态 `Implemented`，随 0.6.3 发布。 |
+  | `0015-swift-6-4-demangling-alignment.md` | 上游 6.3.2 → 6.4.0 的 `lib/Demangling` 全部改动逐项移植：新 kind `implNonisolatedNonsendingIsolation`（`@caller_isolated`）、`read2Accessor` / `modify2Accessor` 改名为 `yieldingBorrowAccessor` / `yieldingMutateAccessor`（旧名留弃用别名、`Codable` 兼容）、参数特化 `E`、requirement `j` / `J`、`Tn` / `TN` 的泛型参数 subject、attached macro 可变子节点 remangle、TypeDecoder 的三值 isolation 与 `createBuiltinBorrowType`。语料 oracle 的基准随之从 Apple Swift 6.3.3 切到 6.4（`DEVELOPER_DIR` 指向 Xcode 27）。值泛型加固推迟。状态 `Implemented`。 |
 
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」

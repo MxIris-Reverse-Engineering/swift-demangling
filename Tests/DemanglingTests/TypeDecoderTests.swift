@@ -198,6 +198,42 @@ struct TypeDecoderTests {
         #expect(result == "@async @callee_guaranteed () -> ()")
     }
 
+    /// Swift 6.4 (evolution 0015): the impl isolation slot is three-valued.
+    /// `A` is @isolated(any), `N` is nonisolated(nonsending) — printed
+    /// @caller_isolated — and the two are exclusive.
+    @Test(arguments: [
+        ("$sIeNg_D", "@caller_isolated @callee_guaranteed () -> ()"),
+        ("$sIeAg_D", "@isolated(any) @callee_guaranteed () -> ()"),
+    ])
+    func implFunctionTypeIsolation(mangled: String, expected: String) throws {
+        #expect(try Self.decodeType(mangled) == expected)
+    }
+
+    /// `ImplFunctionTypeFlags` keeps its 6.3 surface: the Bool initializer and
+    /// `hasErasedIsolation()` still work, mapped onto the isolation enum.
+    @Test func implFunctionTypeFlagsIsolationCompatibility() {
+        let erased = ImplFunctionTypeFlags(
+            rep: .thick, pseudogeneric: false, noescape: false, concurrent: false, async: false,
+            erasedIsolation: true, diffKind: .nonDifferentiable, hasSendingResult: false
+        )
+        #expect(erased.getIsolation() == .erased)
+        #expect(erased.hasErasedIsolation())
+        #expect(!erased.hasNonisolatedNonsendingIsolation())
+
+        let callerIsolated = ImplFunctionTypeFlags().withNonisolatedNonsendingIsolation()
+        #expect(callerIsolated.getIsolation() == .nonisolatedNonsending)
+        #expect(callerIsolated.hasNonisolatedNonsendingIsolation())
+        #expect(!callerIsolated.hasErasedIsolation())
+
+        #expect(ImplFunctionTypeFlags().getIsolation() == .unknown)
+    }
+
+    /// Swift 6.4 (evolution 0015): `BW` is `Builtin.Borrow<Referent>`, handed to
+    /// `TypeBuilder.createBuiltinBorrowType(referent:)`.
+    @Test func builtinBorrowType() throws {
+        #expect(try Self.decodeType("$sBwBWD") == "Builtin.Borrow<Word>")
+    }
+
     // MARK: - Existential Metatypes (Protocols)
     //
     // Source: swift/test/TypeDecoder/lowered_metatypes.swift
@@ -336,6 +372,10 @@ struct StringTypeBuilder: TypeBuilder {
 
     func createBuiltinFixedArrayType(size: String, element: String) -> String {
         return "Builtin.FixedArray<\(size), \(element)>"
+    }
+
+    func createBuiltinBorrowType(referent: String) -> String {
+        return "Builtin.Borrow<\(referent)>"
     }
 
     // MARK: Metatypes
@@ -520,6 +560,11 @@ struct StringTypeBuilder: TypeBuilder {
         var prefix = ""
         if flags.isAsync() { prefix += "@async " }
         if flags.isSendable() { prefix += "@Sendable " }
+        switch flags.getIsolation() {
+        case .unknown: break
+        case .nonisolatedNonsending: prefix += "@caller_isolated "
+        case .erased: prefix += "@isolated(any) "
+        }
 
         switch calleeConvention {
         case .directGuaranteed: prefix += "@callee_guaranteed "

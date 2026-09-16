@@ -468,6 +468,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .implCoroutineKind: printImplCoroutineKind(name)
         case .implDifferentiabilityKind: printImplDifferentiabilityKind(name)
         case .implErasedIsolation: target.write("@isolated(any)")
+        case .implNonisolatedNonsendingIsolation: target.write("@caller_isolated")
         case .implErrorResult: printChildren(name, prefix: "@error ", separator: " ")
         case .implParameter,
              .implResult: printImplParameter(name)
@@ -523,7 +524,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .methodDescriptor: printFirstChild(name, prefix: "method descriptor for ")
         case .methodLookupFunction: printFirstChild(name, prefix: "method lookup function for ")
         case .modifyAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "modify")
-        case .modify2Accessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "modify2")
+        case .yieldingMutateAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "yielding_mutate")
         case .mutateAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "mutate")
         case .module: printModule(name)
         case .moduleDescriptor: printFirstChild(name, prefix: "module descriptor ")
@@ -637,7 +638,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .reabstractionThunkHelperWithGlobalActor: printReabstracctionThunkHelperWithGlobalActor(name)
         case .reabstractionThunkHelperWithSelf: printReabstractionThunkHelperWithSelf(name)
         case .readAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "read")
-        case .read2Accessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "read2")
+        case .yieldingBorrowAccessor: return printAbstractStorage(name.children.first, asPrefixContext: asPrefixContext, extraName: "yielding_borrow")
         case .reflectionMetadataAssocTypeDescriptor: printFirstChild(name, prefix: "reflection metadata associated type descriptor ")
         case .reflectionMetadataBuiltinDescriptor: printFirstChild(name, prefix: "reflection metadata builtin descriptor ")
         case .reflectionMetadataFieldDescriptor: printFirstChild(name, prefix: "reflection metadata field descriptor ")
@@ -889,7 +890,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                 target.write(" : ")
                 printNextParamChildNode(name, argIdx: &argIdx, kind: k)
                 target.write("]")
-            case .closureProp:
+            case .closureProp, .escapingClosureProp:
                 if idx + 2 > end { return }
                 target.write("[")
                 _ = printOptional(name.children.at(idx))

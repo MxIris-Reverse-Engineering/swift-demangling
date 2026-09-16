@@ -108,6 +108,11 @@ public protocol TypeBuilder {
     /// Create builtin array types
     func createBuiltinFixedArrayType(size: BuiltType, element: BuiltType) -> BuiltType
 
+    /// Create `Builtin.Borrow<Referent>` (Swift 6.4, mangled `BW`).
+    /// Deliberately without a default implementation: a builder that cannot
+    /// represent it must say so itself rather than inherit a silent stand-in.
+    func createBuiltinBorrowType(referent: BuiltType) -> BuiltType
+
     // Objective-C support
     #if canImport(ObjectiveC)
     func createObjCClassType(name: String) -> BuiltType

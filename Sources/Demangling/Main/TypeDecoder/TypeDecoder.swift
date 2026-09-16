@@ -581,6 +581,9 @@ extension TypeDecoderEngine {
                 case .implErasedIsolation:
                     flags = flags.withErasedIsolation()
 
+                case .implNonisolatedNonsendingIsolation:
+                    flags = flags.withNonisolatedNonsendingIsolation()
+
                 case .implParameter:
                     try decodeImplFunctionParam(node: child, depth: depth + 1, results: &parameters)
 
@@ -1005,6 +1008,13 @@ extension TypeDecoderEngine {
                 throw TypeLookupError(node: node, message: "integer literal out of range")
             }
             return builder.createNegativeIntegerType(value: integerValue)
+
+        case .builtinBorrow:
+            guard node.children.count >= 1 else {
+                throw TypeLookupError(node: node, message: "fewer children (\(node.children.count)) than required (1)")
+            }
+            let referent = try decodeMangledType(node: node.children[0], depth: depth + 1)
+            return builder.createBuiltinBorrowType(referent: referent)
 
         case .builtinFixedArray:
             guard node.children.count >= 2 else {
