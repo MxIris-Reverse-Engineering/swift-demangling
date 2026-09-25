@@ -3,7 +3,7 @@
 - **状态**: Draft
 - **作者**: JH
 - **创建日期**: 2026-08-16
-- **最后更新**: 2026-08-16
+- **最后更新**: 2026-09-25
 - **所属愿景**: 无单一归属——四条留档条目分属 `Evolutions/README.md` 愿景第 3 条（计价纪律与健壮性）与第 4 条（API 演进）
 - **关联提案**: [0007](0007-short-circuit-queries-and-typedecoder-sweep.md)（同一类「横向排查漏了一族」的先例）、[0009](0009-swift-syntax-arena-lessons.md)（`reserveCapacity` 的引入方）、[0010](0010-appendable-shared-node-store.md)（视图钉扎纪律的确立方，本提案第 1 条是它的补扫）
 - **实现分支 / PR**: 未开始
@@ -67,6 +67,17 @@ nominal 的名字正是这么丢的：`LocalStruct` 自己 scope 为 nil，而�
 `04c959b`（基线 `next` 的最新提交）刚用 nil 屏障修完同族的嵌套类型分隔点误归属，
 本轮又是它的直接邻居——**作者在逐个撞见这类问题**。一次系统排查（把所有
 `target.write` 直写点 × scope 栈状态列一遍）比继续逐个撞便宜。
+
+> **2026-09-25 追记：上面点名的那个例子已经修了，结构性问题还在。** 下游
+> RuntimeViewer 报告「很多协议没有高亮、不能跳转」，查下来全是私有协议：名字包在
+> `privateDeclName` 里，经缓存的 `printName` 打印，既丢了这里说的 scope，也丢了
+> `parentKind`（`printEntity` 只给裸 `identifier` 传实体种类）。修法走了一条比本节方案
+> 窄得多的路：`printEntity` 把实体种类作为 `identifierParentKind` 传给三种包裹名字
+> （`privateDeclName` / `localDeclName` / `relatedEntityDeclName`），带着它的
+> `printName` 调用不进缓存——包裹名字于是直接写进外层 target，落在实体自己的 scope
+> 里。回归测试 `NodePrinterWrappedEntityNameTests`。**没有解决的**：其余经嵌套可缓存
+> `printName` 打印、又本该属于外层 scope 的文本，照样看不见外层 scope；本节的方案 A 与
+> 「先决动作」的直写点清点都仍然有效、仍未开始。
 
 ### 3. scope hook 挂在手挑的 kind 清单上
 

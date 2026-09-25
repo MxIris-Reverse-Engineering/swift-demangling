@@ -224,7 +224,9 @@ struct HighlightedTarget: NodePrinterTarget {
     // near-miss that fails to compile instead of silently doing nothing.
     mutating func write(_ content: String, context: @autoclosure () -> NodePrintContext?) {
         // context()?.state is .printIdentifier, .printKeyword, .printType, …
-        // and context()?.parentKind gives the enclosing node kind.
+        // For .printIdentifier, context()?.parentKind is the kind of the
+        // entity the identifier names (.protocol, .structure, .function, …),
+        // private and local names included.
         fragments.append((content, context()?.state))
     }
 
