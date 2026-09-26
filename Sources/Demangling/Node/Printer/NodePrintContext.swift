@@ -9,6 +9,14 @@
 /// this reason; this type holds one and had been left behind.
 public struct NodePrintContext: Sendable {
     public let node: Node?
+    /// For a `.printIdentifier` write, the kind of the entity the identifier
+    /// names — `.protocol`, `.structure`, `.function`, … — which is what a rich
+    /// target types the name by. It is the entity's kind even when the
+    /// demangled name wraps the identifier in another node: a `private` /
+    /// `fileprivate` declaration (`privateDeclName`), one declared in a
+    /// function body (`localDeclName`), or a Clang-imported related entity
+    /// (`relatedEntityDeclName`). `nil` where the printer attributes the
+    /// identifier to no entity.
     public let parentKind: Node.Kind?
     public let state: NodePrintState
 

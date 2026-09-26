@@ -138,7 +138,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         return target
     }
 
-    private mutating func printName(_ name: SomeNode, asPrefixContext: Bool = false) -> SomeNode? {
+    /// `identifierParentKind` is the kind of the entity a wrapped name belongs
+    /// to (see `printEntity`), handed down to the identifier inside the
+    /// wrapper; `nil` everywhere else.
+    private mutating func printName(_ name: SomeNode, asPrefixContext: Bool = false, identifierParentKind: Node.Kind? = nil) -> SomeNode? {
         // `<=`, not `<`: `printDepth` is still the *enclosing* frame count here
         // (the increment is below), so upstream's `if (depth > MaxDepth)` with a
         // depth-0 root truncates on the 770th frame. Spelling this `<` shaved a
@@ -158,8 +161,13 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         // `dependentMemberTypeDepth > 0` chain or `asPrefixContext` changes
         // the rendered output for the same node, and so does a temporary
         // options override (`optionsOverrideDepth > 0`), so those calls
-        // bypass the cache to stay correct.
-        let canCache = !asPrefixContext && dependentMemberTypeDepth == 0 && optionsOverrideDepth == 0
+        // bypass the cache to stay correct. An `identifierParentKind` changes
+        // no text but does change the context a rich target receives, and one
+        // wrapped-name node can belong to entities of different kinds — so
+        // those calls bypass it too. Bypassing also keeps the wrapped name in
+        // its entity's type-reference scope: a cached print writes into a
+        // fresh sub-target whose scope stack is empty (evolution 0012, item 2).
+        let canCache = !asPrefixContext && dependentMemberTypeDepth == 0 && optionsOverrideDepth == 0 && identifierParentKind == nil
         if canCache, let cached = printCache[name.printCacheIdentity] {
             target.append(cached)
             return nil
@@ -189,7 +197,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             target.append(subTarget)
             return result
         }
-        return dispatchPrintName(name, asPrefixContext: asPrefixContext)
+        return dispatchPrintName(name, asPrefixContext: asPrefixContext, identifierParentKind: identifierParentKind)
     }
 
     /// The `#N` discriminator displayed for a node index.
@@ -223,7 +231,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         )
     }
 
-    private mutating func dispatchPrintName(_ name: SomeNode, asPrefixContext: Bool = false) -> SomeNode? {
+    private mutating func dispatchPrintName(_ name: SomeNode, asPrefixContext: Bool = false, identifierParentKind: Node.Kind? = nil) -> SomeNode? {
         switch name.kind {
         case .accessibleFunctionRecord:
             if !options.contains(.shortenThunk) {
@@ -463,7 +471,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .globalVariableOnceFunction,
              .globalVariableOnceToken: printGlobalVariableOnceFunction(name)
         case .hasSymbolQuery: target.write("#_hasSymbol query for ")
-        case .identifier: printIdentifier(name, asPrefixContext: asPrefixContext)
+        case .identifier: printIdentifier(name, asPrefixContext: asPrefixContext, parentKind: identifierParentKind)
         case .implConvention: target.write(name.text ?? "")
         case .implCoroutineKind: printImplCoroutineKind(name)
         case .implDifferentiabilityKind: printImplDifferentiabilityKind(name)
@@ -509,7 +517,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .labelList: break
         case .lazyProtocolWitnessTableAccessor: printLazyProtocolWitnesstableAccessor(name)
         case .lazyProtocolWitnessTableCacheVariable: printLazyProtocolWitnesstableCacheVariable(name)
-        case .localDeclName: _ = printOptional(name.children.at(1), suffix: options.contains(.displayLocalNameContexts) ? " #\(displayDiscriminator(name.children.at(0)?.index ?? 0, of: name.kind))" : nil)
+        case .localDeclName: _ = printOptional(name.children.at(1), suffix: options.contains(.displayLocalNameContexts) ? " #\(displayDiscriminator(name.children.at(0)?.index ?? 0, of: name.kind))" : nil, identifierParentKind: identifierParentKind)
         case .macro: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: name.children.count == 3 ? .withColon : .functionStyle, hasName: true)
         case .macroExpansionLoc: printMacroExpansionLoc(name)
         case .macroExpansionUniqueName: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "unique name #", extraIndex: displayDiscriminator(name.children.at(2)?.index ?? 0, of: name.kind))
@@ -608,7 +616,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .peerAttachedMacroExpansion: return printMacro(name: name, asPrefixContext: asPrefixContext, label: "peer")
         case .postfixOperator: target.write("\(name.text ?? "") postfix")
         case .prefixOperator: target.write("\(name.text ?? "") prefix")
-        case .privateDeclName: printPrivateDeclName(name)
+        case .privateDeclName: printPrivateDeclName(name, identifierParentKind: identifierParentKind)
         case .propertyDescriptor: printFirstChild(name, prefix: "property descriptor for ")
         case .propertyWrapperBackingInitializer: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: false, extraName: "property wrapper backing initializer")
         case .propertyWrapperInitFromProjectedValue: return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: false, extraName: "property wrapper init from projected value")
@@ -645,8 +653,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .reflectionMetadataSuperclassDescriptor: printFirstChild(name, prefix: "reflection metadata superclass descriptor ")
         case .representationChanged: target.write("representation changed")
         case .relatedEntityDeclName:
+            // Child 0 is the related-entity kind (`e`), not a name, so only
+            // child 1 takes the entity's kind.
             printFirstChild(name, prefix: "related decl '", suffix: "' for ")
-            _ = printOptional(name.children.at(1))
+            _ = printOptional(name.children.at(1), identifierParentKind: identifierParentKind)
         case .resilientProtocolWitnessTable: printFirstChild(name, prefix: "resilient protocol witness table for ")
         case .retroactiveConformance: printRetroactiveConformance(name)
         case .returnType: printReturnType(name)
@@ -738,10 +748,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         return true
     }
 
-    private mutating func printOptional(_ optional: SomeNode?, prefix: String? = nil, suffix: String? = nil, asPrefixContext: Bool = false) -> SomeNode? {
+    private mutating func printOptional(_ optional: SomeNode?, prefix: String? = nil, suffix: String? = nil, asPrefixContext: Bool = false, identifierParentKind: Node.Kind? = nil) -> SomeNode? {
         guard let o = optional else { return nil }
         prefix.map { target.write($0) }
-        let r = printName(o)
+        let r = printName(o, identifierParentKind: identifierParentKind)
         suffix.map { target.write($0) }
         return r
     }
@@ -799,8 +809,8 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         }
     }
 
-    private mutating func printPrivateDeclName(_ name: SomeNode) {
-        _ = printOptional(name.children.at(1), prefix: options.contains(.showPrivateDiscriminators) ? "(" : nil)
+    private mutating func printPrivateDeclName(_ name: SomeNode, identifierParentKind: Node.Kind?) {
+        _ = printOptional(name.children.at(1), prefix: options.contains(.showPrivateDiscriminators) ? "(" : nil, identifierParentKind: identifierParentKind)
         target.write(options.contains(.showPrivateDiscriminators) ? "\(name.children.count > 1 ? " " : "(")in \(name.children.at(0)?.text ?? ""))" : "")
     }
 
@@ -2002,16 +2012,26 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             if let o = overwriteName {
                 target.write(o)
             } else {
+                // The entity's kind goes to the identifier that names it on
+                // every path — a rich target types the name by it — including
+                // the three wrappers a name can sit in: `private` /
+                // `fileprivate` (`privateDeclName`), declared in a function
+                // body (`localDeclName`), Clang-imported related entity
+                // (`relatedEntityDeclName`). Without it a private protocol
+                // reached the target as plain text.
                 if let one = name.children.at(1) {
-                    if one.kind != .privateDeclName {
-                        if one.kind == .identifier {
-                            printIdentifier(one, parentKind: name.kind)
-                        } else {
-                            _ = printName(one)
-                        }
+                    switch one.kind {
+                    case .identifier:
+                        printIdentifier(one, parentKind: name.kind)
+                    case .privateDeclName:
+                        break // printed below, after any other name child
+                    case .localDeclName, .relatedEntityDeclName:
+                        _ = printName(one, identifierParentKind: name.kind)
+                    default:
+                        _ = printName(one)
                     }
                     if let pdn = name.children.first(where: { $0.kind == .privateDeclName }) {
-                        _ = printName(pdn)
+                        _ = printName(pdn, identifierParentKind: name.kind)
                     }
                 }
             }
