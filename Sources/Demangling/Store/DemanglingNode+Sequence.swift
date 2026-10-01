@@ -216,9 +216,10 @@ extension Sequence where Element: DemanglingNode {
 
 // MARK: - Short-circuit kind queries over a whole subtree
 
-extension DemanglingNode where Self: Sequence, Self.Element == Self {
+extension DemanglingNode {
     /// One identity-deduped preorder pass returning the first node whose kind
-    /// the predicate accepts.
+    /// the predicate accepts — the default for the requirement, used by every
+    /// conformer without a faster walk of its own.
     ///
     /// Deduping is sound for *short-circuit* queries specifically: a repeat
     /// visit of a shared instance cannot contain anything its first visit did
@@ -228,7 +229,7 @@ extension DemanglingNode where Self: Sequence, Self.Element == Self {
     /// `filter(of:)`, the `preorder()` family) deliberately do NOT get this:
     /// they enumerate the logical tree, where occurrence counts are the
     /// correct answer (`KnownIssues.md` N6).
-    func firstNodeInDedupedPreorder(matching kindMatches: (Node.Kind) -> Bool) -> Self? {
+    public func firstNodeInDedupedPreorder(matching kindMatches: (Node.Kind) -> Bool) -> Self? {
         var pendingNodes: [Self] = [self]
         var visitedNodes: Set<PrintCacheIdentity> = []
         while let currentNode = pendingNodes.popLast() {
@@ -241,7 +242,9 @@ extension DemanglingNode where Self: Sequence, Self.Element == Self {
         }
         return nil
     }
+}
 
+extension DemanglingNode where Self: Sequence, Self.Element == Self {
     /// The first node of `kind` in preorder, or `nil`.
     ///
     /// Overrides the `Sequence` implementation for whole-subtree queries: on a
