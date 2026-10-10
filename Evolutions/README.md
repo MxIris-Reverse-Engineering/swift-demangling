@@ -57,6 +57,7 @@
 | [0014](0014-large-stack-task-executor.md) | 大栈 TaskExecutor：Swift Concurrency 任务整体跑在 16 MB 线程上，任务内 demangle / print / remangle 探测直接通过、零跳转；与阻塞跳转池分池共码，`@_spi(Internals)`，macOS 15 起 | Implemented |
 | [0015](0015-swift-6-4-demangling-alignment.md) | 对齐 Swift 6.4 的 lib/Demangling：新 kind、accessor 改名与 oracle 换基准 | Implemented |
 | [0016](0016-unretained-kind-queries.md) | 在 store 上按种类找节点时不碰引用计数 | Implemented |
+| [draft](draft-module-selectors.md) | 打印选项：用 SE-0491 的模块选择器（`Module::Name`）写限定名 | In Progress |
 
 ## 流程
 
