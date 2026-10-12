@@ -1,11 +1,11 @@
-# Draft - 打印选项：用 SE-0491 的模块选择器（`Module::Name`）写限定名
+# 0017 - 打印选项：用 SE-0491 的模块选择器（`Module::Name`）写限定名
 
-- **状态**: In Progress
+- **状态**: Implemented
 - **作者**: JH
 - **创建日期**: 2026-10-10
-- **最后更新**: 2026-10-10
-- **关联提案**: 下游 MachOSwiftSection 提案 `draft-module-selectors`（interface / dump 的同名开关建在本选项之上）
-- **实现分支 / PR**: `feature/module-selectors`
+- **最后更新**: 2026-10-12
+- **关联提案**: 下游 MachOSwiftSection 提案 `0064-module-selectors`（interface / dump 的同名开关建在本选项之上）
+- **实现分支 / PR**: `feature/module-selectors`（快进合入 `next`）
 
 ## 摘要
 
@@ -36,3 +36,4 @@ Swift 6.4 编译器生成 `.swiftinterface` 时默认就用这种写法（`Print
 | 2026-10-10 | 选项名 `useModuleSelectors` | 沿用编译器 `PrintOptions::UseModuleSelectors` 的名字，便于对照上游 |
 | 2026-10-10 | 默认关闭、不进任何预设 | 上游 demangler 没有这个选项，预设的输出要与官方 demangler 逐字节对齐（corpus oracle） |
 | 2026-10-10 | 验证 | `ModuleSelectorPrintingTests`（13 个符号形状 × Node 与 store 两条打印路径，外加富目标的模块写入）在只加选项声明、未接行为时 26 处失败，实现后全过；全量 `swift test` 624 个测试 / 43 个套件通过，原始退出码 0（含与官方 demangler 逐字节对照的语料测试，证明选项关闭时输出不变）。下游 MachOSwiftSection 用 libswiftCore 渲染比对：两边都出现的 107 条嵌套类型路径，逐层模块与 Xcode 27 SDK 的 `Swift.swiftinterface` 一致 |
+| 2026-10-12 | Implemented，编号 0017，快进合入 `next`（不推送、不发版） | 用户要求合并。分支直接基于 `next` `e17ae7f`，之后 `next` 没有新提交，不用 rebase，10-10 的验证仍然成立；下游 MachOSwiftSection 提案 0064 同批合入它的 `next`，用本分支跑全量测试，只剩那台机器上早已存在的两条失败。发版时机随下游下一个版本定：下游的版本范围（`0.7.1 ..< 0.8.0`）要在本库发版后再抬。配套文档：README 的 `useModuleSelectors` 一段与 AGENTS.md 的 `DemangleOptions` 一条已写，不另写实现说明；新术语：无 |
