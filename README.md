@@ -90,7 +90,13 @@ var options: DemangleOptions = .default
 options.insert(.synthesizeSugarOnTypes)
 options.remove(.displayModuleNames)
 node.print(using: options)
+
+// SE-0491 module selectors, the way a Swift 6.4 .swiftinterface spells names:
+// Swift::Duration.Foundation::TimeFormatStyle
+node.print(using: DemangleOptions.interface.union(.useModuleSelectors))
 ```
+
+`useModuleSelectors` is opt-in and part of no preset, so every preset still prints exactly what the Swift toolchain's demangler prints. With it, a nested type carries a selector naming the module that declared it — `Swift::Duration.Foundation::TimeFormatStyle` for a type Foundation adds in an extension of `Swift.Duration` — while local types and the associated types of type parameters (`A.Element`) carry none, as SE-0491 requires.
 
 ### Inspecting the Node Tree
 

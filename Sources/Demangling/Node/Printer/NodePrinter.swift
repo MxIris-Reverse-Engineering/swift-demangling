@@ -315,15 +315,15 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             defer { target.popTypeReferenceScope() }
             printBoundGeneric(name)
         case .builtinBorrow:
-            target.write("Builtin.Borrow<")
+            target.write(builtinModuleQualifier + "Borrow<")
             printFirstChild(name)
             target.write(">")
         case .builtinFixedArray:
             printBuildInFixedArray(name)
         case .builtinTupleType:
-            target.write("Builtin.TheTupleType")
+            target.write(builtinModuleQualifier + "TheTupleType")
         case .builtinTypeName:
-            target.write(name.text ?? "")
+            target.write(builtinTypeNameSpelling(name.text ?? ""))
         case .canonicalPrespecializedGenericTypeCachingOnceToken:
             printFirstChild(name, prefix: "flag for loading of canonical specialized generic type metadata for ")
         case .canonicalSpecializedGenericMetaclass: printFirstChild(name, prefix: "specialized generic metaclass for ")
@@ -820,6 +820,92 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         }
     }
 
+    /// `Builtin.` — or `Builtin::` under `useModuleSelectors`, which is how
+    /// the compiler writes a builtin type in a `.swiftinterface`.
+    private var builtinModuleQualifier: String {
+        options.contains(.useModuleSelectors) ? "Builtin::" : "Builtin."
+    }
+
+    /// `Swift.` — or `Swift::` under `useModuleSelectors` — for the standard
+    /// library names this printer spells out itself rather than reading from
+    /// a `module` node (`AnyObject`, `Copyable`, `Escapable`).
+    private var standardLibraryModuleQualifier: String {
+        options.contains(.useModuleSelectors) ? "Swift::" : "Swift."
+    }
+
+    /// A `builtinTypeName`'s text, which the demangler builds whole
+    /// (`Builtin.RawPointer`), with its qualifier respelled for
+    /// `useModuleSelectors`.
+    private func builtinTypeNameSpelling(_ text: String) -> String {
+        let dottedQualifier = "Builtin."
+        guard options.contains(.useModuleSelectors), text.hasPrefix(dottedQualifier) else { return text }
+        return builtinModuleQualifier + text.dropFirst(dottedQualifier.count)
+    }
+
+    /// Writes the module selector a nested type's own name carries under
+    /// `useModuleSelectors` — the `Foundation::` of
+    /// `Swift::Duration.Foundation::TimeFormatStyle`. The compiler writes one
+    /// on every type it qualifies, parent printed or not
+    /// (`TypePrinter::printQualifiedType`), because an extension in another
+    /// module can declare a nested type the parent's module knows nothing
+    /// about.
+    ///
+    /// Runs inside the nested type's own type-reference scope, after the
+    /// separator dot, so a rich target sees the module name the way it sees a
+    /// top-level type's. Nothing is written when the declaring module is
+    /// unknown (a type inside a function or closure — a module selector skips
+    /// local scopes, so the compiler writes none either) or hidden by the
+    /// other options.
+    private mutating func printModuleSelector(ofNestedType name: SomeNode) {
+        guard options.contains(.useModuleSelectors), Self.isModuleSelectableTypeKind(name.kind),
+              let module = declaringModule(ofNestedType: name), shouldPrintContext(module)
+        else { return }
+        let currentPosition = target.writtenUnitCount
+        printModule(module)
+        if target.writtenUnitCount != currentPosition {
+            target.write("::")
+        }
+    }
+
+    /// The type declarations a module selector qualifies. Members — functions,
+    /// properties, subscripts — are qualified through their type and carry
+    /// none of their own.
+    private static func isModuleSelectableTypeKind(_ kind: Node.Kind) -> Bool {
+        switch kind {
+        case .class, .structure, .enum, .protocol, .otherNominalType, .typeAlias: true
+        default: false
+        }
+    }
+
+    /// The module that declared a nested type: the module of the nearest
+    /// enclosing extension, else the module at the root of its context chain.
+    /// `nil` once the chain leaves types and extensions (a function, closure
+    /// or anonymous context), where no selector applies.
+    ///
+    /// Iterative: the chain is as long as the nesting, and this walk sits
+    /// outside the depth-checked `printName` recursion.
+    private func declaringModule(ofNestedType name: SomeNode) -> SomeNode? {
+        var context = name.children.first
+        while let current = context {
+            switch current.kind {
+            case .module:
+                return current
+            case .extension:
+                guard let extensionModule = current.children.first, extensionModule.kind == .module else { return nil }
+                return extensionModule
+            case .type,
+                 .class, .structure, .enum, .protocol, .otherNominalType, .typeAlias,
+                 .boundGenericClass, .boundGenericStructure, .boundGenericEnum, .boundGenericProtocol, .boundGenericOtherNominalType, .boundGenericTypeAlias:
+                // A type's first child is the type it wraps; a nominal's is its
+                // own context; a bound generic's is its unbound type.
+                context = current.children.first
+            default:
+                return nil
+            }
+        }
+        return nil
+    }
+
     private mutating func printReturnType(_ name: SomeNode) {
         if name.children.isEmpty, let t = name.text {
             target.write(t)
@@ -1185,7 +1271,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             printChildren(protocolsTypeList, suffix: " & ", separator: " & ")
         }
         if options.contains(.qualifyEntities) && options.contains(.displayStdlibModule) {
-            target.write("Swift.")
+            target.write(standardLibraryModuleQualifier)
         }
         target.write("AnyObject")
     }
@@ -1770,7 +1856,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printBuildInFixedArray(_ name: SomeNode) {
-        _ = printOptional(name.children.first, prefix: "Builtin.FixedArray<")
+        _ = printOptional(name.children.first, prefix: builtinModuleQualifier + "FixedArray<")
         _ = printOptional(name.children.at(1), prefix: ", ", suffix: ">")
     }
 
@@ -1892,9 +1978,9 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     private mutating func printDependentGenericInverseConformanceRequirement(_ name: SomeNode) {
         printFirstChild(name, suffix: ": ~")
         switch name.children.at(1)?.index {
-        case 0: target.write("Swift.Copyable")
-        case 1: target.write("Swift.Escapable")
-        default: target.write("Swift.<bit \(name.children.at(1)?.index ?? 0)>")
+        case 0: target.write(standardLibraryModuleQualifier + "Copyable")
+        case 1: target.write(standardLibraryModuleQualifier + "Escapable")
+        default: target.write(standardLibraryModuleQualifier + "<bit \(name.children.at(1)?.index ?? 0)>")
         }
     }
 
@@ -1988,11 +2074,12 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                     // spans, so emit it under a barrier instead of fusing it
                     // onto this leaf's span.
                     if context.kind == .module {
-                        target.write(".")
+                        target.write(options.contains(.useModuleSelectors) ? "::" : ".")
                     } else {
                         target.pushTypeReferenceScope(nil)
                         target.write(".")
                         target.popTypeReferenceScope()
+                        printModuleSelector(ofNestedType: name)
                     }
                 }
             }

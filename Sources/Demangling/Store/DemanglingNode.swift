@@ -88,6 +88,18 @@ public protocol DemanglingNode: Sendable {
     /// place for a per-conformer performance override** — if a conformer needs
     /// to answer a question differently, the question has to be a requirement.
     var hasChildren: Bool { get }
+
+    /// The first node, in one identity-deduped preorder pass over this
+    /// subtree, whose kind `kindMatches` accepts — what `first(of:)` and
+    /// `contains(_:)` answer from (`DemanglingNode+Sequence.swift`).
+    ///
+    /// A **requirement** with a derived default, for the reason
+    /// ``hasChildren`` is one: `NodeReference` answers it from one pinned
+    /// view without retaining its store per visited node, which a host
+    /// querying one shared store from many threads at once cannot do without
+    /// (evolution proposal `unretained-kind-queries`). As an extension member
+    /// that walk would never be selected from generic code.
+    func firstNodeInDedupedPreorder(matching kindMatches: (Node.Kind) -> Bool) -> Self?
 }
 
 // MARK: - Derived helpers shared by the printer
@@ -403,5 +415,40 @@ extension NodeReference {
                 }
             }
         }
+    }
+}
+
+// MARK: - Store-path kind queries without per-node ARC
+
+extension NodeReference {
+    /// Witness for ``DemanglingNode/firstNodeInDedupedPreorder(matching:)``:
+    /// the default's deduped preorder pass, run on raw indices over one view
+    /// pinned at entry with the anchoring ``runPrintWalk(using:)`` uses. A
+    /// query retains its store once instead of once per visited node, pushed
+    /// child and dedupe entry, so many threads querying one shared store no
+    /// longer fight over its reference count (evolution proposal
+    /// `unretained-kind-queries`). Within one store the raw index is the node
+    /// identity the default dedupes on, so the visits and the answer are the
+    /// same.
+    public func firstNodeInDedupedPreorder(matching kindMatches: (Node.Kind) -> Bool) -> NodeReference? {
+        let matchedRawIndex: UInt32? = withExtendedLifetime(store) {
+            store.withView { pinnedView in
+                withUnsafePointer(to: pinnedView) { viewPointer in
+                    var pendingRawIndices: [UInt32] = [nodeIndex.rawValue]
+                    var visitedRawIndices: Set<UInt32> = []
+                    while let rawIndex = pendingRawIndices.popLast() {
+                        guard visitedRawIndices.insert(rawIndex).inserted else { continue }
+                        let node = UnretainedNodeReference(viewPointer: viewPointer, rawIndex: rawIndex)
+                        if kindMatches(node.kind) { return rawIndex }
+                        // Reversed push keeps the pop order preorder (leftmost first).
+                        for child in node.children.reversed() {
+                            pendingRawIndices.append(child.rawIndex)
+                        }
+                    }
+                    return nil
+                }
+            }
+        }
+        return matchedRawIndex.map { NodeReference(store: store, nodeIndex: store.nodeIndex(forRaw: $0)) }
     }
 }

@@ -28,6 +28,23 @@ public struct DemangleOptions: OptionSet, Codable, Sendable {
     public static let removeBoundGeneric = DemangleOptions(rawValue: 1 << 23)
     public static let removeReferenceStoragePrefix = DemangleOptions(rawValue: 1 << 24)
     public static let displayLocalNameContexts = DemangleOptions(rawValue: 1 << 25)
+    /// Qualifies names with SE-0491 module selectors — `Swift::Int` instead of
+    /// `Swift.Int` — the way the Swift 6.4 compiler writes a `.swiftinterface`
+    /// (`PrintOptions::UseModuleSelectors`, which this option is named after).
+    ///
+    /// A nested type carries a selector of its own, naming the module that
+    /// declared it: the module of the nearest enclosing extension, else the
+    /// module at the root of its context chain
+    /// (`Swift::Duration.Foundation::TimeFormatStyle`). A type declared inside
+    /// a function or closure gets none, nor does the associated type of a
+    /// type parameter (`A.Element`) — SE-0491 forbids both. A module the other
+    /// options hide (`displayModuleNames`, `displayStdlibModule`, …) gets no
+    /// selector either. The hard-coded `Builtin.`, `Swift.AnyObject` and
+    /// `Swift.Copyable` / `Swift.Escapable` spellings follow suit.
+    ///
+    /// Not in any preset: upstream's demangler has no such option, and the
+    /// presets stay byte-identical to it.
+    public static let useModuleSelectors = DemangleOptions(rawValue: 1 << 26)
 
     public init(rawValue: Int) {
         self.rawValue = rawValue
