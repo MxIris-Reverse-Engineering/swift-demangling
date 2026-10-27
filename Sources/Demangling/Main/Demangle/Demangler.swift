@@ -30,9 +30,9 @@ struct Demangler<Words: WordRangeStorage>: ~Escapable {
 }
 
 extension Demangler {
-    private func require<T>(_ optional: T?) throws(DemanglingError) -> T {
-        if let v = optional {
-            return v
+    private func require<Wrapped>(_ optional: Wrapped?) throws(DemanglingError) -> Wrapped {
+        if let optional {
+            return optional
         } else {
             throw failure
         }

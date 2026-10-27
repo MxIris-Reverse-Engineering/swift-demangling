@@ -3787,15 +3787,12 @@ extension Remangler {
         try mangleChildNode(node, at: 2, depth: depth + 1)
     }
 
-    // Attached-macro nodes are [context, attachedName, macroName, discriminator].
-    // Upstream Remangler mangles children 0,1,2, then "fM"+roleChar, then the
-    // discriminator (child 3) LAST. The MangledChar values come from MacroRoles.def
-    // (Accessor='a', MemberAttribute='r', Member='m', Peer='p', Conformance='c',
-    // Extension='e', Body='b').
     /// Upstream `mangleAttachedMacro` (Swift 6.4): an attached macro expansion
     /// has three or four children — the attached name is absent when the
     /// expansion is itself the context of another expansion — and the
     /// discriminator is always the last child, mangled after the operator.
+    /// `roleChar` comes from `MacroRoles.def` (Accessor `a`, MemberAttribute
+    /// `r`, Member `m`, Peer `p`, Conformance `c`, Extension `e`, Body `b`).
     private mutating func mangleAttachedMacroExpansion(_ node: Node, roleChar: String, depth: Int) throws(ManglingError) {
         guard node.numberOfChildren >= 1 else {
             throw .invalidNodeStructure(node, message: "AttachedMacroExpansion needs at least 1 child")
@@ -4509,9 +4506,9 @@ extension Remangler {
         append("P")
     }
 
-    private func require<T>(_ param: T?) throws(ManglingError) -> T {
-        if let param {
-            return param
+    private func require<Wrapped>(_ optional: Wrapped?) throws(ManglingError) -> Wrapped {
+        if let optional {
+            return optional
         } else {
             throw .genericError("")
         }

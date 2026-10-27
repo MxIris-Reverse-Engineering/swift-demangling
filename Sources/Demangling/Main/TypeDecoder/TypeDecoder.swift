@@ -1075,11 +1075,11 @@ extension TypeDecoderEngine {
         }
     }
 
-    private func decodeImplFunctionParam<T: ImplFunctionParamProtocol>(
+    private func decodeImplFunctionParam<Parameter: ImplFunctionParamProtocol>(
         node: SomeNode,
         depth: Int,
-        results: inout [T]
-    ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
+        results: inout [Parameter]
+    ) throws(TypeLookupError) where Parameter.BuiltTypeParam == BuiltType {
         guard depth <= Self.maxDepth else {
             throw TypeLookupError("Depth exceeded")
         }
@@ -1097,40 +1097,40 @@ extension TypeDecoderEngine {
             throw TypeLookupError(node: node, message: "invalid parameter structure")
         }
 
-        guard let convention = T.getConventionFromString(conventionString) else {
+        guard let convention = Parameter.getConventionFromString(conventionString) else {
             throw TypeLookupError(node: conventionNode, message: "invalid convention")
         }
 
         let type = try decodeMangledType(node: typeNode, depth: depth + 1)
 
-        var options = T.OptionsType()
+        var options = Parameter.OptionsType()
         for i in 1 ..< (node.children.count - 1) {
             let child = node.children[i]
             switch child.kind {
             case .implParameterResultDifferentiability:
                 if let text = child.text,
-                   let diffOptions = T.getDifferentiabilityFromString(text) {
+                   let diffOptions = Parameter.getDifferentiabilityFromString(text) {
                     options = options.union(diffOptions)
                 }
             case .implParameterSending:
-                options = options.union(T.getSending())
+                options = options.union(Parameter.getSending())
             case .implParameterIsolated:
-                options = options.union(T.getIsolated())
+                options = options.union(Parameter.getIsolated())
             case .implParameterImplicitLeading:
-                options = options.union(T.getImplicitLeading())
+                options = options.union(Parameter.getImplicitLeading())
             default:
                 throw TypeLookupError(node: child, message: "unexpected attribute kind")
             }
         }
 
-        results.append(T(type: type, convention: convention, options: options))
+        results.append(Parameter(type: type, convention: convention, options: options))
     }
 
-    private func decodeImplFunctionResult<T: ImplFunctionResultProtocol>(
+    private func decodeImplFunctionResult<FunctionResult: ImplFunctionResultProtocol>(
         node: SomeNode,
         depth: Int,
-        results: inout [T]
-    ) throws(TypeLookupError) where T.BuiltTypeParam == BuiltType {
+        results: inout [FunctionResult]
+    ) throws(TypeLookupError) where FunctionResult.BuiltTypeParam == BuiltType {
         guard depth <= Self.maxDepth else {
             throw TypeLookupError("Depth exceeded")
         }
@@ -1148,31 +1148,31 @@ extension TypeDecoderEngine {
             throw TypeLookupError(node: node, message: "invalid result structure")
         }
 
-        guard let convention = T.getConventionFromString(conventionString) else {
+        guard let convention = FunctionResult.getConventionFromString(conventionString) else {
             throw TypeLookupError(node: conventionNode, message: "invalid convention")
         }
 
         let type = try decodeMangledType(node: typeNode, depth: depth + 1)
 
-        var options = T.OptionsType()
+        var options = FunctionResult.OptionsType()
         for i in 1 ..< (node.children.count - 1) {
             let child = node.children[i]
             switch child.kind {
             case .implParameterResultDifferentiability:
                 if let text = child.text,
-                   let diffOptions = T.getDifferentiabilityFromString(text) {
+                   let diffOptions = FunctionResult.getDifferentiabilityFromString(text) {
                     options = options.union(diffOptions)
                 }
 
             case .implParameterSending:
-                options = options.union(T.getSending())
+                options = options.union(FunctionResult.getSending())
 
             default:
                 throw TypeLookupError(node: child, message: "unexpected attribute kind")
             }
         }
 
-        let result = T(type: type, convention: convention, options: options)
+        let result = FunctionResult(type: type, convention: convention, options: options)
         results.append(result)
     }
 

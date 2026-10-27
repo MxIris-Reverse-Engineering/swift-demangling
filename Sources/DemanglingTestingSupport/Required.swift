@@ -5,7 +5,7 @@ public enum RequiredError: Error {
     case requiredConditionTrue
 }
 
-public func required<T>(_ optional: T?, error: Error? = nil) throws -> T {
+public func required<Wrapped>(_ optional: Wrapped?, error: Error? = nil) throws -> Wrapped {
     guard let optional else { throw error ?? RequiredError.requiredNonOptional }
     return optional
 }

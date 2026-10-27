@@ -557,7 +557,7 @@ public final class NodeBuilder: Sendable {
     /// `Node` in place and hand back either the builder itself or a node, none
     /// of which crosses an isolation domain, so the `sending` constraints buy
     /// nothing here.
-    private func withLock<T>(_ body: (inout Node) -> T) -> T {
+    private func withLock<BodyResult>(_ body: (inout Node) -> BodyResult) -> BodyResult {
         _node.withLockUnchecked(body)
     }
 
