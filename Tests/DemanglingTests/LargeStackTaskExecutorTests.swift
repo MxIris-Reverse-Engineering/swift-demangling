@@ -158,13 +158,7 @@ struct LargeStackTaskExecutorTests {
     /// property survives the failure — and never inline in `enqueue`.
     @Test func aJobThePoolCannotTakeStillRunsOnALargeStackThread() async {
         guard #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) else { return }
-        let executor = LargeStackTaskExecutor(
-            pool: LargeStackThreadPool(
-                stackSize: LargeStackTaskExecutor.threadStackSize,
-                workerThreadNamePrefix: LargeStackTaskExecutor.workerThreadNamePrefix,
-                simulatesSpawnFailureForTesting: true
-            )
-        )
+        let executor = LargeStackTaskExecutor(pool: LargeStackTaskExecutor.makePool(simulatesSpawnFailureForTesting: true))
         let enqueuingThread = pthread_mach_thread_np(pthread_self())
         let (stackSize, threadName, runningThread) = await withTaskExecutorPreference(executor) {
             (pthread_get_stacksize_np(pthread_self()), Self.currentThreadName(), pthread_mach_thread_np(pthread_self()))
@@ -172,6 +166,63 @@ struct LargeStackTaskExecutorTests {
         #expect(stackSize >= LargeStackTaskExecutor.threadStackSize, "stack was \(stackSize) bytes")
         #expect(threadName == "swift-demangling.large-stack", "ran on \(threadName)")
         #expect(runningThread != enqueuingThread)
+    }
+
+    /// Jobs enqueued at the moment thread creation collapses never run on an
+    /// enqueuing thread either. Every enqueue reserves a worker and fails to
+    /// spawn it; those that roll back while another reservation is pending
+    /// queue their jobs, and the last one, finding the pool empty, used to run
+    /// all of them inside its own `enqueue` — on the thread that resumed the
+    /// task, which can be the small stack the executor exists to avoid.
+    @Test func jobsStrandedByAThreadCreationCollapseRunOffTheEnqueuingThreads() {
+        guard #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) else { return }
+        let executor = LargeStackTaskExecutor(
+            pool: LargeStackTaskExecutor.makePool(
+                simulatesSpawnFailureForTesting: true,
+                // Holds every enqueue in the reserved-but-not-yet-failed state
+                // at once, so the roll-backs race instead of serializing.
+                simulatedSpawnFailureDelayForTesting: 0.25
+            )
+        )
+        final class ThreadRecord: @unchecked Sendable {
+            private let lock = NSLock()
+            private var threads: Set<mach_port_t> = []
+            func insertCurrentThread() {
+                lock.lock()
+                threads.insert(pthread_mach_thread_np(pthread_self()))
+                lock.unlock()
+            }
+            var recorded: Set<mach_port_t> {
+                lock.lock()
+                defer { lock.unlock() }
+                return threads
+            }
+        }
+        let enqueuingThreads = ThreadRecord()
+        let jobThreads = ThreadRecord()
+        let enqueuerCount = 8
+        let jobRan = DispatchSemaphore(value: 0)
+        let releaseEnqueuers = DispatchSemaphore(value: 0)
+
+        for _ in 0 ..< enqueuerCount {
+            Thread.detachNewThread {
+                enqueuingThreads.insertCurrentThread()
+                Task(executorPreference: executor, priority: .medium) {
+                    jobThreads.insertCurrentThread()
+                    jobRan.signal()
+                }
+                // Alive until the assertion, so no later thread can take over
+                // its port name and fake a match.
+                releaseEnqueuers.wait()
+            }
+        }
+        for _ in 0 ..< enqueuerCount {
+            #expect(jobRan.wait(timeout: .now() + 60) == .success, "a job never ran")
+        }
+        #expect(jobThreads.recorded.isDisjoint(with: enqueuingThreads.recorded), "a job ran inside another job's enqueue")
+        for _ in 0 ..< enqueuerCount {
+            releaseEnqueuers.signal()
+        }
     }
 
     // MARK: - Depth (KnownIssues.md #4 on the executor path)

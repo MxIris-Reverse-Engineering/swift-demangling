@@ -40,7 +40,9 @@ import Foundation
 /// on a global dispatch queue of its class: the job still runs, the per-call
 /// probe hops as it does today. `enqueue` never runs a job inline: it is called
 /// from the runtime's scheduling path, and running the job there would recurse
-/// into it.
+/// into it. The same goes for a job the pool queued and then lost every worker
+/// for: the pool hands it to that fallback rather than to the `enqueue` that
+/// discovered the collapse, which the hop pool's drain would have done.
 ///
 /// ### What it does not do
 ///
@@ -71,9 +73,28 @@ public final class LargeStackTaskExecutor: TaskExecutor, Sendable {
 
     /// The process-wide executor. Its threads are separate from
     /// `LargeStackThreadPool.shared`, which keeps serving the blocking hops.
-    public static let shared = LargeStackTaskExecutor(
-        pool: LargeStackThreadPool(stackSize: threadStackSize, workerThreadNamePrefix: workerThreadNamePrefix)
-    )
+    public static let shared = LargeStackTaskExecutor(pool: makePool())
+
+    /// The executor's pool: ``threadStackSize`` workers named after the
+    /// executor, and jobs stranded by a thread-creation collapse sent to
+    /// ``runOffTheEnqueuingThread(qualityOfServiceClass:_:)`` instead of run
+    /// by whichever `enqueue` discovered the collapse. ``shared`` uses the
+    /// defaults; tests pass the spawn-failure hooks, so they exercise the
+    /// production configuration rather than one assembled in the test.
+    static func makePool(
+        simulatesSpawnFailureForTesting: Bool = false,
+        simulatedSpawnFailureDelayForTesting: TimeInterval = 0
+    ) -> LargeStackThreadPool {
+        LargeStackThreadPool(
+            stackSize: threadStackSize,
+            workerThreadNamePrefix: workerThreadNamePrefix,
+            strandedWorkItemHandler: { qualityOfServiceClass, job in
+                runOffTheEnqueuingThread(qualityOfServiceClass: qualityOfServiceClass, job)
+            },
+            simulatesSpawnFailureForTesting: simulatesSpawnFailureForTesting,
+            simulatedSpawnFailureDelayForTesting: simulatedSpawnFailureDelayForTesting
+        )
+    }
 
     private let pool: LargeStackThreadPool
 
@@ -98,14 +119,23 @@ public final class LargeStackTaskExecutor: TaskExecutor, Sendable {
         if pool.trySubmit(allowingOverflow: false, submitterQualityOfService: qualityOfServiceClass, runJob) {
             return
         }
+        Self.runOffTheEnqueuingThread(qualityOfServiceClass: qualityOfServiceClass, runJob)
+    }
+
+    /// Where a job runs when the pool cannot take it: a dedicated
+    /// ``threadStackSize`` thread at the job's class, or if even that cannot
+    /// be created, a global dispatch queue of that class. Never the calling
+    /// thread — that is whichever thread resumed the task, inside the runtime's
+    /// scheduling path.
+    static func runOffTheEnqueuingThread(qualityOfServiceClass: qos_class_t, _ job: @escaping @Sendable () -> Void) {
         if StackSafeExecutor.spawnDedicatedLargeStackThread(
-            stackSize: Self.threadStackSize,
+            stackSize: threadStackSize,
             qualityOfServiceClass: qualityOfServiceClass,
-            runJob
+            job
         ) {
             return
         }
-        DispatchQueue.global(qos: DispatchQoS.QoSClass(rawValue: qualityOfServiceClass) ?? .default).async(execute: runJob)
+        DispatchQueue.global(qos: DispatchQoS.QoSClass(rawValue: qualityOfServiceClass) ?? .default).async(execute: job)
     }
 
     /// The QOS class a job of `priority` runs at.

@@ -193,7 +193,15 @@ enqueue(job)
 
 第 2、3 步只在「操作系统建不出线程」时才会走到；第 3 步保证 job 永远不丢——GCD 的队列
 不会拒绝，只会排队。`enqueue` **绝不在当前线程就地跑 job**：它是被运行时的调度代码调用的，
-就地跑等于在调度路径里递归回去。
+就地跑等于在调度路径里递归回去。第 2、3 步合在 `runOffTheEnqueuingThread` 里。
+
+这条承诺在 2026-10-27 之前有一个漏洞（`KnownIssues.md` N2 的重新裁决）。池子在「所有建线程
+尝试都失败、worker 数归零」时，会把已经排队的任务全部取出来跑完，原因是跳转池的提交方正
+阻塞等着这些任务。执行器复用了同一套池代码，于是几个 `enqueue` 同时撞上建线程失败时，
+先回滚的那个看到别人的名额还在、把 job 入队返回，最后回滚的那个就在**自己的** `enqueue`
+里把别人的 job 跑掉了，跑在恢复那个任务的线程上，可能是 512 KB 的协作线程。现在执行器的
+池（`LargeStackTaskExecutor.makePool`）带一个 `strandedWorkItemHandler`，把这些搁浅的 job
+也交给 `runOffTheEnqueuingThread`。跳转池仍然就地跑，因为它的提交方本来就在等结果。
 
 ### 4.4 为什么是 16 MB，以及它买到了什么
 
@@ -266,7 +274,7 @@ if #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) {
 
 ## 6. 怎么验证的
 
-`Tests/DemanglingTests/LargeStackTaskExecutorTests.swift`，十条测试，每条以运行时可用性
+`Tests/DemanglingTests/LargeStackTaskExecutorTests.swift`，十一条测试，每条以运行时可用性
 门控开头（老系统上直接跳过）：
 
 | 测试 | 钉住的性质 |
@@ -277,6 +285,7 @@ if #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) {
 | `priorityMapsToTheQualityOfServiceClassOfTheSameRawValue` | 映射是原始值恒等；unspecified → default；未知值被池拒绝 |
 | `jobsOnTheExecutorDoNotOccupyTheHopPool` | 占满执行器某类全部稳态 worker 后，同类的同步跳转仍落在 8 MB 跳转池 worker 上、跳转池不增长——分池与共池的判别性断言 |
 | `aJobThePoolCannotTakeStillRunsOnALargeStackThread` | 模拟建线程失败，job 落在 16 MB 专用线程上、不在 enqueue 线程上 |
+| `jobsStrandedByAThreadCreationCollapseRunOffTheEnqueuingThreads` | 8 个 `enqueue` 同时撞上建线程失败（模拟失败带 0.25 秒延迟，让回滚真正赛跑），没有任何 job 跑在发起 `enqueue` 的线程上。修复前，搁浅的 job 由最后回滚的 `enqueue` 就地跑掉 |
 | `printingOnTheExecutorSurvivesADepthThatOverflowsAnEightMegabyteThread` | 380 层在执行器上完整打印（同深度 8 MB 上 SIGBUS） |
 | `printingOnTheExecutorDegradesPastTheDepthLimitInsteadOfCrashing` | 1000 层返回 `<<too complex>>`——第 4 条当年从 `StackSafetyTests` 移除的断言，在这条路径上恢复 |
 | `remanglingOnTheExecutorSurvivesADepthThatOverflowsAnEightMegabyteThread` | 200 层在执行器上往返（同深度 8 MB 上 SIGBUS） |

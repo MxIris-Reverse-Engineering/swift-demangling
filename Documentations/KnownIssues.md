@@ -13,7 +13,7 @@
   **「修复后登记」和「发现后登记」一样是硬要求**：本清单是 review 流程「已裁决即跳过」
   的依据，所以漏登记已修项会让整族继续挂着「暂缓」标签，把其中尚未修的那处一并遮住——
   这在 2026-08-16 真实发生过一次，详见第 1 条。
-- **第二部分（文末「误报与非缺陷」，N1–N22）**：经查证**判定为误报或刻意设计**的 review
+- **第二部分（文末「误报与非缺陷」，N1–N23）**：经查证**判定为误报或刻意设计**的 review
   发现。记录发现内容、裁决结论、理由与裁决日期，目的是让同一个发现不必被反复重新推导。
 
 - **记录日期**：2026-07-30（PR #6 review 期间逐条用复现测试确认）。
@@ -392,6 +392,17 @@ load-bearing，`executeAsync` 却无条件提交，可能死锁。
 但触发前提是 `pthread_create` 已经失败、线程池整体塌缩；该 drain 正是为修复一个**复现过的**
 stranding 缺陷而存在（见 `LargeStackThreadPoolTests`）。在 OS 已无法创建线程时，
 「阻塞一下协作线程」优于「任务永不执行」。不改。
+
+**2026-10-27 重新裁决（只针对 task executor 的池）**：上面的理由成立的前提是「就地跑」与
+「永不执行」二选一。2026-09-03 加入的 `LargeStackTaskExecutor`（evolution 0014）复用了同一套
+池代码，而它有第三条路：被拒的 job 本来就会转去专用 16 MB 线程，再不行就进全局 dispatch
+队列。旧 drain 却让塌缩时排队的 job 在**另一个** `enqueue` 里就地运行——跑在恢复任务的那条
+线程上（可能是 512 KB 的协作线程），违背了执行器「`enqueue` 绝不就地跑 job」的文档承诺。
+现在池接受一个 `strandedWorkItemHandler`：执行器的池把搁浅的 job 交给与 `enqueue` 同一条
+退路（`LargeStackTaskExecutor.runOffTheEnqueuingThread`），由
+`LargeStackTaskExecutorTests.jobsStrandedByAThreadCreationCollapseRunOffTheEnqueuingThreads`
+钉住。**阻塞跳转用的 `LargeStackThreadPool.shared` 维持原裁决**：它的提交方正阻塞等自己的
+任务，没有 dispatch 这条不占用调用线程的退路可走。
 
 ## N3. `DemanglingPrinter.printRoot` 是 internal，SPI 消费方无法调用
 
@@ -816,3 +827,20 @@ but well-formed」）。review 建议把 tag 保留到 release，理由是 `Node
 要改就走提案推翻 0009 的该节，并把 `NodeIndex` 的 stride 代价一并算进去。
 
 **裁决日期**：2026-08-16。
+
+## N23. 排队中的执行器 job 被提升优先级后不会被加速（2026-10-27 全项目 review）
+
+**发现内容**：`LargeStackTaskExecutor.enqueue` 在入队时就按 `job.priority` 选定 QOS 类的池，
+池里的 worker 终身不换类。若任务入队后被提升优先级（比如后台任务被用户交互代码 `await`），
+它仍排在原先那个类（可能是 background）的 worker 后面；review 认为 dispatch 的全局执行器
+会把它提升上来，本执行器做不到，且「What it does not do」一节没有写。
+
+**裁决：误报。** 对照的前提不成立：Swift 运行时自己对**排队中**的任务也不做提升。
+`stdlib/public/Concurrency/TaskStatus.cpp`（swift-6.4.0-RELEASE，`swift_task_escalateImpl`）
+里，任务在运行时才会给执行它的线程加 override；任务处于 enqueued 状态时只有一条
+`TODO (rokhinip): Add a stealer to escalate the thread request for the task`，除了把
+任务标记为已提升、等它开始执行时由线程自己 override 之外什么也不做。默认执行器上排队的
+job 同样停在原优先级的 dispatch 队列里，所以这不是本执行器引入的差异。
+`Documentations/LargeStackTaskExecutor.md` 第 5 节已记录「优先级提升不处理」。
+
+**裁决日期**：2026-10-27。
