@@ -21,7 +21,11 @@ open class DyldCacheTests: @unchecked Sendable {
 
     open class var cacheImageName: MachOImageName { .AttributeGraph }
 
-    open class var cachePath: DyldSharedCachePath { .current }
+    /// Throwing, so a subclass that selects its corpus from the environment can
+    /// reject a bad selection instead of quietly substituting another corpus.
+    open class var cachePath: DyldSharedCachePath {
+        get throws { .current }
+    }
 
     public init() async throws {
         self.mainCache = try DyldCache(path: Self.cachePath)

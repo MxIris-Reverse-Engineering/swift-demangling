@@ -148,6 +148,11 @@ let package = Package(
                 "Demangling",
                 "DemanglingTestingSupport",
             ],
+            resources: [
+                // Upstream's manglings.txt at swift-6.4.0-RELEASE, read by
+                // UpstreamManglingsTests.
+                .copy("Resources/manglings.txt"),
+            ],
             swiftSettings: [
                 // Must mirror the Demangling target: #if hasFeature(Lifetimes)
                 // tests compile out silently when the flag is missing here,

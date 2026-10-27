@@ -203,7 +203,8 @@ group-a 严格照搬开源源码删掉它们，正是其破坏功能的根因—
 ## 已确认无差异（覆盖良好）
 
 Pack/SILPackDirect/Indirect/PackExpansion、`Integer`、Inverse requirement、`Isolated`/`Sending`、
-`BuiltinFixedArray`、`ConstrainedExistential`、`borrow`/`mutate` accessor、`RepresentationChanged`、
+`BuiltinFixedArray`、`ConstrainedExistential`、`borrow`/`mutate` accessor、`RepresentationChanged`（仅解析与
+remangle；它的打印一直与上游不同，2026-10-27 才修正，见文末「打印文本对齐」）、
 `ConstValue`、`CoroFunctionPointer`、`DefaultOverride`、`DependentGenericParamValueMarker`、
 StandardTypes 替换表（含 `TaskExecutor`/`UnownedJob`/`MainActor`/`CancellationError` 等）、
 `SymbolicReferenceKind`、`Directness`、`FunctionSigSpecializationParamKind`（含 bitmask）、
@@ -275,7 +276,7 @@ cherry-pick 源也列进来）。每一项都用 Xcode 27.0 的 `swift-demangle`
 | `DemangleInitRAII` 保存 / 恢复 `Words[MaxNumWords]`（嵌套 demangle 的 use-after-free，e3ae0756a1c） | ➖ 不适用 | 本仓库的 `symbolicReferenceResolver` 是纯闭包，拿不到 Demangler；`Demangler` 是每次调用新建的 `~Escapable` 结构体，新 mangling 路径上没有同实例嵌套。唯一的同实例「入口再入」在 `_T` 旧 mangling 里，是另一个 bug（C-2） |
 | `OldRemangler` 三处 | ➖ 不适用 | 本仓库无 OldRemangler（B-L6） |
 | `Errors.cpp` 改名 `DemanglingErrorHandling.cpp`、删 `Punycode.h` include、`StringSwitch.Cases({...})` | ➖ 纯上游工程 | — |
-| 2abf087e71f（checked ObjC async completion handler 的 `TZ`） | ✅ 早已有 | 该 commit 早于 6.3.2，两个 tag 都是 `CheckedObjCAsyncCompletionHandlerImpl`；本仓库已有对应 kind 与 `TZ` 子节点顺序（0、1、[3]、`TZ`、2）。remangler 函数仍叫 `manglePredefinedObjCAsyncCompletionHandlerImpl`，纯命名遗留 |
+| 2abf087e71f（checked ObjC async completion handler 的 `TZ`） | ✅ 早已有（kind 与子节点顺序）；打印文字 2026-10-27 才修正 | 该 commit 早于 6.3.2，两个 tag 都是 `CheckedObjCAsyncCompletionHandlerImpl`；本仓库已有对应 kind 与 `TZ` 子节点顺序（0、1、[3]、`TZ`、2）。remangler 函数仍叫 `manglePredefinedObjCAsyncCompletionHandlerImpl`，纯命名遗留。**本行当时只核了 kind 与子节点顺序**：printer 仍打印旧的 `predefined `，上游自该 commit 起打印 `checked `，见文末「打印文本对齐」 |
 
 ### B-L3 关闭：`builtinBorrow`（`BW`）从「port 自创」变成上游节点
 
@@ -316,3 +317,75 @@ Apple 6.4 的 dump 为 `Global → BuiltinBorrow → Type → Structure(Swift.In
 | macOS 27.0 cache（`DEMANGLING_DYLD_CACHE=macOS_27_0`，Swift 6.4 编译） | 5,774,625 | 5,774,625 | 43,238 | 0 | 0 | 0 |
 
 同一次运行的全套单测：615 条 / 40 个 suite 全绿（`swift test` 原始退出码 0）。
+
+---
+
+## 打印文本对齐（2026-10-27，全项目 review）
+
+### 盲区：语料 oracle 此前不比打印文字
+
+语料 oracle（`DemanglingTestingSupport/DemanglingTests.swift`）此前每个符号只比两样：节点树 dump
+与 remangle 结果。树对了、打印错了，它看不见——上一节 6.4 增量的验收表报告 0 mismatch，同时下面
+三处打印差异已随 0.7.x 发布。现在每个符号还比两份打印文字：`.default.union(.synthesizeSugarOnTypes)`
+对 `swift_demangle_getDemangledName`，`.simplified` 对 `swift_demangle_getSimplifiedDemangledName`
+（工具链 `libswiftDemangle.dylib` 导出的 C API，由 `ToolchainDemangler` 加载）。另加
+`UpstreamManglingsTests`：把上游 `manglings.txt`（swift-6.4.0-RELEASE，vendored 在
+`Tests/DemanglingTests/Resources/`）512 条逐条打印比对；此前只有其中 286 条以单测形式钉住，
+下面第一处差异的符号就在没钉住的那批里。
+
+同批修掉 oracle 自身两处「什么都没比却报通过」的失效：
+
+- `DEVELOPER_DIR` 指向的 Xcode 里没有这个库时，不再静默退回 `/Applications/Xcode.app`。那是
+  Xcode 26.6 的库，拒绝全部 6.4 mangling，于是相关符号的树比对被整批跳过。库加载失败时 oracle
+  直接失败，不再把每个符号都当作「双方都拒绝」计为通过（三个 parity sweep 同理）。
+- `DEMANGLING_DYLD_CACHE` 的值对不上任何语料时报错，不再静默改用本机 cache。
+
+### 已修（2026-10-27）
+
+| 差异 | 来历 | 修法 |
+|---|---|---|
+| `printSpecializationPrefix`：`representation changed of ` 放在了「不显示泛型特化」分支。`.default` 打出 `function signature specialization <> of`，`.simplified` 反而打出 `representation changed of`；循环里跳过 `RepresentationChanged` 时也不像上游那样占一个参数编号（Arg[2]/[3] 打成 Arg[1]/[2]） | 2ff3767（3 月对齐 Swift 6.3）移植 4c09fa6805b 时放错分支 | 移到显示分支；跳过表去掉 `.representationChanged` |
+| `RepresentationChanged` 节点单独打印时只写 `representation changed`，上游写 `representation changed of ` 再打印子节点 | 同一次提交。只有手工构造的树走得到 | `printFirstChild(prefix:)` |
+| `TZ`（checked ObjC async completion handler）打印 `predefined `，上游 `checked ` | 2ff3767 改了 kind 名、没改打印文字；6.4 增量审计也只核了 kind 与子节点顺序（上表 2abf087e71f 行） | 改字 |
+| closure-prop 的 `Argument Types` 在相邻类型之间写 `, `。上游只在下一个子节点带文本时写，类型节点从不带文本，所以工具链把类型连着打（`[Swift.StringSwift.Int]`） | 最初导入时「修正」了上游的怪癖 | 照抄上游判据。输出难看，但它是工具链的输出（KnownIssues N1 的先例：跟随上游，不抢先） |
+
+回归测试：`AppleAlignmentTests` 末尾「Printed text that diverged while every tree matched」一节
+（6 条，期望值是 Xcode 27.2 `swift-demangle` 的输出），以及 `UpstreamManglingsTests` 中
+`$e4test4BaseCyxGAA1PA2aEP3fooyyFTWTfr9` 那一行。两个 cache 上 `.default` 的打印差异由此分别减少
+865 与 896 处（见下方验收表），说明这几处在真实二进制里确实出现。
+
+### 新 oracle 翻出的差异（2026-10-27 已处理）
+
+上面四处修完后，带打印比对的 oracle 又翻出四类差异（P-1 至 P-4），根因都对读上游源码确认过。
+维护者决定修 P-1 至 P-3、P-4 不修。修完这三类后再跑，又剩两类很小的差异（R-1、R-2），与 P 类
+同属「打印与工具链不一致」，按同类问题一并修掉。
+
+| 编号 | 差异 | 规模 | 根因 | 处理 |
+|---|---|---|---|---|
+| P-1 | 嵌套名：函数签名特化参数里嵌的符号名（`Constant Propagated Function / Global`、整数 / 浮点常量、`FunctionSignatureSpecializationParamPayload`）。工具链不加类型语法糖，也不受调用方选项影响（`Swift.Optional<X>`、`Swift.Dictionary<A, B>`）；本仓库按调用方选项打印（`X?`、`[A : B]`） | 前四处修完后 `.default` 剩余的 608 / 601 处 | 上游对嵌套名调用不带选项的 `demangleSymbolAsString(text)`，即默认 `DemangleOptions()` | 已修：嵌套名用 `nestedNameOptions`（`.default` 加上调用方的 `.useModuleSelectors`；上游没有这个选项，保留它是为了不让同一行里一半名字带 selector、一半不带）。横向排查补上同类的 attached macro 名：上游用 `nodeToString(Node->getChild(2))`，同样不带选项；demangle 出来的树里宏名总是裸标识符，只有手工构造的树看得出差别 |
+| P-2 | `.simplified` 下的 thunk：工具链打印最后一个子节点，本仓库打印倒数第二个，两边的函数类型对不上 | `.simplified` 差异的主要形态 | 上游 `ShortenThunk` 分支 `print(Node->getChild(Node->getNumChildren() - 1))`；本仓库最初导入时写成 `children.count - 2` | 已修 |
+| P-3 | `.simplified` 预设与上游 `SimplifiedUIDemangleOptions()` 不一致：缺 `displayLocalNameContexts`、`displayDebuggerGeneratedModule`、`displayStdlibModule`、`displayObjCModule`、`showClosureSignature`，以及本仓库自有的 `showModuleInDependentMemberType`（缺了它，dependent member type 里的上下文被省掉：`A.Text.Effect.Base.Timing` 打成 `A.Base.Timing`） | 与 P-2 计在同一个数里 | 上游从 `DemangleOptions()` 出发、只改列出的项；本仓库只收了显式设为 `true` 的项 | 已修：`.simplified` 改为从 `.default` 出发、逐项照抄上游的改动。**下游可见**：`.simplified` 的输出从此带局部名的 `#1 in …`、dependent member type 的完整上下文 |
+| P-4 | `manglings.txt` 里 8 条 Swift 3 旧 mangling（`_T` 前缀、非 `_T0`）：7 条函数签名特化的参数打成空名，1 条超长泛型签名解析失败 | 8 / 512 | `demangleSwift3*` 路径 | 不修，见 `KnownIssues.md` N24；测试里以 `withKnownIssue` 标记 |
+| R-1 | `.simplified` 下 back deployment fallback 丢了前缀 `back deployment fallback for ` | 22 / 4 处 | 上游只让 `BackDeploymentThunk` 受 `ShortenThunk` 控制，`BackDeploymentFallback` 总是打印；本仓库最初导入时两者都受控 | 已修 |
+| R-2 | 值泛型参数的 `let` 标记：工具链打印 `<let A, B>`，本仓库打印 `<A, B>` | macOS 27.0 cache 2 处 | 上游从 value marker 的 `.type` 包装（只有一个子节点）读第二个子节点作值类型，是越界读，发布版工具链把它打印成空，于是只剩 `let A`；本仓库用安全下标，读不到值类型就整个跳过了这个 marker，连 `let` 也没打 | 已修：照工具链的实际输出打印 `let`，值类型照上游读法取（实际总是取不到），不另造上游没有的 `: Swift.Int` |
+
+回归测试：`AppleAlignmentTests` 末尾「Differences the printed-text oracle found in real binaries」
+一节（P 类与 R 类共 7 条），以及 `UpstreamManglingsTests` 里 P-4 的 8 条已知问题。
+
+### 验收：语料 oracle（2026-10-27，Xcode 27.2 的 `libswiftDemangle.dylib`）
+
+| 语料 | 阶段 | 符号总数 | 工具链接受 | NodeTree / Remangle mismatch | 打印 mismatch `.default` | 打印 mismatch `.simplified` |
+|---|---|---|---|---|---|---|
+| 本机 macOS 26.6 cache | 本轮开始时 | 4,530,817 | 4,528,955 | 0 / 0 | 1,473 | 14,351 |
+| | 修完前四处 | | | 0 / 0 | 608 | 14,319 |
+| | 修完 P-1 至 P-3 | | | 0 / 0 | 0 | 22（R-1） |
+| | 修完 R-1、R-2 | | | 0 / 0 | **0** | **0** |
+| macOS 27.0 cache | 本轮开始时 | 5,774,625 | 5,772,690 | 0 / 0 | 1,497 | 30,191 |
+| | 修完前四处 | | | 0 / 0 | 601 | 30,142 |
+| | 修完 P-1 至 P-3 | | | 0 / 0 | 2（R-2） | 4（R-1） |
+| | 修完 R-1、R-2 | | | 0 / 0 | **0** | **0** |
+
+`UpstreamManglingsTests`：本轮开始时 503 / 512 通过，现在 504 / 512 通过、剩下 8 条（P-4）以已知问题
+标记。同一次运行的全套单测：645 条 / 45 个 suite 通过、8 个已知问题（`swift test` 原始退出码 0）；
+用 Xcode 26.6 的默认工具链也能完整编译。带打印比对后，本机 cache 上整个 oracle 用时约 9 分钟，
+macOS 27.0 cache 约 12 分钟。

@@ -70,14 +70,34 @@ public struct DemangleOptions: OptionSet, Codable, Sendable {
         .displayLocalNameContexts,
     ]
 
-    public static let simplified: DemangleOptions = [
-        .synthesizeSugarOnTypes,
-        .qualifyEntities,
-        .shortenPartialApply,
-        .shortenThunk,
-        .shortenValueWitness,
-        .shortenArchetype,
-    ]
+    /// Upstream's `DemangleOptions::SimplifiedUIDemangleOptions()`, written the
+    /// way upstream writes it: start from the default options and change the
+    /// ones it names. Every other option keeps its default — local-name
+    /// contexts, closure signatures, the standard-library, Objective-C and
+    /// debugger module rules, and the contexts inside a dependent member type.
+    /// Listing only the options upstream sets to `true` dropped those, which
+    /// is how this preset once printed `Bar` where the toolchain prints
+    /// `Bar #1 in foo()`.
+    public static let simplified: DemangleOptions = {
+        var options = DemangleOptions.default
+        options.insert(.synthesizeSugarOnTypes)
+        options.insert(.qualifyEntities)
+        options.remove(.displayExtensionContexts)
+        options.remove(.displayUnmangledSuffix)
+        options.remove(.displayModuleNames)
+        options.remove(.displayGenericSpecializations)
+        options.remove(.displayProtocolConformances)
+        options.remove(.displayWhereClauses)
+        options.remove(.displayEntityTypes)
+        options.insert(.shortenPartialApply)
+        options.insert(.shortenThunk)
+        options.insert(.shortenValueWitness)
+        options.insert(.shortenArchetype)
+        options.remove(.showPrivateDiscriminators)
+        options.remove(.showFunctionArgumentTypes)
+        options.remove(.showAsyncResumePartial)
+        return options
+    }()
 
     public static let interface: DemangleOptions = {
         var options = DemangleOptions.default

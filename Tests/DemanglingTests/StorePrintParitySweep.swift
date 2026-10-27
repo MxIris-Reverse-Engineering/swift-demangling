@@ -38,6 +38,8 @@ final class StorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendable {
         let extracted = try await symbols(for: .SwiftUI, .SwiftUICore, .Foundation, .Combine)
         let corpus = Array(Set(extracted.map(\.stringValue))).sorted()
         try #require(!corpus.isEmpty, "print corpus unavailable on this machine")
+        // "Rejected by both" is only a verdict when a toolchain was there to reject.
+        try ToolchainDemangler.requireLoadedLibrary()
 
         var builder = NodeStoreBuilder()
         var rootBySymbol: [(symbol: String, root: NodeStore.NodeIndex)] = []
@@ -56,11 +58,12 @@ final class StorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendable {
         // swallowed with `try?` before the comparison, making the sweep blind
         // to any regression that turns success into failure — F2 (the 0xFF
         // padding regression) escaped exactly that way. Every symbol the store
-        // path rejected is classified against the Swift runtime's own
-        // demangler, the same referee the default-run corpus oracle uses:
-        // rejected by stdlib too → consistent rejection (symbol-table junk,
-        // counted and reported); demangled by stdlib → regression, asserted to
-        // zero. The classification stays blind to a symbol class absent from
+        // path rejected is classified against the toolchain's demangler
+        // (`libswiftDemangle.dylib`), the same referee the default-run corpus
+        // oracle uses: rejected by the toolchain too → consistent rejection
+        // (symbol-table junk, counted and reported); demangled by the
+        // toolchain → regression, asserted to zero. The classification stays
+        // blind to a symbol class absent from
         // the all-ASCII symbol-table corpus — targeted unit tests carry those.
         //
         // There is deliberately no "one-sided failure" arm. The F4 fix added
@@ -78,7 +81,7 @@ final class StorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendable {
         var regressedSymbolCount = 0
         var regressedSymbolSamples: [String] = []
         for mangled in storePathFailedSymbols {
-            if stdlib_demangleNodeTree(mangled) == nil {
+            if ToolchainDemangler.nodeTree(for: mangled) == nil {
                 consistentlyRejectedCount += 1
                 if consistentlyRejectedSamples.count < 20 {
                     consistentlyRejectedSamples.append(mangled)
@@ -119,12 +122,12 @@ final class StorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendable {
             print("[0008-print-parity] samples: \(mismatchSamples.joined(separator: ", "))")
         }
         if !consistentlyRejectedSamples.isEmpty {
-            print("[0008-print-parity] consistently rejected (stdlib fails these too): \(consistentlyRejectedSamples.joined(separator: ", "))")
+            print("[0008-print-parity] consistently rejected (the toolchain rejects these too): \(consistentlyRejectedSamples.joined(separator: ", "))")
         }
         if !regressedSymbolSamples.isEmpty {
             print("[0008-print-parity] regressed (stdlib demangles these, this library does not): \(regressedSymbolSamples.joined(separator: ", "))")
         }
-        #expect(regressedSymbolCount == 0, "symbols the stdlib demangler handles must not fail here")
+        #expect(regressedSymbolCount == 0, "symbols the toolchain demangler handles must not fail here")
         #expect(mismatchCount == 0, "store-path printing must be byte-identical to the Node path")
     }
 }

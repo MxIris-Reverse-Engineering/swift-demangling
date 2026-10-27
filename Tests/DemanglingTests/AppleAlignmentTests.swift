@@ -200,4 +200,130 @@ struct AppleAlignmentTests {
         #expect(try decode("yieldingBorrowAccessor") == .yieldingBorrowAccessor)
         #expect(throws: DecodingError.self) { try decode("noSuchKind") }
     }
+
+    // MARK: - Printed text that diverged while every tree matched
+
+    // The corpus oracle compared node trees and remangled strings but never
+    // printed text, so these printer divergences shipped with every tree
+    // matching. Each expected value is Xcode 27.2's `swift-demangle` output.
+
+    // Upstream prints "specialized " whenever generic specializations are
+    // hidden and "representation changed of " only when they are displayed
+    // (4c09fa6805b); the port had the check in the hidden branch.
+    @Test func representationChangedSpecializationPrintsLikeTheToolchain() throws {
+        let node = try demangleAsNode("$e4test4BaseCyxGAA1PA2aEP3fooyyFTWTfr9")
+        #expect(node.print(using: .default.union(.synthesizeSugarOnTypes))
+            == "representation changed of protocol witness for test.P.foo() -> () in conformance test.Base<A> : test.P in test")
+    }
+
+    // The node printed on its own, as upstream's `case RepresentationChanged`
+    // does: the prefix, then the child. Only a hand-built tree reaches it —
+    // the demangler creates the node childless under a specialization, where
+    // it is never printed on its own.
+    @Test func representationChangedNodePrintsItsChildLikeUpstream() {
+        let node = Node.create(kind: .representationChanged, child: Node.create(kind: .identifier, text: "foo"))
+        #expect(node.print(using: .default) == "representation changed of foo")
+    }
+
+    @Test func simplifiedRepresentationChangedSpecializationSaysSpecialized() throws {
+        let node = try demangleAsNode("$e4test4BaseCyxGAA1PA2aEP3fooyyFTWTfr9")
+        #expect(node.print(using: .simplified) == "specialized protocol witness for P.foo() in conformance Base<A>")
+    }
+
+    // A representation-changed child in a later position takes a parameter
+    // number, like every other childless specialization child does upstream.
+    @Test func representationChangedChildAdvancesTheArgumentNumber() throws {
+        let node = try demangleAsNode("$s3foo7closureSSTfar1cC0_n")
+        #expect(node.print(using: .default.union(.synthesizeSugarOnTypes))
+            == "function signature specialization <Arg[2] = [Closure Propagated : closure, Argument Types : [Swift.String], Arg[3] = [Same As Argument 0]> of foo")
+    }
+
+    // Upstream renamed the predefined completion handler to the checked one
+    // (2abf087e71f); the port renamed the kind but kept the printed word.
+    @Test func checkedObjCCompletionHandlerThunkSaysChecked() throws {
+        let node = try demangleAsNode("$sIeyBh_ytTZ_")
+        #expect(node.print(using: .default.union(.synthesizeSugarOnTypes))
+            == "checked @objc completion handler block implementation for @escaping @callee_unowned @convention(block) @Sendable () -> () with result type ()")
+    }
+
+    // Upstream separates two argument types only when the next child carries
+    // text, which a type node never does, so they print run together. It reads
+    // badly, but it is the toolchain's text, and the port follows upstream's
+    // printer rather than getting ahead of it (KnownIssues N1).
+    @Test func closurePropagatedArgumentTypesPrintRunTogether() throws {
+        let node = try demangleAsNode("$s3foo7closureSSSiTf1cC0_n")
+        #expect(node.print(using: .default.union(.synthesizeSugarOnTypes))
+            == "function signature specialization <Arg[0] = [Closure Propagated : closure, Argument Types : [Swift.StringSwift.Int], Arg[1] = [Same As Argument 0]> of foo")
+    }
+
+    // MARK: - Differences the printed-text oracle found in real binaries
+
+    // A mangled name nested in a specialization parameter prints under the
+    // default options, without type sugar, whatever the caller asked for:
+    // upstream calls `demangleSymbolAsString(text)` with no options.
+    @Test func nameNestedInASpecializationParameterPrintsUnderTheDefaultOptions() throws {
+        let node = try demangleAsNode("_$sxq_xq_Iegnnrr_x3key_q_5valuetx_q_tIegnr_SHRzs5ErrorRd__r0__lTRSS_SSs5NeverOTG5064$sSD5merge_16uniquingKeysWithySDyxq_Gn_q_q__q_tqd__YKXEtqd__YKs5c27Rd__lFx_q_tx_q_tcfU_SS_SSs5D4OTG5Tf3nnpf_n")
+        #expect(node.print(using: .default.union(.synthesizeSugarOnTypes))
+            == "function signature specialization <Arg[2] = [Constant Propagated Function : generic not re-abstracted specialization <Swift.String, Swift.String, Swift.Never> of closure #1 (A, B) -> (A, B) in Swift.Dictionary.merge<A where A1: Swift.Error>(_: __owned Swift.Dictionary<A, B>, uniquingKeysWith: (B, B) throws(A1) -> B) throws(A1) -> ()]> of generic not re-abstracted specialization <Swift.String, Swift.String, Swift.Never> of reabstraction thunk helper <A, B><A1 where A: Swift.Hashable, A1: Swift.Error> from @escaping @callee_guaranteed (@in_guaranteed A, @in_guaranteed B) -> (@out A, @out B) to @escaping @callee_guaranteed (@in_guaranteed (key: A, value: B)) -> (@out (A, B))")
+    }
+
+    // The same rule for an attached macro's name, which upstream prints with
+    // `nodeToString(Node->getChild(2))`, again without options. Demangled
+    // input always carries a bare identifier there, so the tree is hand-built
+    // with a qualified name, the one shape where the options show.
+    @Test func attachedMacroNamePrintsUnderTheDefaultOptions() {
+        let qualifiedMacroName = Node.create(kind: .structure, children: [
+            Node.create(kind: .module, text: "Swift"),
+            Node.create(kind: .identifier, text: "Int"),
+        ])
+        let expansion = Node.create(kind: .peerAttachedMacroExpansion, children: [
+            Node.create(kind: .module, text: "main"),
+            Node.create(kind: .identifier, text: "f"),
+            qualifiedMacroName,
+            Node.create(kind: .number, index: 0),
+        ])
+        #expect(expansion.print(using: .simplified).contains("peer macro @Swift.Int expansion #1"))
+    }
+
+    // A shortened thunk prints its last child, as upstream's `ShortenThunk`
+    // branch does; the port printed the other function type.
+    @Test func shortenedThunkPrintsTheLastChildLikeUpstream() throws {
+        let node = try demangleAsNode("_$sSo11NSTextRangeCSgSDySo21NSAttributedStringKeyaypGSgIeggg_ACSo12NSDictionaryCSgIeyByy_TR")
+        #expect(node.print(using: .simplified)
+            == "thunk for @escaping @callee_guaranteed (@guaranteed NSTextRange?, @guaranteed [NSAttributedStringKey : Any]?) -> ()")
+    }
+
+    // `.simplified` is upstream's `SimplifiedUIDemangleOptions()`: the default
+    // options with a named few changed, every other one keeping its default.
+    // A local name therefore keeps its "#1 in" context.
+    @Test func simplifiedKeepsTheContextOfALocalName() throws {
+        let node = try demangleAsNode("$s4main3fooyyF3BarL_VMa")
+        #expect(node.print(using: .simplified) == "type metadata accessor for Bar #1 in foo()")
+    }
+
+    // ...and a dependent member type keeps the context of its protocol
+    // (`A.Text.Effect.Base.Timing`, not `A.Base.Timing`). The symbol is a
+    // shortened thunk too, so it also needs the last-child rule above.
+    @Test func simplifiedKeepsTheContextOfADependentMemberType() throws {
+        let node = try demangleAsNode("_$s6Timing7SwiftUI4TextV0D16AnimationSupportE6EffectO4BasePQzAG16DrawableFragmentVy__xGAG19QuantizationContextVAG0I0VIegngyo_AjmoQIegnnnr_AE0dG0RzlTRAE05BloomdG0V_TG5TA")
+        #expect(node.print(using: .simplified)
+            == "partial apply for specialized thunk for @escaping @callee_guaranteed (@in_guaranteed A.Text.Effect.Base.Timing, @guaranteed Text.Effect.DrawableFragment<A>, @unowned Text.Effect.QuantizationContext) -> (@owned Text.Effect.Drawable)")
+    }
+
+    // Shortening drops "back deployment thunk for " but never "back deployment
+    // fallback for ": upstream gates only the thunk on `ShortenThunk`.
+    @Test func simplifiedKeepsTheBackDeploymentFallbackPrefix() throws {
+        let node = try demangleAsNode("$ss31_diagnoseUnavailableCodeReacheds5NeverOyFTwB")
+        #expect(node.print(using: .simplified) == "back deployment fallback for _diagnoseUnavailableCodeReached()")
+    }
+
+    // A value generic parameter prints its `let` marker. Upstream then reads
+    // the value type out of bounds of the marker's `.type` wrapper, which the
+    // shipping toolchain prints as nothing, so the line reads `<let A, B>`
+    // without the `: Swift.Int` the mangling carries.
+    @Test func valueGenericParameterPrintsItsLetMarker() throws {
+        let node = try demangleAsNode("_$sSWqd__s5Error_pIgyrzo_SWqd__sAA_pIegyrzr_SiRVzs5UInt8VRs_r0__lTRTA")
+        #expect(node.print(using: .default.union(.synthesizeSugarOnTypes))
+            == "partial apply forwarder for reabstraction thunk helper <let A, B><A1 where B == Swift.UInt8> from @callee_guaranteed (@unowned Swift.UnsafeRawBufferPointer) -> (@out A1, @error @owned Swift.Error) to @escaping @callee_guaranteed (@unowned Swift.UnsafeRawBufferPointer) -> (@out A1, @error @out Swift.Error)")
+    }
 }
