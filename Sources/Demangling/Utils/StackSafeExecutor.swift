@@ -199,20 +199,61 @@ public enum StackSafeExecutor {
         work()
     }
 
-    /// Context handed to a dedicated thread's C entry point.
-    private final class DedicatedThreadContext {
-        let work: @Sendable () -> Void
+    /// Context handed to a detached thread's C entry point.
+    private final class DetachedThreadContext {
+        let name: String
+        let body: @Sendable () -> Void
 
-        init(work: @escaping @Sendable () -> Void) {
-            self.work = work
+        init(name: String, body: @escaping @Sendable () -> Void) {
+            self.name = name
+            self.body = body
         }
+    }
+
+    /// Creates a detached thread with `stackSize` bytes of stack at
+    /// `qualityOfServiceClass`, named `name`, running `body`, and reports
+    /// whether the OS actually made it. The one place both the dedicated
+    /// one-off threads and the pool workers are created.
+    ///
+    /// `Thread`/`NSThread` is deliberately not used: `start()` returns `Void`
+    /// and swallows exactly the failure this reports.
+    static func createDetachedThread(
+        stackSize: Int,
+        qualityOfServiceClass: qos_class_t,
+        name: String,
+        _ body: @escaping @Sendable () -> Void
+    ) -> Bool {
+        var threadAttributes = pthread_attr_t()
+        guard pthread_attr_init(&threadAttributes) == 0 else { return false }
+        defer { pthread_attr_destroy(&threadAttributes) }
+        guard pthread_attr_setstacksize(&threadAttributes, stackSize) == 0,
+              pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
+        else {
+            return false
+        }
+        // A class this build does not know is rejected with `EINVAL`, leaving
+        // the thread at `pthread_create`'s default — the documented outcome
+        // for an unknown class, so the result is deliberately not checked.
+        _ = pthread_attr_set_qos_class_np(&threadAttributes, qualityOfServiceClass, 0)
+
+        let context = Unmanaged.passRetained(DetachedThreadContext(name: name, body: body)).toOpaque()
+        var threadHandle: pthread_t?
+        let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
+            let threadContext = Unmanaged<StackSafeExecutor.DetachedThreadContext>
+                .fromOpaque(rawContext).takeRetainedValue()
+            pthread_setname_np(threadContext.name)
+            threadContext.body()
+            return nil
+        }, context)
+        guard creationResult == 0 else {
+            Unmanaged<DetachedThreadContext>.fromOpaque(context).release()
+            return false
+        }
+        return true
     }
 
     /// Starts a one-off detached thread with a large stack, reporting whether
     /// the OS actually made it.
-    ///
-    /// `Thread`/`NSThread` is deliberately not used: `start()` returns `Void`
-    /// and swallows exactly the failure this reports.
     ///
     /// - Parameters:
     ///   - stackSize: the thread's stack; ``largeStackThreadSize`` for the
@@ -231,32 +272,15 @@ public enum StackSafeExecutor {
         qualityOfServiceClass: qos_class_t? = nil,
         _ work: @escaping @Sendable () -> Void
     ) -> Bool {
-        var threadAttributes = pthread_attr_t()
-        guard pthread_attr_init(&threadAttributes) == 0 else { return false }
-        defer { pthread_attr_destroy(&threadAttributes) }
-        guard pthread_attr_setstacksize(&threadAttributes, stackSize) == 0,
-              pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
-        else {
-            return false
-        }
-        _ = pthread_attr_set_qos_class_np(&threadAttributes, qualityOfServiceClass ?? resolvedSubmitterQualityOfService(), 0)
-
-        let context = Unmanaged.passRetained(DedicatedThreadContext(work: work)).toOpaque()
-        var threadHandle: pthread_t?
-        let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
-            let dedicatedContext = Unmanaged<StackSafeExecutor.DedicatedThreadContext>
-                .fromOpaque(rawContext).takeRetainedValue()
-            pthread_setname_np("swift-demangling.large-stack")
+        createDetachedThread(
+            stackSize: stackSize,
+            qualityOfServiceClass: qualityOfServiceClass ?? resolvedSubmitterQualityOfService(),
+            name: "swift-demangling.large-stack"
+        ) {
             autoreleasepool {
-                dedicatedContext.work()
+                work()
             }
-            return nil
-        }, context)
-        guard creationResult == 0 else {
-            Unmanaged<DedicatedThreadContext>.fromOpaque(context).release()
-            return false
         }
-        return true
     }
     #endif
 }
@@ -306,7 +330,9 @@ private func resolvedSubmitterQualityOfService() -> qos_class_t {
 ///   everything still queued on its own thread before refusing. Nobody hangs;
 ///   the cost is running someone's work on a caller's stack in a process that
 ///   cannot create threads at all, where the depth limits degrade instead of
-///   crash.
+///   crash. A pool built with a stranded-item handler sends those items there
+///   instead: the task executor's does, because its submitters are inside
+///   `enqueue` and must not run a job there.
 /// - **Submission can be refused.** A refused item is the caller's to run —
 ///   `StackSafeExecutor` puts it on a dedicated thread, or inline as the last
 ///   resort. That is what makes every failure mode degrade rather than hang.
@@ -385,38 +411,63 @@ final class LargeStackThreadPool: Sendable {
     /// Name prefix of ``shared``'s workers; the class suffix follows.
     static let hopWorkerThreadNamePrefix = "swift-demangling.large-stack-worker."
 
-    /// The QOS classes a submitter can resolve to, one sub-pool each, in
-    /// ``classPools`` order — ``poolIndex(for:)`` is the single source of that
-    /// order and the initializer asserts the two agree.
+    /// The QOS classes a submitter can resolve to, one sub-pool each. A case's
+    /// raw value is its index into ``classPools``, so the class, its pool and
+    /// its thread name cannot drift apart.
     ///
     /// `QOS_CLASS_UNSPECIFIED` is not a pool: ``resolvedSubmitterQualityOfService()``
     /// folds it into user-initiated before the lookup, so a legacy thread
     /// outside the QOS system shares the user-initiated pool.
-    private static let pooledQualityOfServiceClasses: [qos_class_t] = [
-        QOS_CLASS_BACKGROUND,
-        QOS_CLASS_UTILITY,
-        QOS_CLASS_DEFAULT,
-        QOS_CLASS_USER_INITIATED,
-        QOS_CLASS_USER_INTERACTIVE,
-    ]
+    fileprivate enum PooledQualityOfServiceClass: Int, CaseIterable {
+        case background
+        case utility
+        case `default`
+        case userInitiated
+        case userInteractive
 
-    /// Index into ``classPools`` for a resolved submitter class, or `nil` for
-    /// a raw value this build does not know (a class a future OS adds). An
-    /// unknown class is refused rather than filed under a known one: the first
-    /// partitioned version folded it into user-initiated, which raised work of
-    /// unknown rank five levels and let a user-initiated park be signalled
-    /// from below — the very shape the partition rules out. The refusal sends
-    /// the caller down the dedicated-thread path, which does not promote it
-    /// either (`pthread_attr_set_qos_class_np` rejects the value with `EINVAL`,
-    /// leaving the thread at `pthread_create`'s default).
-    private static func poolIndex(for qualityOfServiceClass: qos_class_t) -> Int? {
-        switch qualityOfServiceClass {
-        case QOS_CLASS_BACKGROUND: return 0
-        case QOS_CLASS_UTILITY: return 1
-        case QOS_CLASS_DEFAULT: return 2
-        case QOS_CLASS_USER_INITIATED: return 3
-        case QOS_CLASS_USER_INTERACTIVE: return 4
-        default: return nil
+        /// The pooled class of a resolved submitter class, or `nil` for a raw
+        /// value this build does not know (a class a future OS adds). An
+        /// unknown class is refused rather than filed under a known one: the
+        /// first partitioned version folded it into user-initiated, which
+        /// raised work of unknown rank five levels and let a user-initiated
+        /// park be signalled from below — the very shape the partition rules
+        /// out. The refusal sends the caller down the dedicated-thread path,
+        /// which does not promote it either (`pthread_attr_set_qos_class_np`
+        /// rejects the value with `EINVAL`, leaving the thread at
+        /// `pthread_create`'s default).
+        init?(_ qualityOfServiceClass: qos_class_t) {
+            switch qualityOfServiceClass {
+            case QOS_CLASS_BACKGROUND: self = .background
+            case QOS_CLASS_UTILITY: self = .utility
+            case QOS_CLASS_DEFAULT: self = .default
+            case QOS_CLASS_USER_INITIATED: self = .userInitiated
+            case QOS_CLASS_USER_INTERACTIVE: self = .userInteractive
+            default: return nil
+            }
+        }
+
+        var qualityOfServiceClass: qos_class_t {
+            switch self {
+            case .background: QOS_CLASS_BACKGROUND
+            case .utility: QOS_CLASS_UTILITY
+            case .default: QOS_CLASS_DEFAULT
+            case .userInitiated: QOS_CLASS_USER_INITIATED
+            case .userInteractive: QOS_CLASS_USER_INTERACTIVE
+            }
+        }
+
+        /// Suffix of the class's worker thread names, so a spindump shows
+        /// which class's pool grew and whether an item landed in the wrong one.
+        /// `pthread_setname_np` caps names at 63 bytes; the longest here is 51
+        /// (`swift-demangling.large-stack-worker.user-interactive`).
+        var threadNameSuffix: String {
+            switch self {
+            case .background: "background"
+            case .utility: "utility"
+            case .default: "default"
+            case .userInitiated: "user-initiated"
+            case .userInteractive: "user-interactive"
+            }
         }
     }
 
@@ -458,18 +509,31 @@ final class LargeStackThreadPool: Sendable {
     private let steadyStateWorkerLimit: Int
     private let burstWorkerLimit: Int
 
-    /// One sub-pool per pooled class, in ``pooledQualityOfServiceClasses``
-    /// order. Created eagerly — five small objects — so the submission path
-    /// is a plain array read; a class that never receives a submission never
-    /// spawns a thread.
+    /// One sub-pool per pooled class, indexed by
+    /// ``PooledQualityOfServiceClass/rawValue``. Created eagerly — five small
+    /// objects — so the submission path is a plain array read; a class that
+    /// never receives a submission never spawns a thread.
     private let classPools: [QualityOfServiceClassPool]
 
+    /// Where a class pool sends the items a thread-creation collapse strands:
+    /// called once per item, outside the lock, with the class the item was
+    /// queued under.
+    typealias StrandedWorkItemHandler = @Sendable (_ qualityOfServiceClass: qos_class_t, _ workItem: @escaping @Sendable () -> Void) -> Void
+
     /// ``shared`` uses the parameterless form; ``LargeStackTaskExecutor``
-    /// passes its own stack size and thread-name prefix. Only tests pass the
-    /// hooks, which are handed straight to the class pools.
+    /// passes its own stack size, thread-name prefix and stranded-item
+    /// handler. Only tests pass the hooks, which are handed straight to the
+    /// class pools.
+    ///
+    /// - Parameter strandedWorkItemHandler: `nil` runs stranded items on the
+    ///   thread that discovered the collapse, which is right for the blocking
+    ///   hops: their submitters are waiting for the items, and running them is
+    ///   what unblocks them. The task executor must never run a job inside
+    ///   `enqueue`, so it hands them to its own fallback instead.
     init(
         stackSize: Int = StackSafeExecutor.largeStackThreadSize,
         workerThreadNamePrefix: String = LargeStackThreadPool.hopWorkerThreadNamePrefix,
+        strandedWorkItemHandler: StrandedWorkItemHandler? = nil,
         simulatesSpawnFailureForTesting: Bool = false,
         simulatedSpawnFailureDelayForTesting: TimeInterval = 0
     ) {
@@ -477,19 +541,17 @@ final class LargeStackThreadPool: Sendable {
         let burstWorkerLimit = max(32, 4 * steadyStateWorkerLimit)
         self.steadyStateWorkerLimit = steadyStateWorkerLimit
         self.burstWorkerLimit = burstWorkerLimit
-        self.classPools = Self.pooledQualityOfServiceClasses.map { qualityOfServiceClass in
+        self.classPools = PooledQualityOfServiceClass.allCases.map { pooledClass in
             QualityOfServiceClassPool(
-                qualityOfServiceClass: qualityOfServiceClass,
+                pooledClass: pooledClass,
                 workerStackSize: stackSize,
                 workerThreadNamePrefix: workerThreadNamePrefix,
                 steadyStateWorkerLimit: steadyStateWorkerLimit,
                 burstWorkerLimit: burstWorkerLimit,
+                strandedWorkItemHandler: strandedWorkItemHandler,
                 simulatesSpawnFailureForTesting: simulatesSpawnFailureForTesting,
                 simulatedSpawnFailureDelayForTesting: simulatedSpawnFailureDelayForTesting
             )
-        }
-        for (index, qualityOfServiceClass) in Self.pooledQualityOfServiceClasses.enumerated() {
-            assert(Self.poolIndex(for: qualityOfServiceClass) == index, "pooledQualityOfServiceClasses must follow poolIndex(for:)")
         }
     }
 
@@ -505,8 +567,8 @@ final class LargeStackThreadPool: Sendable {
     /// Number of workers created for one class (zero for a class this build
     /// does not pool). Exposed for tests that pin the partition itself.
     func currentWorkerCount(for qualityOfServiceClass: qos_class_t) -> Int {
-        guard let poolIndex = Self.poolIndex(for: qualityOfServiceClass) else { return 0 }
-        return classPools[poolIndex].currentWorkerCount
+        guard let pooledClass = PooledQualityOfServiceClass(qualityOfServiceClass) else { return 0 }
+        return classPools[pooledClass.rawValue].currentWorkerCount
     }
 
     /// One class pool's steady-state ceiling — what a non-blocking submission
@@ -529,7 +591,8 @@ final class LargeStackThreadPool: Sendable {
     ///   caller must run it elsewhere. When this returns `true` the item is
     ///   guaranteed to run: by a worker of the submitter's class, or — if
     ///   thread creation collapses process-wide — on the thread of whichever
-    ///   submitter discovered the collapse.
+    ///   submitter discovered the collapse, or wherever the pool's
+    ///   stranded-item handler sends it.
     func trySubmit(allowingOverflow: Bool, _ workItem: @escaping @Sendable () -> Void) -> Bool {
         trySubmit(allowingOverflow: allowingOverflow, submitterQualityOfService: resolvedSubmitterQualityOfService(), workItem)
     }
@@ -538,8 +601,8 @@ final class LargeStackThreadPool: Sendable {
     /// always passes the calling thread's resolved class; tests pass classes no
     /// thread of this process can carry.
     func trySubmit(allowingOverflow: Bool, submitterQualityOfService: qos_class_t, _ workItem: @escaping @Sendable () -> Void) -> Bool {
-        guard Self.workerMarkerKey != nil, let poolIndex = Self.poolIndex(for: submitterQualityOfService) else { return false }
-        return classPools[poolIndex].trySubmit(allowingOverflow: allowingOverflow, workItem)
+        guard Self.workerMarkerKey != nil, let pooledClass = PooledQualityOfServiceClass(submitterQualityOfService) else { return false }
+        return classPools[pooledClass.rawValue].trySubmit(allowingOverflow: allowingOverflow, workItem)
     }
 
     /// The workers of one QOS class: created at that class, never re-ranked,
@@ -558,10 +621,8 @@ final class LargeStackThreadPool: Sendable {
     private final class QualityOfServiceClassPool: @unchecked Sendable {
         let qualityOfServiceClass: qos_class_t
 
-        /// Thread name for this pool's workers, class-suffixed so a spindump
-        /// shows which class's pool grew and whether an item landed in the
-        /// wrong one. `pthread_setname_np` caps names at 63 bytes; the longest
-        /// here is 51 (`swift-demangling.large-stack-worker.user-interactive`).
+        /// Thread name for this pool's workers: the owner's prefix plus
+        /// ``PooledQualityOfServiceClass/threadNameSuffix``.
         let workerThreadName: String
 
         /// Stack size of this pool's workers.
@@ -603,33 +664,27 @@ final class LargeStackThreadPool: Sendable {
         /// has to survive.
         private let simulatedSpawnFailureDelayForTesting: TimeInterval
 
+        /// See ``LargeStackThreadPool/init(stackSize:workerThreadNamePrefix:strandedWorkItemHandler:simulatesSpawnFailureForTesting:simulatedSpawnFailureDelayForTesting:)``.
+        private let strandedWorkItemHandler: StrandedWorkItemHandler?
+
         init(
-            qualityOfServiceClass: qos_class_t,
+            pooledClass: PooledQualityOfServiceClass,
             workerStackSize: Int,
             workerThreadNamePrefix: String,
             steadyStateWorkerLimit: Int,
             burstWorkerLimit: Int,
+            strandedWorkItemHandler: StrandedWorkItemHandler?,
             simulatesSpawnFailureForTesting: Bool,
             simulatedSpawnFailureDelayForTesting: TimeInterval
         ) {
-            self.qualityOfServiceClass = qualityOfServiceClass
-            self.workerThreadName = workerThreadNamePrefix + Self.threadNameSuffix(for: qualityOfServiceClass)
+            self.qualityOfServiceClass = pooledClass.qualityOfServiceClass
+            self.workerThreadName = workerThreadNamePrefix + pooledClass.threadNameSuffix
             self.workerStackSize = workerStackSize
             self.steadyStateWorkerLimit = steadyStateWorkerLimit
             self.burstWorkerLimit = burstWorkerLimit
+            self.strandedWorkItemHandler = strandedWorkItemHandler
             self.simulatesSpawnFailureForTesting = simulatesSpawnFailureForTesting
             self.simulatedSpawnFailureDelayForTesting = simulatedSpawnFailureDelayForTesting
-        }
-
-        private static func threadNameSuffix(for qualityOfServiceClass: qos_class_t) -> String {
-            switch qualityOfServiceClass {
-            case QOS_CLASS_BACKGROUND: return "background"
-            case QOS_CLASS_UTILITY: return "utility"
-            case QOS_CLASS_DEFAULT: return "default"
-            case QOS_CLASS_USER_INITIATED: return "user-initiated"
-            case QOS_CLASS_USER_INTERACTIVE: return "user-interactive"
-            default: return "unknown"
-            }
         }
 
         private let condition = NSCondition()
@@ -686,13 +741,14 @@ final class LargeStackThreadPool: Sendable {
             return true
         }
 
-        /// Runs every queued item on the calling thread. Entered with the lock
+        /// Runs every queued item on the calling thread, or hands each to the
+        /// stranded-item handler when the pool has one. Entered with the lock
         /// held and `workerCount == 0`; leaves the lock held.
         ///
         /// The lock is released around each item — items block on semaphores of
         /// their own and may take arbitrarily long. New items queued meanwhile are
         /// picked up on the next pass; they can only come from submitters racing
-        /// the same collapse, and running them here is what unblocks those
+        /// the same collapse, and running them is what unblocks those
         /// submitters. Runs at the drainer's own class, which is this pool's
         /// class by construction.
         private func drainPendingWorkItemsWhileLocked() {
@@ -705,18 +761,20 @@ final class LargeStackThreadPool: Sendable {
                     nextWorkItemIndex = 0
                 }
                 condition.unlock()
-                autoreleasepool {
-                    workItem()
+                if let strandedWorkItemHandler {
+                    strandedWorkItemHandler(qualityOfServiceClass, workItem)
+                } else {
+                    autoreleasepool {
+                        workItem()
+                    }
                 }
                 condition.lock()
             }
         }
 
         /// Starts one worker at this pool's class, reporting whether the OS
-        /// actually made the thread.
-        ///
-        /// `Thread`/`NSThread` is deliberately not used here: `start()` returns
-        /// `Void` and swallows the failure this whole path exists to detect.
+        /// actually made the thread (``StackSafeExecutor/createDetachedThread(stackSize:qualityOfServiceClass:name:_:)``,
+        /// which never goes through `Thread.start()` and its swallowed failure).
         private func spawnWorker() -> Bool {
             if simulatesSpawnFailureForTesting {
                 if simulatedSpawnFailureDelayForTesting > 0 {
@@ -724,32 +782,17 @@ final class LargeStackThreadPool: Sendable {
                 }
                 return false
             }
-            var threadAttributes = pthread_attr_t()
-            guard pthread_attr_init(&threadAttributes) == 0 else { return false }
-            defer { pthread_attr_destroy(&threadAttributes) }
-            guard pthread_attr_setstacksize(&threadAttributes, workerStackSize) == 0,
-                  pthread_attr_setdetachstate(&threadAttributes, PTHREAD_CREATE_DETACHED) == 0
-            else {
-                return false
-            }
             // The worker's class for life: every item it will ever run was
             // submitted from a thread of this class, so the hop never needs a
-            // re-rank and the idle park never outranks its signaller.
-            _ = pthread_attr_set_qos_class_np(&threadAttributes, qualityOfServiceClass, 0)
-
-            let context = Unmanaged.passRetained(self).toOpaque()
-            var threadHandle: pthread_t?
-            let creationResult = pthread_create(&threadHandle, &threadAttributes, { rawContext in
-                let classPool = Unmanaged<QualityOfServiceClassPool>.fromOpaque(rawContext).takeRetainedValue()
-                pthread_setname_np(classPool.workerThreadName)
-                classPool.runWorkerLoop()
-                return nil
-            }, context)
-            guard creationResult == 0 else {
-                Unmanaged<QualityOfServiceClassPool>.fromOpaque(context).release()
-                return false
+            // re-rank and the idle park never outranks its signaller. The
+            // closure keeps the pool alive for as long as the worker runs.
+            return StackSafeExecutor.createDetachedThread(
+                stackSize: workerStackSize,
+                qualityOfServiceClass: qualityOfServiceClass,
+                name: workerThreadName
+            ) {
+                self.runWorkerLoop()
             }
-            return true
         }
 
         private func runWorkerLoop() {

@@ -33,7 +33,7 @@ public struct TypeLookupError: Error, CustomStringConvertible, Sendable {
 }
 
 /// Result type for type decoding operations
-public typealias TypeLookupErrorOr<T> = Result<T, TypeLookupError>
+public typealias TypeLookupErrorOr<Success> = Result<Success, TypeLookupError>
 
 extension Result where Failure == TypeLookupError {
     /// Get the value if successful, nil otherwise

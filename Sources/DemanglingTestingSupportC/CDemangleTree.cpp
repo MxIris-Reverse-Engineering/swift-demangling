@@ -1,12 +1,15 @@
-// Self-contained wrapper around libswiftDemangle.dylib.
+// Self-contained wrapper around the toolchain's libswiftDemangle.dylib.
 // Uses dlopen/dlsym at runtime — no Swift or LLVM headers required.
+//
+// Which library gets loaded is decided on the Swift side
+// (`ToolchainDemangler.loadedLibraryPath`), where the choice is unit-tested;
+// this file only binds the symbols of the library it is handed.
 
 #include "CDemangleTree.h"
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
-#include <mutex>
 #include <string>
 
 // ---------------------------------------------------------------------------
@@ -31,60 +34,62 @@ struct alignas(8) Context {
 // Function pointer types
 // ---------------------------------------------------------------------------
 
-using CtxCtorFn  = void (*)(Context *);
-using CtxDtorFn  = void (*)(Context *);
-using DemangleFn = Node *(*)(Context *, StringRef);
-using TreeStrFn  = std::string (*)(Node *);
+using ContextConstructorFunction = void (*)(Context *);
+using ContextDestructorFunction = void (*)(Context *);
+using DemangleSymbolFunction = Node *(*)(Context *, StringRef);
+using NodeTreeStringFunction = std::string (*)(Node *);
+// The library's C API (include/swift/SwiftDemangle/SwiftDemangle.h): prints
+// into the buffer and returns the full length of the text, or 0 when the
+// toolchain does not demangle the name.
+using DemangledNameFunction = size_t (*)(const char *, char *, size_t);
 
 // ---------------------------------------------------------------------------
-// Lazy symbol resolution
+// Bound symbols — written once by swift_demangle_loadLibrary, before any other
+// entry point runs (the Swift side guarantees that ordering).
 // ---------------------------------------------------------------------------
 
-static void          *sLib      = nullptr;
-static CtxCtorFn      sCtxCtor  = nullptr;
-static CtxDtorFn      sCtxDtor  = nullptr;
-static DemangleFn     sDemangle = nullptr;
-static TreeStrFn      sTreeStr  = nullptr;
-static bool           sLoadOk   = false;
-static std::once_flag sLoadFlag;
+static void *sLibrary = nullptr;
+static ContextConstructorFunction sContextConstructor = nullptr;
+static ContextDestructorFunction sContextDestructor = nullptr;
+static DemangleSymbolFunction sDemangleSymbol = nullptr;
+static NodeTreeStringFunction sNodeTreeString = nullptr;
+static DemangledNameFunction sDemangledName = nullptr;
+static DemangledNameFunction sSimplifiedDemangledName = nullptr;
 
-static void loadOnce() {
-    // DEVELOPER_DIR selects the toolchain, the same way xcrun resolves it, so
-    // the oracle follows whatever Xcode the test run was pointed at
-    // (evolution 0015: Swift 6.4 lives in Xcode 27, not the default Xcode).
-    if (const char *developerDir = getenv("DEVELOPER_DIR")) {
-        std::string developerDirLibrary = std::string(developerDir) +
-            "/Toolchains/XcodeDefault.xctoolchain/usr/lib/libswiftDemangle.dylib";
-        sLib = dlopen(developerDirLibrary.c_str(), RTLD_LAZY);
-    }
+bool swift_demangle_loadLibrary(const char *libraryPath) {
+    if (sLibrary)
+        return true;
 
-    // Otherwise try the well-known Xcode toolchain path, then DYLD search.
-    static const char *paths[] = {
-        "/Applications/Xcode.app/Contents/Developer/Toolchains/"
-        "XcodeDefault.xctoolchain/usr/lib/libswiftDemangle.dylib",
-        "libswiftDemangle.dylib",
-        nullptr
-    };
-
-    for (int i = 0; !sLib && paths[i]; ++i) {
-        sLib = dlopen(paths[i], RTLD_LAZY);
-    }
-    if (!sLib) return;
+    void *library = dlopen(libraryPath, RTLD_LAZY);
+    if (!library)
+        return false;
 
     // C++ mangled symbol names (stable across Swift 5.x / 6.x releases).
-    sCtxCtor  = (CtxCtorFn)  dlsym(sLib, "_ZN5swift8Demangle7ContextC1Ev");
-    sCtxDtor  = (CtxDtorFn)  dlsym(sLib, "_ZN5swift8Demangle7ContextD1Ev");
-    sDemangle = (DemangleFn) dlsym(sLib,
+    auto contextConstructor = (ContextConstructorFunction) dlsym(library, "_ZN5swift8Demangle7ContextC1Ev");
+    auto contextDestructor = (ContextDestructorFunction) dlsym(library, "_ZN5swift8Demangle7ContextD1Ev");
+    auto demangleSymbol = (DemangleSymbolFunction) dlsym(library,
         "_ZN5swift8Demangle7Context20demangleSymbolAsNodeEN4llvm9StringRefE");
-    sTreeStr  = (TreeStrFn)  dlsym(sLib,
+    auto nodeTreeString = (NodeTreeStringFunction) dlsym(library,
         "_ZN5swift8Demangle19getNodeTreeAsStringEPNS0_4NodeE");
+    auto demangledName = (DemangledNameFunction) dlsym(library, "swift_demangle_getDemangledName");
+    auto simplifiedDemangledName = (DemangledNameFunction) dlsym(library, "swift_demangle_getSimplifiedDemangledName");
 
-    sLoadOk = sCtxCtor && sCtxDtor && sDemangle && sTreeStr;
-}
+    // A library missing any of them is not loaded at all: an oracle that can
+    // compare trees but silently skips text would be the blind spot again.
+    if (!contextConstructor || !contextDestructor || !demangleSymbol || !nodeTreeString ||
+        !demangledName || !simplifiedDemangledName) {
+        dlclose(library);
+        return false;
+    }
 
-static bool ensureLoaded() {
-    std::call_once(sLoadFlag, loadOnce);
-    return sLoadOk;
+    sContextConstructor = contextConstructor;
+    sContextDestructor = contextDestructor;
+    sDemangleSymbol = demangleSymbol;
+    sNodeTreeString = nodeTreeString;
+    sDemangledName = demangledName;
+    sSimplifiedDemangledName = simplifiedDemangledName;
+    sLibrary = library;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,22 +97,50 @@ static bool ensureLoaded() {
 // ---------------------------------------------------------------------------
 
 char *swift_demangle_getNodeTreeAsString(const char *mangledName) {
-    if (!mangledName || !ensureLoaded())
+    if (!mangledName || !sLibrary)
         return nullptr;
 
-    Context ctx;
-    sCtxCtor(&ctx);
+    Context context;
+    sContextConstructor(&context);
 
-    StringRef ref = { mangledName, strlen(mangledName) };
-    Node *node = sDemangle(&ctx, ref);
+    StringRef reference = { mangledName, strlen(mangledName) };
+    Node *node = sDemangleSymbol(&context, reference);
 
     char *result = nullptr;
     if (node) {
-        std::string tree = sTreeStr(node);
+        std::string tree = sNodeTreeString(node);
         result = static_cast<char *>(malloc(tree.size() + 1));
         memcpy(result, tree.c_str(), tree.size() + 1);
     }
 
-    sCtxDtor(&ctx);
+    sContextDestructor(&context);
     return result;
+}
+
+static char *copyDemangledName(DemangledNameFunction demangledName, const char *mangledName) {
+    if (!mangledName || !sLibrary)
+        return nullptr;
+
+    // Most names fit the stack buffer; a longer one is printed a second time
+    // into a buffer of the exact length the first call reported.
+    char stackBuffer[4096];
+    size_t length = demangledName(mangledName, stackBuffer, sizeof stackBuffer);
+    if (length == 0)
+        return nullptr;
+
+    char *result = static_cast<char *>(malloc(length + 1));
+    if (length < sizeof stackBuffer) {
+        memcpy(result, stackBuffer, length + 1);
+    } else {
+        demangledName(mangledName, result, length + 1);
+    }
+    return result;
+}
+
+char *swift_demangle_copyDemangledName(const char *mangledName) {
+    return copyDemangledName(sDemangledName, mangledName);
+}
+
+char *swift_demangle_copySimplifiedDemangledName(const char *mangledName) {
+    return copyDemangledName(sSimplifiedDemangledName, mangledName);
 }

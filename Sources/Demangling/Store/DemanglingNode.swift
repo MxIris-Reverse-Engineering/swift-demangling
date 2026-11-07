@@ -182,22 +182,31 @@ extension DemanglingNode {
     @usableFromInline
     static var maxTypeWrapperUnwrapDepth: Int { 64 }
 
-    /// Whether this type prints without needing parentheses around it.
+    /// This node with its `.type` wrappers looked through, or `nil` when the
+    /// chain is longer than ``maxTypeWrapperUnwrapDepth`` or ends in a wrapper
+    /// without a child — the cases every predicate built on it answers `false`
+    /// for.
     ///
-    /// `.type` wrappers are unwrapped with a bounded loop rather than by
-    /// recursing: this is public API reachable from a caller-assembled tree,
-    /// and it sits outside every engine's stack guard.
-    public var isSimpleType: Bool {
+    /// A bounded loop rather than recursion: the predicates using it are
+    /// public API reachable from a caller-assembled tree, and they sit outside
+    /// every engine's stack guard.
+    var unwrappingTypeWrappers: Self? {
         var currentNode = self
         var unwrapDepth = 0
         while currentNode.kind == .type {
             unwrapDepth += 1
             guard unwrapDepth <= Self.maxTypeWrapperUnwrapDepth,
                   let onlyChild = currentNode.children.first
-            else { return false }
+            else { return nil }
             currentNode = onlyChild
         }
-        return currentNode.isSimpleTypeIgnoringTypeWrappers
+        return currentNode
+    }
+
+    /// Whether this type prints without needing parentheses around it,
+    /// looking through `.type` wrappers (``unwrappingTypeWrappers``).
+    public var isSimpleType: Bool {
+        unwrappingTypeWrappers?.isSimpleTypeIgnoringTypeWrappers ?? false
     }
 
     private var isSimpleTypeIgnoringTypeWrappers: Bool {
@@ -257,21 +266,10 @@ extension DemanglingNode {
         }
     }
 
-    /// Whether a space belongs between a preceding keyword and this type.
-    ///
-    /// Unwraps `.type` with a bounded loop, for the same reason as
-    /// ``isSimpleType``.
+    /// Whether a space belongs between a preceding keyword and this type,
+    /// looking through `.type` wrappers (``unwrappingTypeWrappers``).
     public var needSpaceBeforeType: Bool {
-        var currentNode = self
-        var unwrapDepth = 0
-        while currentNode.kind == .type {
-            unwrapDepth += 1
-            guard unwrapDepth <= Self.maxTypeWrapperUnwrapDepth,
-                  let onlyChild = currentNode.children.first
-            else { return false }
-            currentNode = onlyChild
-        }
-        return currentNode.needSpaceBeforeTypeIgnoringTypeWrappers
+        unwrappingTypeWrappers?.needSpaceBeforeTypeIgnoringTypeWrappers ?? false
     }
 
     private var needSpaceBeforeTypeIgnoringTypeWrappers: Bool {

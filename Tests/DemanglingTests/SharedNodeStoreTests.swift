@@ -329,13 +329,15 @@ final class SharedStorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendab
         let extracted = try await symbols(for: .SwiftUI, .SwiftUICore, .Foundation, .Combine)
         let corpus = Array(Set(extracted.map(\.stringValue))).sorted()
         try #require(!corpus.isEmpty, "print corpus unavailable on this machine")
+        // "Rejected by both" is only a verdict when a toolchain was there to reject.
+        try ToolchainDemangler.requireLoadedLibrary()
 
         let sharedStore = SharedNodeStore()
         sharedStore.reserveCapacity(expectedSymbolCount: corpus.count)
 
         // Failure visibility (ReviewFindingsPR7 F4): a one-sided demangle
         // failure is a parity mismatch; a both-sided failure is classified
-        // against the stdlib demangler (see StorePrintParitySweep for the
+        // against the toolchain demangler (see StorePrintParitySweep for the
         // rationale and the classification's blind spot).
         var comparedCount = 0
         // No "one-sided failure" tally here either: `SharedNodeStore.demangle`
@@ -358,7 +360,7 @@ final class SharedStorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendab
             do { node = try demangleAsNodeTransient(mangled) } catch { node = nil }
             switch (reference, node) {
             case (nil, nil):
-                if stdlib_demangleNodeTree(mangled) == nil {
+                if ToolchainDemangler.nodeTree(for: mangled) == nil {
                     consistentlyRejectedCount += 1
                 } else {
                     regressedSymbolCount += 1
@@ -387,7 +389,7 @@ final class SharedStorePrintParitySweep: DyldCacheSymbolTests, @unchecked Sendab
         if !regressedSymbolSamples.isEmpty {
             print("[0010-shared-print-parity] regressed (stdlib demangles these, this library does not): \(regressedSymbolSamples.joined(separator: ", "))")
         }
-        #expect(regressedSymbolCount == 0, "symbols the stdlib demangler handles must not fail here")
+        #expect(regressedSymbolCount == 0, "symbols the toolchain demangler handles must not fail here")
         #expect(mismatchCount == 0, "shared-store printing must be byte-identical to the Node path")
     }
 }

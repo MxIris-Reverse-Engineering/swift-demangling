@@ -164,7 +164,7 @@ final class TransientRemangleParitySweep: DyldCacheSymbolTests, @unchecked Senda
         }
     }
 
-    // Demangle failures are classified against the stdlib demangler, the
+    // Demangle failures are classified against the toolchain demangler, the
     // same referee the default-run corpus oracle uses (see
     // StorePrintParitySweep for the rationale and the classification's blind
     // spot). Remangle failures are parity-checked but not classified: both
@@ -175,6 +175,8 @@ final class TransientRemangleParitySweep: DyldCacheSymbolTests, @unchecked Senda
         let extracted = try await symbols(for: .SwiftUI, .SwiftUICore, .Foundation, .Combine)
         let corpus = Array(Set(extracted.map(\.stringValue))).sorted()
         try #require(!corpus.isEmpty, "remangle corpus unavailable on this machine")
+        // "Rejected by both" is only a verdict when a toolchain was there to reject.
+        try ToolchainDemangler.requireLoadedLibrary()
 
         var comparedCount = 0
         var remangledCount = 0
@@ -198,7 +200,7 @@ final class TransientRemangleParitySweep: DyldCacheSymbolTests, @unchecked Senda
             case .remangleFailed:
                 remangleFailedCount += 1
             case .demangleFailed:
-                if stdlib_demangleNodeTree(mangled) == nil {
+                if ToolchainDemangler.nodeTree(for: mangled) == nil {
                     consistentlyRejectedCount += 1
                 } else {
                     regressedSymbolCount += 1
@@ -222,6 +224,6 @@ final class TransientRemangleParitySweep: DyldCacheSymbolTests, @unchecked Senda
             print("[0011-remangle-parity] regressed (stdlib demangles these, this library does not): \(regressedSymbolSamples.joined(separator: ", "))")
         }
         #expect(mismatchCount == 0, "transient-path remangling must agree with the canonical path, including on failures and their reasons")
-        #expect(regressedSymbolCount == 0, "symbols the stdlib demangler handles must not fail here")
+        #expect(regressedSymbolCount == 0, "symbols the toolchain demangler handles must not fail here")
     }
 }

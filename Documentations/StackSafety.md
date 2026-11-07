@@ -226,7 +226,9 @@ depth 计数器根本没机会涨。上游 C++ 有完全相同的洞，靠「调
   地址预留（双核手表 5 × 2 × 16MB = 160MB）。
 - **回退**：池拒绝（建不出线程）→ 一次性 16MB 专用线程（按 **job 的类**创建，不是 enqueue 线程的类：
   enqueue 的线程是恢复这个 job 的任意线程）→ `DispatchQueue.global(qos:)`（job 照跑、探针照跳）。
-  `enqueue` 绝不就地跑 job——它在运行时的调度路径里被调用，就地跑会递归回去。
+  `enqueue` 绝不就地跑 job——它在运行时的调度路径里被调用，就地跑会递归回去。池子塌缩（所有建线程
+  尝试都失败）时搁浅的已入队 job 也走这条退路：执行器的池带 `strandedWorkItemHandler`，不像跳转池那样
+  由最后回滚的提交方就地跑完（2026-10-27 修复，`KnownIssues.md` N2）。
 - **16MB 关掉了什么**（2026-09-03 实测，debug，arm64，嵌套 `Optional` 形状：打印器每层 2 个深度单位、
   remangler 4 个）：8MB 线程上打印器 380 层（≈760 单位）、remangler 200 层（≈800 单位）都先于计数器
   SIGBUS——这正是 `KnownIssues.md` #4 的窗口；16MB 上 380 层完整打印、383 层起 `<<too complex>>`，

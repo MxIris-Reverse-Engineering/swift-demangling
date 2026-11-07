@@ -120,27 +120,16 @@ extension Node {
 }
 
 extension Node {
-    /// Whether this node denotes a protocol, looking through `.type` wrappers.
-    ///
-    /// Unwraps `.type` with a bounded loop rather than by recursing, for the
-    /// same reason as ``DemanglingNode/isSimpleType``: this is public API, so
-    /// the tree may be caller-assembled rather than demangler-produced, and it
-    /// sits outside every engine's stack guard. On demangled input the limit is
-    /// unreachable — the demangler does not nest `.type` (measured across the
-    /// full 4.5M-symbol corpus, the longest consecutive run is one) — so the
-    /// bound exists only so a hand-built chain returns `false` instead of
-    /// overflowing the stack.
+    /// Whether this node denotes a protocol, looking through `.type` wrappers
+    /// with the bounded ``DemanglingNode/unwrappingTypeWrappers``: this is
+    /// public API, so the tree may be caller-assembled rather than
+    /// demangler-produced. On demangled input the bound is unreachable — the
+    /// demangler does not nest `.type` (measured across the full 4.5M-symbol
+    /// corpus, the longest consecutive run is one) — so it exists only so a
+    /// hand-built chain returns `false` instead of overflowing the stack.
     public var isProtocol: Bool {
-        var currentNode = self
-        var unwrapDepth = 0
-        while currentNode.kind == .type {
-            unwrapDepth += 1
-            guard unwrapDepth <= Self.maxTypeWrapperUnwrapDepth,
-                  let onlyChild = currentNode.children.first
-            else { return false }
-            currentNode = onlyChild
-        }
-        switch currentNode.kind {
+        guard let unwrappedKind = unwrappingTypeWrappers?.kind else { return false }
+        switch unwrappedKind {
         case .protocol,
              .protocolSymbolicReference,
              .objectiveCProtocolSymbolicReference: return true
@@ -149,19 +138,10 @@ extension Node {
     }
 
     /// Whether this node is a generic parameter type, looking through `.type`
-    /// wrappers (upstream `isGenericParamType`, Swift 6.4). Same bounded loop
-    /// as `isProtocol`, for the same reason.
+    /// wrappers the same way as `isProtocol` (upstream `isGenericParamType`,
+    /// Swift 6.4).
     public var isGenericParamType: Bool {
-        var currentNode = self
-        var unwrapDepth = 0
-        while currentNode.kind == .type {
-            unwrapDepth += 1
-            guard unwrapDepth <= Self.maxTypeWrapperUnwrapDepth,
-                  let onlyChild = currentNode.children.first
-            else { return false }
-            currentNode = onlyChild
-        }
-        return currentNode.kind == .dependentGenericParamType
+        unwrappingTypeWrappers?.kind == .dependentGenericParamType
     }
 
     // `isSimpleType`, `needSpaceBeforeType`, `isIdentifier(desired:)`, and

@@ -287,9 +287,9 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .autoDiffSubsetParametersThunk:
             printAutoDiffSubsetParametersThunk(name)
         case .backDeploymentFallback:
-            if !options.contains(.shortenThunk) {
-                target.write("back deployment fallback for ")
-            }
+            // Unlike the thunk below, never shortened away: upstream gates
+            // only `BackDeploymentThunk` on `ShortenThunk`.
+            target.write("back deployment fallback for ")
         case .backDeploymentThunk:
             if !options.contains(.shortenThunk) {
                 target.write("back deployment thunk for ")
@@ -442,7 +442,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .functionSignatureSpecializationParamKind: printFunctionSignatureSpecializationParamKind(name)
         case .functionSignatureSpecializationParamPayload:
             if let text = name.text {
-                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: options) ?? ""
+                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: nestedNameOptions) ?? ""
                 if demangledName.isEmpty {
                     target.write(text)
                 } else {
@@ -651,7 +651,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .reflectionMetadataBuiltinDescriptor: printFirstChild(name, prefix: "reflection metadata builtin descriptor ")
         case .reflectionMetadataFieldDescriptor: printFirstChild(name, prefix: "reflection metadata field descriptor ")
         case .reflectionMetadataSuperclassDescriptor: printFirstChild(name, prefix: "reflection metadata superclass descriptor ")
-        case .representationChanged: target.write("representation changed")
+        case .representationChanged: printFirstChild(name, prefix: "representation changed of ")
         case .relatedEntityDeclName:
             // Child 0 is the related-entity kind (`e`), not a name, so only
             // child 1 takes the entity's kind.
@@ -727,6 +727,19 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         return nil
     }
 
+    /// The options a nested name prints under: a mangled name inside a
+    /// specialization parameter, which upstream demangles with
+    /// `demangleSymbolAsString(text)`, and an attached macro's name, which it
+    /// prints with `nodeToString(Node->getChild(2))`. Both calls pass no
+    /// options, so the nested name reads the same — without type sugar —
+    /// whatever the caller asked for. The one caller option carried over is
+    /// `.useModuleSelectors`: it has no upstream counterpart, and a line that
+    /// spells some qualified names with selectors and others without would be
+    /// neither form.
+    private var nestedNameOptions: DemangleOptions {
+        DemangleOptions.default.union(options.intersection(.useModuleSelectors))
+    }
+
     private func shouldPrintContext(_ context: SomeNode) -> Bool {
         guard options.contains(.qualifyEntities) else {
             return false
@@ -760,16 +773,16 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         _ = printOptional(ofName.children.at(0), prefix: prefix, suffix: suffix)
     }
 
-    private mutating func printSequence<S>(_ names: S, prefix: String? = nil, suffix: String? = nil, separator: String? = nil) where S: Sequence, S.Element == SomeNode {
+    private mutating func printSequence<Names>(_ names: Names, prefix: String? = nil, suffix: String? = nil, separator: String? = nil) where Names: Sequence, Names.Element == SomeNode {
         var isFirst = true
         prefix.map { target.write($0) }
-        for c in names {
-            if let s = separator, !isFirst {
-                target.write(s)
+        for name in names {
+            if let separator, !isFirst {
+                target.write(separator)
             } else {
                 isFirst = false
             }
-            _ = printName(c)
+            _ = printName(name)
         }
         suffix.map { target.write($0) }
     }
@@ -779,7 +792,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     }
 
     private mutating func printMacro(name: SomeNode, asPrefixContext: Bool, label: String) -> SomeNode? {
-        return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "\(label) macro @\(name.children.at(2)?.print(using: options) ?? "") expansion #", extraIndex: displayDiscriminator(name.children.at(3)?.index ?? 0, of: name.kind))
+        return printEntity(name, asPrefixContext: asPrefixContext, typePrinting: .noType, hasName: true, extraName: "\(label) macro @\(name.children.at(2)?.print(using: nestedNameOptions) ?? "") expansion #", extraIndex: displayDiscriminator(name.children.at(3)?.index ?? 0, of: name.kind))
     }
 
     private mutating func printAnonymousContext(_ name: SomeNode) {
@@ -998,7 +1011,11 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                     guard let typeChild = name.children.at(argIdx), typeChild.kind == .type else { break }
                     argIdx += 1
                     _ = printName(typeChild)
-                    if argIdx < name.children.count, name.children.at(argIdx)?.kind == .type {
+                    // Upstream writes the separator only when the next child
+                    // carries text, which a type node never does, so the types
+                    // print run together. Kept: the presets are byte-identical
+                    // to the toolchain (KnownIssues N1).
+                    if argIdx < name.children.count, name.children.at(argIdx)?.text != nil {
                         target.write(", ")
                     }
                 }
@@ -1032,7 +1049,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             switch kind {
             case .constantPropInteger, .constantPropFloat:
                 guard let text = child.text else { return }
-                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: options) ?? ""
+                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: nestedNameOptions) ?? ""
                 if demangledName.isEmpty {
                     target.write(text)
                 } else {
@@ -1046,7 +1063,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                 _ = printName(child)
             case .constantPropFunction, .constantPropGlobal:
                 let text = child.text ?? ""
-                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: options) ?? ""
+                let demangledName = (try? demangleAsNodeTransient(text))?.print(using: nestedNameOptions) ?? ""
                 if demangledName.isEmpty {
                     target.write(text)
                 } else {
@@ -1168,7 +1185,8 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 
     private mutating func printReabstractionThunk(_ name: SomeNode) {
         if options.contains(.shortenThunk) {
-            _ = printOptional(name.children.at(name.children.count - 2), prefix: "thunk for ")
+            // The last child, as upstream's `ShortenThunk` branch prints.
+            _ = printOptional(name.children.at(name.children.count - 1), prefix: "thunk for ")
         } else {
             target.write("reabstraction thunk ")
             target.write(name.kind == .reabstractionThunkHelper ? "helper " : "")
@@ -1399,27 +1417,30 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             return false
         }
 
-        let isGenericParamValue = { (depth: UInt64, index: UInt64) -> SomeNode? in
+        // Whether the parameter carries a value marker, and the value type
+        // upstream would print after it. Upstream takes that type as the
+        // second child of the marker's `.type` wrapper, which only ever has
+        // one: an out-of-bounds read the shipping toolchain prints as nothing,
+        // so its output is `let A` with no `: Swift.Int`. The same read here
+        // finds no child and prints the same; requiring the type, as this
+        // closure once did, dropped the `let` as well.
+        let isGenericParamValue = { (depth: UInt64, index: UInt64) -> (isValue: Bool, valueType: SomeNode?) in
             for var child in name.children.dropFirst(numGenericParams).prefix(markerCount) {
                 guard child.kind == .dependentGenericParamValueMarker else { continue }
                 child = child.children.first ?? child
 
                 guard child.kind == .type else { continue }
 
-                guard
-                    let param = child.children.at(0),
-                    let type = child.children.at(1),
-                    param.kind == .dependentGenericParamType
-                else {
+                guard let param = child.children.at(0), param.kind == .dependentGenericParamType else {
                     continue
                 }
 
                 if index == param.children.at(0)?.index, depth == param.children.at(1)?.index {
-                    return type
+                    return (true, child.children.at(1))
                 }
             }
 
-            return nil
+            return (false, nil)
         }
 
         for gpDepth in 0 ..< numGenericParams {
@@ -1446,15 +1467,15 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                 }
 
                 let value = isGenericParamValue(UInt64(gpDepth), UInt64(index))
-                if value != nil {
+                if value.isValue {
                     target.write("let ")
                 }
 
                 target.write(Self.genericParameterName(depth: UInt64(gpDepth), index: UInt64(index)))
 
-                if let value {
+                if let valueType = value.valueType {
                     target.write(": ")
-                    _ = printName(value)
+                    _ = printName(valueType)
                 }
             }
         }
@@ -1775,7 +1796,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 
     private mutating func printObjCAsyncCompletionHandlerImpl(_ name: SomeNode) {
         if name.kind == .checkedObjCAsyncCompletionHandlerImpl {
-            target.write("predefined ")
+            target.write("checked ")
         }
         target.write("@objc completion handler block implementation for ")
         if name.children.count >= 4 {
@@ -2117,8 +2138,8 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
                     default:
                         _ = printName(one)
                     }
-                    if let pdn = name.children.first(where: { $0.kind == .privateDeclName }) {
-                        _ = printName(pdn, identifierParentKind: name.kind)
+                    if let privateDeclarationName = name.children.first(where: { $0.kind == .privateDeclName }) {
+                        _ = printName(privateDeclarationName, identifierParentKind: name.kind)
                     }
                 }
             }
@@ -2206,13 +2227,16 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             // inside its branch (PR #7 review, finding 2).
             specializationPrefixVisitCount += 1
             if !specializationPrefixPrinted {
-                if name.children.first?.kind == .representationChanged {
-                    target.write("representation changed of ")
-                } else {
-                    target.write("specialized ")
-                }
+                target.write("specialized ")
                 specializationPrefixPrinted = true
             }
+            return
+        }
+        // Only reached with generic specializations displayed, as upstream
+        // (4c09fa6805b): with them hidden a representation change is just
+        // another specialization and reads "specialized " above.
+        if name.children.first?.kind == .representationChanged {
+            target.write("representation changed of ")
             return
         }
         target.write("\(description) <")
@@ -2220,9 +2244,10 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         var argNum = 0
         for c in name.children {
             switch c.kind {
+            // A representation change in a later position falls through to
+            // `default` and takes a parameter number, as upstream's does.
             case .specializationPassID,
-                 .droppedArgument,
-                 .representationChanged: break
+                 .droppedArgument: break
             case .isSerialized:
                 target.write(separator)
                 separator = ", "
