@@ -47,18 +47,27 @@ extension Demangler {
         createNode(kind: kind, contents: .index(index))
     }
 
+    // The compound forms below are `mutating` for the reason `require` is
+    // (Demangler.swift): their callers pass arguments that mutate `self` —
+    // `createNode(typeWithChildKind:childChildren: [..., require(pop(kind: .type))])`
+    // — and a non-mutating receiver had to be a copy of the whole demangler,
+    // taken before those arguments ran. The single-node forms above stay
+    // non-mutating for the two non-mutating callers; they are always inlined
+    // and read only `internsLeaves`, a `let`, so the optimizer drops their
+    // copy, which the compound forms, not inlined, kept.
+
     /// Compound: `.type` wrapping a node of `typeWithChildKind` with one child.
-    func createNode(typeWithChildKind: Node.Kind, childChild: Node) -> Node {
+    mutating func createNode(typeWithChildKind: Node.Kind, childChild: Node) -> Node {
         createNode(kind: .type, children: [createNode(kind: typeWithChildKind, children: [childChild])])
     }
 
     /// Compound: `.type` wrapping a node of `typeWithChildKind` with children.
-    func createNode(typeWithChildKind: Node.Kind, childChildren: [Node]) -> Node {
+    mutating func createNode(typeWithChildKind: Node.Kind, childChildren: [Node]) -> Node {
         createNode(kind: .type, children: [createNode(kind: typeWithChildKind, children: childChildren)])
     }
 
     /// Compound: Swift stdlib type (`.type` > `kind` > [`.module("Swift")`, `.identifier(name)`]).
-    func createNode(swiftStdlibTypeKind: Node.Kind, name: String) -> Node {
+    mutating func createNode(swiftStdlibTypeKind: Node.Kind, name: String) -> Node {
         createNode(kind: .type, children: [createNode(kind: swiftStdlibTypeKind, children: [
             createNode(kind: .module, text: stdlibName),
             createNode(kind: .identifier, text: name),
@@ -66,7 +75,7 @@ extension Demangler {
     }
 
     /// Compound: Swift builtin type (`.type` > `kind(name)`).
-    func createNode(swiftBuiltinType: Node.Kind, name: String) -> Node {
+    mutating func createNode(swiftBuiltinType: Node.Kind, name: String) -> Node {
         createNode(kind: .type, children: [createNode(kind: swiftBuiltinType, text: name)])
     }
 }

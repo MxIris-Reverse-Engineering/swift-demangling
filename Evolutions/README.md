@@ -58,6 +58,7 @@
 | [0015](0015-swift-6-4-demangling-alignment.md) | 对齐 Swift 6.4 的 lib/Demangling：新 kind、accessor 改名与 oracle 换基准 | Implemented |
 | [0016](0016-unretained-kind-queries.md) | 在 store 上按种类找节点时不碰引用计数 | Implemented |
 | [0017](0017-module-selectors.md) | 打印选项：用 SE-0491 的模块选择器（`Module::Name`）写限定名 | Implemented |
+| [0018](0018-demangler-self-copy.md) | demangle 不再复制整个 Demangler，remangle 不再逐格销毁节点哈希缓存 | Implemented |
 
 ## 流程
 

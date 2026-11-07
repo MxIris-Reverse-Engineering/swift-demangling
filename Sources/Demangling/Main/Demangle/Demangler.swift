@@ -30,7 +30,20 @@ struct Demangler<Words: WordRangeStorage>: ~Escapable {
 }
 
 extension Demangler {
-    private func require<Wrapped>(_ optional: Wrapped?) throws(DemanglingError) -> Wrapped {
+    // `mutating` although neither mutates anything. Almost every call passes
+    // an argument that mutates `self` — `try require(pop())` — and Swift
+    // evaluates the receiver before the arguments: for a non-mutating method
+    // that receiver had to be a copy of the whole demangler, taken before
+    // `pop()` ran. The copy shared the node stack's buffer, so the `pop()`
+    // that followed copied the whole stack, every node's reference count
+    // included, and destroying the copy released them all again — a third
+    // of the time a demangle took, and with several threads demangling at
+    // once a fight over the reference counts of the shared parameterless
+    // nodes. A mutating receiver is an inout access that begins after the
+    // arguments are evaluated, so nothing is copied. (Evolution proposal
+    // `demangler-self-copy`.) The one visible difference: a failure reports
+    // the scanner position after the argument was evaluated, not before.
+    private mutating func require<Wrapped>(_ optional: Wrapped?) throws(DemanglingError) -> Wrapped {
         if let optional {
             return optional
         } else {
@@ -38,7 +51,7 @@ extension Demangler {
         }
     }
 
-    private func require(_ value: Bool) throws(DemanglingError) {
+    private mutating func require(_ value: Bool) throws(DemanglingError) {
         if !value {
             throw failure
         }

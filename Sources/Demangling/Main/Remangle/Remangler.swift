@@ -61,8 +61,23 @@ struct Remangler {
     /// longer read back (PR #7 review, fourth round).
     private var buffer: [UInt8] = []
 
-    /// Hash table for caching node hashes (avoids expensive recursive computation)
-    private var hashHash: [SubstitutionEntry?] = Array(repeating: nil, count: hashHashCapacity)
+    /// Hash table caching node hashes (avoids expensive recursive computation),
+    /// allocated by ``mangle(_:)`` for each remangle.
+    ///
+    /// A slot holds plain values — the node's object identity, its hash, and
+    /// whether it was hashed as an identifier — so dropping the table, which
+    /// every remangle does, frees one allocation. Slots of optional entries
+    /// holding the node itself made the runtime call a value witness on each
+    /// of the 512 slots to find the references to release, 6% of printing
+    /// SwiftUI's interface (evolution proposal `demangler-self-copy`).
+    /// ``hashCachedNodes`` keeps every node in the table alive until the next
+    /// reset, so no other node can take an address while it names a slot, and
+    /// an identity match is the same node, as the slots' own strong
+    /// references guaranteed before.
+    private var hashHash: [HashCacheSlot] = []
+
+    /// The nodes ``hashHash`` names, kept alive while it names them.
+    private var hashCachedNodes: [Node] = []
 
     /// Inline storage for first 16 substitutions (fast path, no heap allocation)
     private var inlineSubstitutions: [SubstitutionEntry] = []
@@ -225,11 +240,7 @@ struct Remangler {
             // parent, so repeated back-references stay O(1).
             let slot = cacheSlot(for: frame.node, treatAsIdentifier: false)
             if let freeSlotIndex = slot.freeSlotIndex {
-                hashHash[freeSlotIndex] = SubstitutionEntry(
-                    node: frame.node,
-                    storedHash: frame.accumulatedHash,
-                    treatAsIdentifier: false
-                )
+                cacheHash(frame.accumulatedHash, of: frame.node, treatAsIdentifier: false, inSlotAt: freeSlotIndex)
             }
             pendingChildHash = frame.accumulatedHash
         }
@@ -279,15 +290,17 @@ struct Remangler {
         let ident = treatAsIdentifier ? 4 : 0
         // wrapping-audited: hash mixing; the sum is masked into a slot below, so a wrap is a different slot, never a bad one.
         let nodeHash = nodePointerHash(node) &+ ident
+        let nodeIdentity = ObjectIdentifier(node)
 
         // Linear probing with limited attempts
         for probe in 0 ..< Self.hashHashMaxProbes {
             // wrapping-audited: open-addressing probe — the mask below makes any wrap land in range.
             let index = (nodeHash &+ probe) & (Self.hashHashCapacity - 1)
 
-            if let cachedEntry = hashHash[index] {
-                if cachedEntry.matches(node: node, treatAsIdentifier: treatAsIdentifier) {
-                    return (cachedEntry, nil)
+            let slot = hashHash[index]
+            if let cachedNodeIdentity = slot.nodeIdentity {
+                if cachedNodeIdentity == nodeIdentity, slot.treatAsIdentifier == treatAsIdentifier {
+                    return (SubstitutionEntry(node: node, storedHash: slot.storedHash, treatAsIdentifier: treatAsIdentifier), nil)
                 }
             } else {
                 return (nil, index)
@@ -303,11 +316,17 @@ struct Remangler {
         }
 
         let hash = hashForNode(node, treatAsIdentifier: treatAsIdentifier)
-        let entry = SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
         if let freeSlotIndex = slot.freeSlotIndex {
-            hashHash[freeSlotIndex] = entry
+            cacheHash(hash, of: node, treatAsIdentifier: treatAsIdentifier, inSlotAt: freeSlotIndex)
         }
-        return entry
+        return SubstitutionEntry(node: node, storedHash: hash, treatAsIdentifier: treatAsIdentifier)
+    }
+
+    /// Writes `hash` into the cache slot at `slotIndex` for `node`, keeping
+    /// the node alive for as long as the table may name it.
+    private mutating func cacheHash(_ hash: Int, of node: Node, treatAsIdentifier: Bool, inSlotAt slotIndex: Int) {
+        hashHash[slotIndex] = HashCacheSlot(nodeIdentity: ObjectIdentifier(node), storedHash: hash, treatAsIdentifier: treatAsIdentifier)
+        hashCachedNodes.append(node)
     }
 
     /// Compute a hash from a node pointer (for cache indexing)
@@ -468,7 +487,14 @@ struct Remangler {
         clearBuffer()
         words.removeAll(keepingCapacity: true)
         substWordsInIdent.removeAll(keepingCapacity: true)
-        hashHash = Array(repeating: nil, count: Self.hashHashCapacity)
+        if hashHash.count == Self.hashHashCapacity {
+            for slotIndex in hashHash.indices {
+                hashHash[slotIndex] = .empty
+            }
+        } else {
+            hashHash = Array(repeating: .empty, count: Self.hashHashCapacity)
+        }
+        hashCachedNodes.removeAll(keepingCapacity: true)
         inlineSubstitutions.removeAll(keepingCapacity: true)
         overflowSubstitutions.removeAll(keepingCapacity: true)
         substMerging = .init()
@@ -5970,6 +5996,21 @@ extension Remangler {
         }
 
         substWordsInIdent.removeAll()
+    }
+
+    /// One slot of the node hash cache (``hashHash``): which node, hashed
+    /// under which treatment, to what. Plain values only, so a table of them
+    /// is freed without visiting its slots; the node itself is kept alive by
+    /// ``hashCachedNodes``.
+    private struct HashCacheSlot {
+        /// The node's identity, or `nil` for an empty slot.
+        var nodeIdentity: ObjectIdentifier?
+
+        var storedHash: Int
+
+        var treatAsIdentifier: Bool
+
+        static let empty = HashCacheSlot(nodeIdentity: nil, storedHash: 0, treatAsIdentifier: false)
     }
 
     /// An entry in the remangler's substitution map.
