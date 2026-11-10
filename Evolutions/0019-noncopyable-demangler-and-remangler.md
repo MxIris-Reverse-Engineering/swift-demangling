@@ -1,12 +1,12 @@
-# Draft - Demangler 与 Remangler 改为 `~Copyable`：「不整份复制」由编译器保证
+# 0019 - Demangler 与 Remangler 改为 `~Copyable`：「不整份复制」由编译器保证
 
-- **状态**: In Progress
+- **状态**: Implemented
 - **作者**: JH
 - **创建日期**: 2026-11-10
 - **最后更新**: 2026-11-10
 - **所属愿景**: `Evolutions/README.md` 愿景第 3 条（计价纪律：违反纪律的代码要被拦下，这里由编译器拦）与第 4 条（渐进吸收新语言能力）
 - **关联提案**: [0018](0018-demangler-self-copy.md)（本提案把它靠约定维持的「不复制」变成编译器保证）
-- **实现分支 / PR**: `refactor/noncopyable-demangler-and-remangler`（worktree `.worktrees/swift-demangling-NoncopyableDemanglerAndRemangler`）
+- **实现分支 / PR**: `refactor/noncopyable-demangler-and-remangler`（快进合入 `next`，随下一个补丁版发布）
 
 ## 摘要
 
@@ -52,3 +52,4 @@
 | 2026-11-10 | 第 6 条验证二：release 性能持平，interface 输出逐字节相同 | MachOSwiftSection 的 `reader-benchmark`，本机 cache 的 SwiftUI。基线接发布版 0.7.3，改后接功能分支，其余依赖用同一份解析结果；两个版本交替跑两轮，第二轮对调先后，运行期间占住构建队列，没有别的构建同时跑。instructions retired，基线 → 改后：只建索引，进程内 59.2–59.3 G → 59.3–59.5 G，离线 63.3–63.8 G → 63.4–63.6 G；interface 准备，进程内 59.7–59.8 G → 59.8–59.9 G，离线 63.7–63.8 G → 63.9–64.0 G；interface 打印（五类布局注释），进程内 61.1–61.2 G → 61.1 G，离线 85.5–85.6 G → 85.4–85.7 G。差异都在波动范围内：同一个二进制两次运行就能差到 0.8%；CPU 时间（5.5–7.5 秒）也一样。两种读取器打印出的 interface 与基线逐字节相同（7,878,092 与 8,309,522 字节）。这符合预期：0.7.3 起，这些复制在 release 下已经被优化器去掉了，本提案的价值在于保证它们不再回来 |
 | 2026-11-10 | 第 6 条验证三：debug 全量测试的 CPU 时间少 2.1%，只记录 | 默认 `swift test` 全量，CPU 时间（user + sys）3172 秒 → 3105 秒；墙钟 822 秒 → 740 秒，但两次运行时机器上其他会话的负载不同，墙钟不可比。降幅不大，因为全量测试的大头是全语料 oracle 里工具链 demangler 的调用、打印与逐符号比对，`-Onone` 下省掉的复制只占其中一小部分。另外，`/usr/bin/time -l` 报告的 instructions retired 只算 `swift test` 自身，不含它拉起的测试进程（实测全量测试只报 6.4 G），所以这里只比 CPU 时间 |
 | 2026-11-10 | 实现完成，待用户看过后收尾 | 文档判断：`AGENTS.md` 已在第 5 条更新；纯内部改动、没有新 API，不需要实现说明或使用指南；没有新术语。`Documentations/README.md` 的提案索引留到正式收尾时登记，届时顺带补上它缺的 0016–0018 三行 |
+| 2026-11-10 | 收尾：编号 0019，状态 Implemented，快进合入 `next` 并推送；暂不发版 | 用户看过后选择现在收尾、暂不发版。实现与方案一致，没有偏离，也没有没做的项。配套文档只有 `AGENTS.md`（第 5 条）；不需要实现说明或使用指南；新术语：无。`Documentations/README.md` 的提案索引补上 0016–0019 四行 |

@@ -78,6 +78,10 @@
   | `0013-punycode-upstream-parity-and-review-round-four-fixes.md` | punycode 解码合并上游两层时，两层各自的守卫都漏了：数字域缺上界（`K`-`Z` 被当成数字）、分隔符前不拒非 basic code point、无效标量用 `.` 顶替而非拒绝——本库因此接受工具链拒绝的符号并编造标识符文本。同批修掉 `TypeDecoder` 窄化族漏下的第 6 处、`StackSafeExecutor` 的假注释与无锁测试 hook，并把 README 示例固化成可编译的测试。 |
   | `0014-large-stack-task-executor.md` | 下游 async 打印管线跑在 512 KB 协作线程上，每次 print 都付一次线程往返（8–21 µs）且 async 循环包不进 `withLargeStack`；新增 `TaskExecutor` 让任务整体住在 16 MB 线程上，探测直接通过。与阻塞池分池共码、`@_spi(Internals)`、`@available(macOS 15…)`；顺手关掉 `KnownIssues` #4 在执行器路径上打印器与 remangler 的两个窗口（实测 16 MB 关不掉 TypeDecoder 的，如实登记）。状态 `Implemented`，随 0.6.3 发布。 |
   | `0015-swift-6-4-demangling-alignment.md` | 上游 6.3.2 → 6.4.0 的 `lib/Demangling` 全部改动逐项移植：新 kind `implNonisolatedNonsendingIsolation`（`@caller_isolated`）、`read2Accessor` / `modify2Accessor` 改名为 `yieldingBorrowAccessor` / `yieldingMutateAccessor`（旧名留弃用别名、`Codable` 兼容）、参数特化 `E`、requirement `j` / `J`、`Tn` / `TN` 的泛型参数 subject、attached macro 可变子节点 remangle、TypeDecoder 的三值 isolation 与 `createBuiltinBorrowType`。语料 oracle 的基准随之从 Apple Swift 6.3.3 切到 6.4（`DEVELOPER_DIR` 指向 Xcode 27）。值泛型加固推迟。状态 `Implemented`。 |
+  | `0016-unretained-kind-queries.md` | 在 store 上按种类找节点（`first(of:)` / `contains(_:)`）时，整次查询只钉住一次视图，不再逐个节点 retain store：此前十四个线程并发查询同一个共享 store，CPU 是串行的约 118 倍。状态 `Implemented`。 |
+  | `0017-module-selectors.md` | 新打印选项 `useModuleSelectors`：用 SE-0491 的模块选择器（`Module::Name`，Swift 6.4 的 `.swiftinterface` 就这么写）写限定名。它不进任何预设，因为 `.default` 与 `.simplified` 要和工具链逐字节对齐。状态 `Implemented`。 |
+  | `0018-demangler-self-copy.md` | `try require(pop())` 里的非 `mutating` 辅助方法让编译器先整份复制 `Demangler`，再连带复制节点栈，占单线程 demangle 约三分之一，并行时把 CPU 拖到约 2.3 倍；改为 `mutating`。同批让 `Remangler` 的 512 格节点哈希缓存不再逐格销毁。随 0.7.3 发布。状态 `Implemented`。 |
+  | `0019-noncopyable-demangler-and-remangler.md` | 把 0018 靠约定维持的「不整份复制」交给编译器：`Demangler` 与 `Remangler` 改为 `~Copyable`，不可复制的接收者在参数求值之后才借用，`require(pop())` 照常编译且一次也不复制；另有回归测试锁住 `~Copyable`。release 性能持平，输出逐字节不变。状态 `Implemented`。 |
 
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」
