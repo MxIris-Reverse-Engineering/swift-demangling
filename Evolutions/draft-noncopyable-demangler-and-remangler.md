@@ -1,6 +1,6 @@
 # Draft - Demangler 与 Remangler 改为 `~Copyable`：「不整份复制」由编译器保证
 
-- **状态**: Accepted
+- **状态**: In Progress
 - **作者**: JH
 - **创建日期**: 2026-11-10
 - **最后更新**: 2026-11-10
@@ -18,7 +18,7 @@
 
 ## 方案
 
-1. **`Demangler` 声明为 `~Copyable, ~Escapable`**（`Demangler.swift`）。两个 `require` 与 `Demangler+NodeCreation.swift` 里的四个组合 `createNode` 去掉 `mutating`。解释「为什么标 `mutating`」的两段注释换成一段说明：接收者不可复制，借用在参数求值之后才开始，`pop()` 先跑完，既不复制也不冲突。
+1. **`Demangler` 声明为 `~Copyable, ~Escapable`**（`Demangler.swift`）。两个 `require` 与 `Demangler+NodeCreation.swift` 里的四个组合 `createNode` 去掉 `mutating`。解释「为什么标 `mutating`」的两段注释换成一段说明：接收者不可复制，借用在参数求值之后才开始，`pop()` 先跑完，既不复制也不冲突。**已完成。**
 2. **`Remangler` 声明为 `~Copyable`**（`Remangler.swift`）。它现在没有 0018 那种复制：非 `mutating` 辅助方法的参数里没有改 `self` 的调用。改它是为了预防，以后有人写出同样的调用，编译器同样会拦下。没有调用方的 `Remangler.require` 顺手删掉。
 3. **按编译器报错逐处调整**。真实类型还没试编过，预期会有零星报错，比如闭包捕获、对 `self` 的整体使用。改法以不改语义为限；如果哪处必须显式 `copy` 或重构才能编过，记进决策日志。
 4. **回归测试锁住 `~Copyable`**。去掉 `~Copyable` 照样能编译，输出也不变，只有性能悄悄退回去，任何输出比对测试都抓不到。所以加一条测试确认两个类型不可复制，失败信息写明不能去掉的原因。判别手段实现时再定：优先用编译期重载决议，不行再退回源码扫描（仿照 `librarySourceAvoidsWordSizeDependentIntegerConversions`）。
@@ -42,3 +42,4 @@
 | 2026-11-10 | 探针结论：`~Copyable` 下接收者借用推迟到参数求值之后 | 仓库外的独立 Swift 文件模拟两个引擎的写法，只编译成 `-Onone` SIL，在 Swift 6.3.3（Xcode 26.6）与 6.4.2（Xcode 27.3 beta）上结果相同。照现状声明的版本在 `createNode(kind:child: try require(pop()))` 处复制整个结构两次，两次都在 `pop()` 之前；`~Copyable` 版本一次也不复制，`pop()` 的修改访问结束后才开始对 `self` 的读借用。闭包里调非 `mutating` 方法、`?? require(pop())` 的自动闭包、`for name in nameStack` 循环体里调 `mutating` 方法，都能编译且不复制结构。Remangler 的写法里，带普通参数的非 `mutating` 调用照现状在 `-Onone` 下每次都给整个结构 retain/release 一次，`~Copyable` 下没有。编译器依据：SILGen 对不可复制类型的 guaranteed 参数（含 `self`）走 `DelayedArgument::BorrowedLValue`，借用推迟到其余参数求值之后（`lib/SILGen/SILGenApply.cpp`，`tryEmitBorrowedMoveOnly`） |
 | 2026-11-10 | 确认不影响 MachOSwiftSection | 它的 Sources 与 Tests 里提到 `Demangler` / `Remangler` 的 8 处都是注释；其中 10 个测试文件 `@testable import Demangling`，也都没碰这两个类型；它用的 SPI（`createTransient`、`StackSafeExecutor`、`DemanglingPrinter`、`LargeStackTaskExecutor`、`materializedNode`）不变；工具链下限 6.3 在探针覆盖范围内；依赖区间 `"0.7.3" ..< "0.8.0"` 能直接接住补丁版 |
 | 2026-11-10 | 用户批准，开始实现，状态 Accepted | 方案第 1、2、4、5 条各是一个能单独构建通过的落地步骤，第 3 条是贯穿前两步的改法约束，第 6 条是收尾验证；不再另拆 |
+| 2026-11-10 | 第 1 步完成，状态 In Progress：`Demangler` 加上 `~Copyable` 后，库与测试一次编过，第 3 条预期的报错一个也没有 | Xcode 27.2 下零错误零警告：闭包捕获、`??` 自动闭包、循环体里的 `mutating` 调用都和探针一样直接成立。快速套件（上游 manglings、`DemangleSwiftProjectDerivedTests`、`DualPathParityTests`、`DefectRegressionTests`、`AppleAlignmentTests` 等 9 个套件 400 个测试）全部通过，8 个已知问题与基线相同；全语料 oracle 留到第 6 条统一跑 |
