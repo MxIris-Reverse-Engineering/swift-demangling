@@ -642,6 +642,50 @@ struct DefectRegressionTests {
         #expect(actualSecond == expectedSecond, "a reused remangler emitted different output than a fresh one")
     }
 
+    // MARK: - Engines that must not be copied
+
+    /// Whether `CheckedType` is copyable, decided at compile time by overload
+    /// resolution: a copyable type matches both overloads and the one that
+    /// requires `Copyable` is the more specific, a noncopyable type matches
+    /// only the second. Both suppress `Escapable`, so a copyable but
+    /// nonescapable type — `Demangler` with its `~Copyable` dropped — still
+    /// resolves to the first.
+    private static func isCopyable<CheckedType: ~Escapable>(_ type: CheckedType.Type) -> Bool {
+        true
+    }
+
+    private static func isCopyable<CheckedType: ~Copyable & ~Escapable>(_ type: CheckedType.Type) -> Bool {
+        false
+    }
+
+    /// `Demangler` and `Remangler` are `~Copyable` so that the compiler can
+    /// never copy an engine behind the code's back. A copyable receiver is
+    /// evaluated before the call's arguments, and `try require(pop())` with a
+    /// non-mutating `require` copied the whole demangler and then its node
+    /// stack, every node's reference count included — a third of the time a
+    /// demangle took (evolution proposal `demangler-self-copy`). Dropping
+    /// `~Copyable` still compiles and changes no output, so no output
+    /// comparison would notice the copies coming back; this test does
+    /// (evolution proposal `noncopyable-demangler-and-remangler`).
+    @Test func demanglerAndRemanglerStayNoncopyable() {
+        // The discriminator itself, on types whose copyability is known: a
+        // copyable type, a copyable nonescapable one and a noncopyable one.
+        #expect(Self.isCopyable(Node.Children.self))
+        #expect(Self.isCopyable(Span<UInt8>.self))
+        #expect(!Self.isCopyable(NodeStoreBuilder.self))
+
+        // `~Copyable` is on the declaration, not on the word storage, so one
+        // instantiation stands for both.
+        #expect(
+            !Self.isCopyable(Demangler<ArrayWordRanges>.self),
+            "Demangler lost ~Copyable: helpers handed `pop()` copy the whole demangler and its node stack again"
+        )
+        #expect(
+            !Self.isCopyable(Remangler.self),
+            "Remangler lost ~Copyable: a helper handed an argument that mutates it would copy its buffers again"
+        )
+    }
+
     // MARK: - Printer cache vs options override (C)
 
     /// `printExtendedExistentialTypeShape` temporarily forces
