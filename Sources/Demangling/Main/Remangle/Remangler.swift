@@ -2,7 +2,18 @@
 ///
 /// This is useful for tools which want to extract or modify subtrees from mangled strings.
 /// The remangler follows the same mangling conventions as the Swift compiler.
-struct Remangler {
+///
+/// `~Copyable` for the same reason `Demangler` is: a copyable receiver is
+/// evaluated before the call's arguments, so a non-mutating helper handed an
+/// argument that mutates the remangler would copy all of its state — the
+/// output buffer, the 512-slot hash cache, the substitution tables — and the
+/// mutation would then copy whichever buffer it touched. Nothing does that
+/// today; as a noncopyable type the remangler is borrowed only after the
+/// arguments are evaluated, so such a call would copy nothing instead of
+/// slowing down unnoticed. In debug builds every non-mutating helper call
+/// also stops retaining and releasing each of its fields.
+/// (Evolution proposal `noncopyable-demangler-and-remangler`.)
+struct Remangler: ~Copyable {
     // MARK: - Constants
 
     /// Capacity of the hash-based node hash cache (must be power of 2)
@@ -4530,14 +4541,6 @@ extension Remangler {
         childIt += 1
 
         append("P")
-    }
-
-    private func require<Wrapped>(_ optional: Wrapped?) throws(ManglingError) -> Wrapped {
-        if let optional {
-            return optional
-        } else {
-            throw .genericError("")
-        }
     }
 
     private mutating func mangleDifferentiabilityWitness(_ node: Node, depth: Int) throws(ManglingError) {
