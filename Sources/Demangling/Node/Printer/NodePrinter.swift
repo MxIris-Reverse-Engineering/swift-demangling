@@ -732,12 +732,13 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
     /// `demangleSymbolAsString(text)`, and an attached macro's name, which it
     /// prints with `nodeToString(Node->getChild(2))`. Both calls pass no
     /// options, so the nested name reads the same — without type sugar —
-    /// whatever the caller asked for. The one caller option carried over is
-    /// `.useModuleSelectors`: it has no upstream counterpart, and a line that
-    /// spells some qualified names with selectors and others without would be
-    /// neither form.
+    /// whatever the caller asked for. The caller options carried over are the
+    /// spellings with no upstream counterpart, `.useModuleSelectors` and
+    /// `.useExistentialAny`: a line that spells some qualified names with
+    /// selectors and others without — or some existentials with `any` and
+    /// others bare — would be neither form.
     private var nestedNameOptions: DemangleOptions {
-        DemangleOptions.default.union(options.intersection(.useModuleSelectors))
+        DemangleOptions.default.union(options.intersection([.useModuleSelectors, .useExistentialAny]))
     }
 
     private func shouldPrintContext(_ context: SomeNode) -> Bool {
@@ -1247,6 +1248,20 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
             printFirstChild(name, suffix: " ")
         }
         guard let type = name.children.at(name.children.count == 2 ? 1 : 0)?.children.first else { return }
+        if options.contains(.useExistentialAny), type.kind.isExistentialType {
+            // The metatype of an existential itself, `(any P).Type`: the
+            // keyword is what tells it from the existential metatype
+            // `any P.Type`, so the compiler writes it even for `Any` and
+            // `AnyObject`, which it otherwise leaves bare
+            // (`ExistentialType::forcePrintWithAny`).
+            target.write("(")
+            if !spellsExistentialWithAnyKeyword(type) {
+                target.write("any ")
+            }
+            _ = printName(type)
+            target.write(").Type")
+            return
+        }
         let needParens = !type.isSimpleType
         target.write(needParens ? "(" : "")
         _ = printName(type)
@@ -1254,11 +1269,23 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         target.write(type.kind.isExistentialType ? ".Protocol" : ".Type")
     }
 
-    private mutating func printExistentialMetatype(_ name: SomeNode) {
+    private mutating func printExistentialMetatype(_ name: SomeNode, spellsAnyKeyword: Bool = true) {
         if name.children.count == 2 {
             printFirstChild(name, suffix: " ")
         }
-        _ = printOptional(name.children.at(name.children.count == 2 ? 1 : 0), suffix: ".Type")
+        let instanceType = name.children.at(name.children.count == 2 ? 1 : 0)
+        guard options.contains(.useExistentialAny), let instanceType else {
+            _ = printOptional(instanceType, suffix: ".Type")
+            return
+        }
+        // The compiler writes the keyword for every existential metatype —
+        // `any Any.Type` included — and the instance under it bare, in
+        // parentheses when it is a composition (`any (P & Q).Type`).
+        if spellsAnyKeyword {
+            target.write("any ")
+        }
+        printExistentialConstraint(instanceType, parenthesizesComposition: true)
+        target.write(".Type")
     }
 
     private mutating func printAssociatedTypeRef(_ name: SomeNode) {
@@ -1266,32 +1293,136 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         target.write(".\(name.children.at(1)?.text ?? "")")
     }
 
-    private mutating func printProtocolList(_ name: SomeNode) {
+    /// `spellsAnyKeyword` is false where the keyword is written already — see
+    /// ``printExistentialConstraint(_:parenthesizesComposition:)``. Without
+    /// ``DemangleOptions/useExistentialAny`` no protocol list writes it.
+    private mutating func printProtocolList(_ name: SomeNode, spellsAnyKeyword: Bool = true) {
         guard let typeList = name.children.first else { return }
         if typeList.children.isEmpty {
             target.write("Any")
         } else {
+            if spellsAnyKeyword, options.contains(.useExistentialAny) {
+                target.write("any ")
+            }
             printChildren(typeList, separator: " & ")
         }
     }
 
-    private mutating func printProtocolListWithClass(_ name: SomeNode) {
+    private mutating func printProtocolListWithClass(_ name: SomeNode, spellsAnyKeyword: Bool = true) {
         guard name.children.count >= 2 else { return }
+        if spellsAnyKeyword, options.contains(.useExistentialAny) {
+            target.write("any ")
+        }
         _ = printOptional(name.children.at(1), suffix: " & ")
         if let protocolsTypeList = name.children.first?.children.first {
             printChildren(protocolsTypeList, separator: " & ")
         }
     }
 
-    private mutating func printProtocolListWithAnyObject(_ name: SomeNode) {
+    private mutating func printProtocolListWithAnyObject(_ name: SomeNode, spellsAnyKeyword: Bool = true) {
         guard let prot = name.children.first, let protocolsTypeList = prot.children.first else { return }
         if protocolsTypeList.children.count > 0 {
+            // A lone `AnyObject` stays bare, as the compiler leaves it.
+            if spellsAnyKeyword, options.contains(.useExistentialAny) {
+                target.write("any ")
+            }
             printChildren(protocolsTypeList, suffix: " & ", separator: " & ")
         }
         if options.contains(.qualifyEntities) && options.contains(.displayStdlibModule) {
             target.write(standardLibraryModuleQualifier)
         }
         target.write("AnyObject")
+    }
+
+    /// Prints the constraint under an `any` keyword written already — the
+    /// instance of an existential metatype (`any P.Type`), the protocol list of
+    /// a parameterized existential (`any P<…>`), the type of an extended
+    /// existential shape — without a keyword of its own. Only reached under
+    /// ``DemangleOptions/useExistentialAny``.
+    ///
+    /// The existential is printed here rather than through
+    /// ``printName(_:asPrefixContext:identifierParentKind:)``: the fragment
+    /// cache is keyed by node identity, and the same node prints with the
+    /// keyword in every other position. Its protocols still go through
+    /// `printName`, which pushes their type-reference scopes.
+    ///
+    /// `parenthesizesComposition` parenthesizes a constraint of more than one
+    /// term, as the compiler does under an existential metatype's keyword
+    /// (`any (P & Q).Type`, `any (C & P).Type`) — where the bare spelling
+    /// `P & Q.Type` would bind `.Type` to `Q` alone.
+    private mutating func printExistentialConstraint(_ typeNode: SomeNode, parenthesizesComposition: Bool) {
+        guard let constraint = typeNode.unwrappingTypeWrappers else {
+            _ = printName(typeNode)
+            return
+        }
+        let needsParentheses = parenthesizesComposition && existentialCompositionTermCount(constraint) > 1
+        target.write(needsParentheses ? "(" : "")
+        switch constraint.kind {
+        case .protocolList:
+            printProtocolList(constraint, spellsAnyKeyword: false)
+        case .protocolListWithClass:
+            printProtocolListWithClass(constraint, spellsAnyKeyword: false)
+        case .protocolListWithAnyObject:
+            printProtocolListWithAnyObject(constraint, spellsAnyKeyword: false)
+        case .constrainedExistential:
+            printConstrainedExistential(constraint, spellsAnyKeyword: false)
+        case .existentialMetatype:
+            // `any P.Type.Type`: the nested existential metatype is written as
+            // the metatype of its own instance, with the outer keyword only.
+            printExistentialMetatype(constraint, spellsAnyKeyword: false)
+        default:
+            _ = printName(typeNode)
+        }
+        target.write(needsParentheses ? ")" : "")
+    }
+
+    /// The number of `&`-separated terms an existential's constraint spells —
+    /// protocols, a superclass, `AnyObject` — which decides, as in the
+    /// compiler's `TypeBase::hasSimpleTypeRepr`, whether it needs parentheses
+    /// under a metatype's keyword. Any other kind counts as one term.
+    private func existentialCompositionTermCount(_ constraint: SomeNode) -> Int {
+        switch constraint.kind {
+        case .protocolList:
+            return constraint.children.first?.children.count ?? 0
+        case .protocolListWithClass:
+            return 1 + (constraint.children.first?.children.first?.children.count ?? 0)
+        case .protocolListWithAnyObject:
+            return 1 + (constraint.children.first?.children.first?.children.count ?? 0)
+        default:
+            return 1
+        }
+    }
+
+    /// Whether this existential, printed under
+    /// ``DemangleOptions/useExistentialAny``, starts with the `any` keyword:
+    /// every existential but a lone `Any` or `AnyObject`.
+    private func spellsExistentialWithAnyKeyword(_ type: SomeNode) -> Bool {
+        guard let existential = type.unwrappingTypeWrappers else { return false }
+        switch existential.kind {
+        case .protocolList:
+            return !(existential.children.first?.children.isEmpty ?? true)
+        case .protocolListWithAnyObject:
+            return !(existential.children.first?.children.first?.children.isEmpty ?? true)
+        case .protocolListWithClass,
+             .existentialMetatype,
+             .constrainedExistential:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// `isSimpleType` as this print spells the type: under
+    /// ``DemangleOptions/useExistentialAny`` an existential written with the
+    /// keyword is not simple — a suffix must not bind to its last protocol
+    /// (`(any P)?`, `(any P.Type)?`) — the way the compiler's
+    /// `isSimpleUnderPrintOptions` treats an `ExistentialType` printed with
+    /// `any`. A lone `Any` or `AnyObject` stays simple.
+    private func isSimpleTypeAsSpelled(_ type: SomeNode) -> Bool {
+        if options.contains(.useExistentialAny), spellsExistentialWithAnyKeyword(type) {
+            return false
+        }
+        return type.isSimpleType
     }
 
     private mutating func printProtocolConformance(_ name: SomeNode) {
@@ -1552,7 +1683,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
 
     private mutating func printSugaredOptional(_ name: SomeNode) {
         if let type = name.children.first {
-            let needParens = !type.isSimpleType
+            let needParens = !isSimpleTypeAsSpelled(type)
             target.write(needParens ? "(" : "")
             _ = printName(type)
             target.write(needParens ? ")" : "")
@@ -1762,7 +1893,12 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         }
         target.write("any ")
         if let shapeType {
-            _ = printName(shapeType)
+            if options.contains(.useExistentialAny) {
+                // The keyword above is written for the shape's type already.
+                printExistentialConstraint(shapeType, parenthesizesComposition: false)
+            } else {
+                _ = printName(shapeType)
+            }
         } else {
             target.write("<null node pointer>")
         }
@@ -2010,8 +2146,20 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         _ = printOptional(name.children.at(1), suffix: ".shape")
     }
 
-    private mutating func printConstrainedExistential(_ name: SomeNode) {
-        printFirstChild(name, prefix: "any ")
+    /// Writes `any` whether or not ``DemangleOptions/useExistentialAny`` is
+    /// set, as upstream does; `spellsAnyKeyword` is false only where the
+    /// keyword is written already (`any P<…>.Type`).
+    private mutating func printConstrainedExistential(_ name: SomeNode, spellsAnyKeyword: Bool = true) {
+        if options.contains(.useExistentialAny), let constraint = name.children.first {
+            // The keyword is this node's own, so the protocol list under it
+            // must not write a second one.
+            if spellsAnyKeyword {
+                target.write("any ")
+            }
+            printExistentialConstraint(constraint, parenthesizesComposition: false)
+        } else {
+            printFirstChild(name, prefix: "any ")
+        }
         _ = printOptional(name.children.at(1), prefix: "<", suffix: ">")
     }
 
@@ -2487,7 +2635,7 @@ public struct DemanglingPrinter<Target: NodePrinterTarget, SomeNode: DemanglingN
         case .optional,
              .implicitlyUnwrappedOptional:
             if let type = name.children.at(1)?.children.at(0) {
-                let needParens = !type.isSimpleType
+                let needParens = !isSimpleTypeAsSpelled(type)
                 _ = printOptional(type, prefix: needParens ? "(" : "", suffix: needParens ? ")" : "")
                 target.write(sugarType == .optional ? "?" : "!")
             }

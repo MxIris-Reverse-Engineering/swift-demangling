@@ -60,6 +60,7 @@
 | [0017](0017-module-selectors.md) | 打印选项：用 SE-0491 的模块选择器（`Module::Name`）写限定名 | Implemented |
 | [0018](0018-demangler-self-copy.md) | demangle 不再复制整个 Demangler，remangle 不再逐格销毁节点哈希缓存 | Implemented |
 | [0019](0019-noncopyable-demangler-and-remangler.md) | Demangler 与 Remangler 改为 `~Copyable`：「不整份复制」由编译器保证 | Implemented |
+| draft | [打印选项：给 existential 写上 `any`](draft-existential-any.md) | In Progress |
 
 ## 流程
 

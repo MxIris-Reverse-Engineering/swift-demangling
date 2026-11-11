@@ -98,6 +98,13 @@ node.print(using: DemangleOptions.interface.union(.useModuleSelectors))
 
 `useModuleSelectors` is opt-in and part of no preset, so every preset still prints exactly what the Swift toolchain's demangler prints. With it, a nested type carries a selector naming the module that declared it — `Swift::Duration.Foundation::TimeFormatStyle` for a type Foundation adds in an extension of `Swift.Duration` — while local types and the associated types of type parameters (`A.Element`) carry none, as SE-0491 requires.
 
+`useExistentialAny` is opt-in on the same terms. With it, existential types carry the `any` keyword the way the compiler writes them in a `.swiftinterface` (SE-0335): `any Swift.Error`, `(any Swift.Error)?`, `any P.Type` for the existential metatype and `(any P).Type` for the metatype of the existential, which the toolchain's demangler prints as `P.Protocol`. `Any` and `AnyObject` stay bare except in a metatype (`any Any.Type`, `(any Any).Type`), as the compiler writes them.
+
+```swift
+// (any Swift.Error)?
+try demangleAsNode("$ss5Error_pSgD").print(using: DemangleOptions.default.union(.useExistentialAny))
+```
+
 ### Inspecting the Node Tree
 
 ```swift
