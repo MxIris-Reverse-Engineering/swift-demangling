@@ -82,7 +82,7 @@
   | `0017-module-selectors.md` | 新打印选项 `useModuleSelectors`：用 SE-0491 的模块选择器（`Module::Name`，Swift 6.4 的 `.swiftinterface` 就这么写）写限定名。它不进任何预设，因为 `.default` 与 `.simplified` 要和工具链逐字节对齐。状态 `Implemented`。 |
   | `0018-demangler-self-copy.md` | `try require(pop())` 里的非 `mutating` 辅助方法让编译器先整份复制 `Demangler`，再连带复制节点栈，占单线程 demangle 约三分之一，并行时把 CPU 拖到约 2.3 倍；改为 `mutating`。同批让 `Remangler` 的 512 格节点哈希缓存不再逐格销毁。随 0.7.3 发布。状态 `Implemented`。 |
   | `0019-noncopyable-demangler-and-remangler.md` | 把 0018 靠约定维持的「不整份复制」交给编译器：`Demangler` 与 `Remangler` 改为 `~Copyable`，不可复制的接收者在参数求值之后才借用，`require(pop())` 照常编译且一次也不复制；另有回归测试锁住 `~Copyable`。release 性能持平，输出逐字节不变。状态 `Implemented`。 |
-  | `draft-existential-any.md` | 新打印选项 `useExistentialAny`：照编译器写 `.swiftinterface` 的规则给 existential 写上 `any`（`(any Swift.Error)?`、`any P.Type`、`(any P).Type`、`any Any.Type`），`Any` 与 `AnyObject` 不写。它不进任何预设，理由同 `useModuleSelectors`。状态 `In Progress`。 |
+  | `0020-existential-any.md` | 新打印选项 `useExistentialAny`：照编译器写 `.swiftinterface` 的规则给 existential 写上 `any`（`(any Swift.Error)?`、`any P.Type`、`(any P).Type`、`any Any.Type`），`Any` 与 `AnyObject` 不写。它不进任何预设，理由同 `useModuleSelectors`。状态 `Implemented`。 |
 
 - **`AGENTS.md` / `CLAUDE.md`**（仓库根） — 面向编码 agent 的架构速查，信息密度最高、
   最不适合人读；要理解「为什么这样设计」看本目录，要快速查「某个类型的契约是什么」

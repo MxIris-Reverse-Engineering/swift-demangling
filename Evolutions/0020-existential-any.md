@@ -1,11 +1,11 @@
-# Draft - 打印选项：给 existential 写上 `any`
+# 0020 - 打印选项：给 existential 写上 `any`
 
-- **状态**: In Progress
+- **状态**: Implemented
 - **作者**: JH
 - **创建日期**: 2026-11-11
 - **最后更新**: 2026-11-11
-- **关联提案**: 下游 MachOSwiftSection 提案 `existential-any`（interface 与 dump 默认写 `any`，dump 一侧建在本选项之上）
-- **实现分支 / PR**: `feature/existential-any`
+- **关联提案**: 下游 MachOSwiftSection 提案 `0092-existential-any`（interface 与 dump 默认写 `any`，dump 一侧建在本选项之上）
+- **实现分支 / PR**: `feature/existential-any`（快进合入 `next`）
 
 ## 摘要
 
@@ -36,3 +36,4 @@
 | 2026-11-11 | 验证 | 在 JHs-Mac-Studio-Ultra（Xcode 26.6）上跑全量 `swift test`：651 个测试 / 46 个套件，与官方 demangler 逐字节对照的语料测试全过，证明选项关闭时输出不变；新测试第一轮有 5 个可选类型用例的期望写错（`.default` 不合成 `?`），改用 `.interface`、补两个 `XSq` 用例后 `ExistentialAnyPrintingTests` 全过，原始退出码 0。下游 MachOSwiftSection 的全量测试用本分支跑过，见那份提案 |
 | 2026-11-11 | `nestedNameOptions` 透传这个选项 | 与 `useModuleSelectors` 同理：一行里有的 existential 带 `any`、有的不带，两种写法都不是 |
 | 2026-11-11 | 实现完成，待用户看过后收尾。下游的渲染 A/B（96 对真实框架输出）打开选项后改动 50207 行，归一化掉 `any`、括号与 `.Protocol` 后与关闭时逐字节相同。配套文档：README 一段、`AGENTS.md` 一条，不另写实现说明；新术语：无 | 下游 MachOSwiftSection 的 `existential-any` 一并完成 |
+| 2026-11-11 | In Progress → Implemented，编号 0020，快进合入 `next` 并推送；不发版 | 用户要求收尾，没有要求发版。下游 MachOSwiftSection 提案 0092 同批落地，它的 `Package.swift` 对本库的下限仍是 `0.7.3`，走远端依赖的构建要等本库发版、下游抬下限后才编得过。按共享分支编号：origin/next 最大 0019，origin/main 最大 0018 |
