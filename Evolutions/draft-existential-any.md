@@ -24,7 +24,7 @@
 
 **片段缓存**：`printCache` 按节点身份缓存打印出的片段，而 `any` 是唯一取决于父节点的写法——同一个 protocol list 在别处带 `any`，在 `any P.Type`、`any P<…>` 里不带。所以这几处（existential metatype 的实例、constrained existential 的 protocol list、extended existential shape 的类型）经 `printExistentialConstraint` 直接印成员，不经 `printName`，缓存里的片段总是带关键字的那个。成员协议仍经 `printName` 打印，富目标照常拿到它们的类型引用作用域。
 
-**测试**：`ExistentialAnyPrintingTests`——30 个形状 × `Node` 与 store 两条打印路径，每个都钉住开关关闭时的旧写法；外加与模块选择器同开、同一个 protocol list 实例在两个位置各自的写法（两种顺序）、裸印的组合里每个协议仍在自己的作用域里。
+**测试**：`ExistentialAnyPrintingTests`——32 个形状 × `Node` 与 store 两条打印路径，每个都钉住开关关闭时的旧写法；外加与模块选择器同开、同一个 protocol list 实例在两个位置各自的写法（两种顺序）、裸印的组合里每个协议仍在自己的作用域里。可选类型的用例用 `.interface` 预设：`.default` 不合成 `?`，印出来是 `Swift.Optional<…>`；另有两个 `XSq`（`SugaredOptional` 节点）用例走 `printSugaredOptional` 那条路。
 
 ## 决策日志
 
@@ -33,4 +33,5 @@
 | 2026-11-11 | Created，直接进入 In Progress | 下游 MachOSwiftSection 的 `existential-any` 提案已经用户批准，本选项是它的第一步，方案在那份提案里定下 |
 | 2026-11-11 | 选项名 `useExistentialAny` | 编译器写接口文件时没有对应的打印选项，名字取自强制写 `any` 的 upcoming feature `ExistentialAny`，前缀照 `useModuleSelectors` |
 | 2026-11-11 | 默认关闭、不进任何预设 | 预设的输出要与官方 demangler 逐字节对齐（corpus oracle）；下游自己决定默认打开 |
+| 2026-11-11 | 验证 | 在 JHs-Mac-Studio-Ultra（Xcode 26.6）上跑全量 `swift test`：651 个测试 / 46 个套件，与官方 demangler 逐字节对照的语料测试全过，证明选项关闭时输出不变；新测试第一轮有 5 个可选类型用例的期望写错（`.default` 不合成 `?`），改用 `.interface`、补两个 `XSq` 用例后 `ExistentialAnyPrintingTests` 全过，原始退出码 0。下游 MachOSwiftSection 的全量测试用本分支跑过，见那份提案 |
 | 2026-11-11 | `nestedNameOptions` 透传这个选项 | 与 `useModuleSelectors` 同理：一行里有的 existential 带 `any`、有的不带，两种写法都不是 |
