@@ -77,16 +77,30 @@ struct ExistentialAnyPrintingTests {
         SpellingCase(
             summary: "an optional existential is parenthesized",
             mangledName: "$ss5Error_pSgD",
-            options: .default,
+            options: .interface,
             spellingWithoutKeyword: "Swift.Error?",
             spellingWithKeyword: "(any Swift.Error)?"
         ),
         SpellingCase(
             summary: "an optional composition",
             mangledName: "$s4main1P_AA1QpSgD",
-            options: .default,
+            options: .interface,
             spellingWithoutKeyword: "(main.P & main.Q)?",
             spellingWithKeyword: "(any main.P & main.Q)?"
+        ),
+        SpellingCase(
+            summary: "a sugared optional existential is parenthesized",
+            mangledName: "$s4main1P_pXSqD",
+            options: .default,
+            spellingWithoutKeyword: "main.P?",
+            spellingWithKeyword: "(any main.P)?"
+        ),
+        SpellingCase(
+            summary: "a sugared optional of Any stays unparenthesized",
+            mangledName: "$sypXSqD",
+            options: .default,
+            spellingWithoutKeyword: "Any?",
+            spellingWithKeyword: "Any?"
         ),
         SpellingCase(
             summary: "an optional synthesized from Optional<…>",
@@ -98,7 +112,7 @@ struct ExistentialAnyPrintingTests {
         SpellingCase(
             summary: "an optional of Any stays unparenthesized",
             mangledName: "$sypSgD",
-            options: .default,
+            options: .interface,
             spellingWithoutKeyword: "Any?",
             spellingWithKeyword: "Any?"
         ),
@@ -133,7 +147,7 @@ struct ExistentialAnyPrintingTests {
         SpellingCase(
             summary: "an optional existential metatype is parenthesized",
             mangledName: "$s4main1P_pXpSgD",
-            options: .default,
+            options: .interface,
             spellingWithoutKeyword: "main.P.Type?",
             spellingWithKeyword: "(any main.P.Type)?"
         ),
@@ -189,7 +203,7 @@ struct ExistentialAnyPrintingTests {
         SpellingCase(
             summary: "an optional parameterized existential",
             mangledName: "$sSl_pSi7ElementRts_XPSgD",
-            options: .default,
+            options: .interface,
             spellingWithoutKeyword: "(any Swift.Collection<Self.Element == Swift.Int>)?",
             spellingWithKeyword: "(any Swift.Collection<Self.Element == Swift.Int>)?"
         ),
