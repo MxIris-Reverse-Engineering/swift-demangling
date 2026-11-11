@@ -35,3 +35,4 @@
 | 2026-11-11 | 默认关闭、不进任何预设 | 预设的输出要与官方 demangler 逐字节对齐（corpus oracle）；下游自己决定默认打开 |
 | 2026-11-11 | 验证 | 在 JHs-Mac-Studio-Ultra（Xcode 26.6）上跑全量 `swift test`：651 个测试 / 46 个套件，与官方 demangler 逐字节对照的语料测试全过，证明选项关闭时输出不变；新测试第一轮有 5 个可选类型用例的期望写错（`.default` 不合成 `?`），改用 `.interface`、补两个 `XSq` 用例后 `ExistentialAnyPrintingTests` 全过，原始退出码 0。下游 MachOSwiftSection 的全量测试用本分支跑过，见那份提案 |
 | 2026-11-11 | `nestedNameOptions` 透传这个选项 | 与 `useModuleSelectors` 同理：一行里有的 existential 带 `any`、有的不带，两种写法都不是 |
+| 2026-11-11 | 实现完成，待用户看过后收尾。下游的渲染 A/B（96 对真实框架输出）打开选项后改动 50207 行，归一化掉 `any`、括号与 `.Protocol` 后与关闭时逐字节相同。配套文档：README 一段、`AGENTS.md` 一条，不另写实现说明；新术语：无 | 下游 MachOSwiftSection 的 `existential-any` 一并完成 |
