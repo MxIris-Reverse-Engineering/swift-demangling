@@ -45,6 +45,27 @@ public struct DemangleOptions: OptionSet, Codable, Sendable {
     /// Not in any preset: upstream's demangler has no such option, and the
     /// presets stay byte-identical to it.
     public static let useModuleSelectors = DemangleOptions(rawValue: 1 << 26)
+    /// Spells existential types with the `any` keyword — `any Swift.Error`,
+    /// `any P & Q`, `(any P)?`, `any P.Type`, `(any P).Type` — the way the
+    /// compiler writes a `.swiftinterface` (SE-0335; named after its upcoming
+    /// feature `ExistentialAny`). Without it every existential prints bare, the
+    /// metatype of one as `P.Protocol`.
+    ///
+    /// `Any` and `AnyObject` stay bare, as the compiler leaves them, except in
+    /// a metatype, where the compiler writes the keyword for them too:
+    /// `any Any.Type` for the existential metatype, `(any Any).Type` for the
+    /// metatype of the existential. An existential spelled with the keyword is
+    /// parenthesized wherever a suffix would otherwise bind to its last
+    /// protocol — `(any P)?`, `(any P & Q)!`, `(any P.Type)?` — and the
+    /// composition under an existential metatype's keyword is parenthesized
+    /// too (`any (P & Q).Type`, which the bare spelling writes as the
+    /// ambiguous `P & Q.Type`). A parameterized existential carries the
+    /// keyword with or without this option (`any P<…>`); inside an existential
+    /// metatype it is written once (`any P<…>.Type`).
+    ///
+    /// Not in any preset: upstream's demangler has no such option, and the
+    /// presets stay byte-identical to it.
+    public static let useExistentialAny = DemangleOptions(rawValue: 1 << 27)
 
     public init(rawValue: Int) {
         self.rawValue = rawValue

@@ -5,7 +5,22 @@
 /// Generic over the word-substitution table storage, the axis-1 storage
 /// selection point: the entry instantiates `Demangler<InlineWordRanges>` on
 /// modern OS runtimes and `Demangler<ArrayWordRanges>` on the legacy path.
-struct Demangler<Words: WordRangeStorage>: ~Escapable {
+///
+/// `~Copyable` as well, so the compiler never copies a demangler behind the
+/// code's back. Nearly every helper is handed an argument that mutates the
+/// demangler — `try require(pop())`, `createNode(kind:child: try require(pop()))`.
+/// A copyable receiver is evaluated before such arguments, which for a
+/// non-mutating helper meant a copy of the whole demangler; the copy shared
+/// the node stack's buffer, so the `pop()` that followed copied the whole
+/// stack, every node's reference count included — a third of the time a
+/// demangle took (evolution proposal `demangler-self-copy`). A noncopyable
+/// receiver is borrowed only after its arguments are evaluated, so those
+/// calls copy nothing, in debug builds as well as optimized ones, and a
+/// pattern that would need a copy is a compile error rather than a silent
+/// slowdown. Dropping `~Copyable` would still compile and change no output,
+/// which is why `DefectRegressionTests` pins it. (Evolution proposal
+/// `noncopyable-demangler-and-remangler`.)
+struct Demangler<Words: WordRangeStorage>: ~Copyable, ~Escapable {
     private var scanner: ScalarScanner
     private var nameStack: [Node] = []
     private var substitutions: [Node] = []
@@ -30,20 +45,12 @@ struct Demangler<Words: WordRangeStorage>: ~Escapable {
 }
 
 extension Demangler {
-    // `mutating` although neither mutates anything. Almost every call passes
-    // an argument that mutates `self` — `try require(pop())` — and Swift
-    // evaluates the receiver before the arguments: for a non-mutating method
-    // that receiver had to be a copy of the whole demangler, taken before
-    // `pop()` ran. The copy shared the node stack's buffer, so the `pop()`
-    // that followed copied the whole stack, every node's reference count
-    // included, and destroying the copy released them all again — a third
-    // of the time a demangle took, and with several threads demangling at
-    // once a fight over the reference counts of the shared parameterless
-    // nodes. A mutating receiver is an inout access that begins after the
-    // arguments are evaluated, so nothing is copied. (Evolution proposal
-    // `demangler-self-copy`.) The one visible difference: a failure reports
-    // the scanner position after the argument was evaluated, not before.
-    private mutating func require<Wrapped>(_ optional: Wrapped?) throws(DemanglingError) -> Wrapped {
+    // Almost every call passes an argument that mutates `self` —
+    // `try require(pop())`. The demangler is noncopyable, so the borrow of
+    // `self` for `require` begins only after `pop()` has run and nothing is
+    // copied (see the type's comment). A failure therefore reports the
+    // scanner position after the argument was evaluated, not before.
+    private func require<Wrapped>(_ optional: Wrapped?) throws(DemanglingError) -> Wrapped {
         if let optional {
             return optional
         } else {
@@ -51,7 +58,7 @@ extension Demangler {
         }
     }
 
-    private mutating func require(_ value: Bool) throws(DemanglingError) {
+    private func require(_ value: Bool) throws(DemanglingError) {
         if !value {
             throw failure
         }
