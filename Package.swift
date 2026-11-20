@@ -170,6 +170,22 @@ let package = Package(
     ] : []),
 )
 
+// MARK: - Upcoming features
+
+// Every Swift target adopts three upcoming features that Swift 7 turns on:
+// ExistentialAny, MemberImportVisibility and InferIsolatedConformances.
+// MachOSwiftSection's proposal swift6-mode-and-upcoming-features covers the
+// MachO packages together.
+let upcomingFeatureSettings: [SwiftSetting] = [
+    .enableUpcomingFeature("ExistentialAny"),
+    .enableUpcomingFeature("MemberImportVisibility"),
+    .enableUpcomingFeature("InferIsolatedConformances"),
+]
+
+for target in package.targets where target.type != .system && target.type != .binary && target.type != .plugin {
+    target.swiftSettings = (target.swiftSettings ?? []) + upcomingFeatureSettings
+}
+
 // MARK: - Tuist development workspace
 
 // MachOSwiftSection's Tuist development workspace (its Documentations/Internal/TuistDevelopment.md)
