@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @_spi(Internals) @testable import Demangling
+import SwiftStdlibToolbox
 
 /// Regressions for defects found by review of the node-store work: node shapes
 /// and API sequences that public API can produce but the demangler never does,

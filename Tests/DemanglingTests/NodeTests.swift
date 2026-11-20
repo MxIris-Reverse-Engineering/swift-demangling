@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import Demangling
+import SwiftStdlibToolbox
 
 /// Unit tests for Node - self-contained, no external dependencies.
 @Suite
