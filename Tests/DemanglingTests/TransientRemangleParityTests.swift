@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @_spi(Internals) @testable import Demangling
 @testable import DemanglingTestingSupport
+import SwiftStdlibToolbox
 
 /// Evolution 0011: the transient tree and the canonical tree of one symbol
 /// must remangle **byte-identically**.
